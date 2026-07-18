@@ -72,8 +72,8 @@ def _run_ffmpeg(cmd: list, description: str, attempt: int = 1, max_attempts: int
 
 
 def _ass_filter(path: str) -> str:
-    escaped = str(path).replace("\\", "/").replace("'", r"\'")
-    return f"ass=filename='{escaped}'"
+    escaped = str(path).replace("\\", "/").replace(":", "\\:")
+    return f"ass=filename={escaped}"
 
 
 def _build_ducking_expression(narration_events: List[Dict[str, Any]]) -> str:
@@ -165,10 +165,12 @@ def compose_group(
 
     # Add clip captions (bottom)
     clip_caption_filters = []
+    last_v = "v"
     for i, cap_path in enumerate(clip_caption_paths):
-        clip_caption_filters.append(f"[v]{_ass_filter(cap_path)}[v{i+1}]")
-    video_filter += ";" + ";".join(clip_caption_filters)
-    last_v = f"v{len(clip_caption_filters)}"
+        clip_caption_filters.append(f"[{last_v}]{_ass_filter(cap_path)}[v{i+1}]")
+        last_v = f"v{i+1}"
+    if clip_caption_filters:
+        video_filter += ";" + ";".join(clip_caption_filters)
 
     # Add narration captions (top) - overlay on top of clip captions
     for i, cap_path in enumerate(narration_caption_paths):
