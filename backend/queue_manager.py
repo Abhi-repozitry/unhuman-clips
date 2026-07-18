@@ -6,7 +6,7 @@ from backend.pipeline.downloader import download_video
 from backend.pipeline.transcriber import transcribe_video
 from backend.pipeline.analyzer import select_reel_plan, select_clips
 from backend.pipeline.commentary import write_commentary
-from backend.pipeline.clipper import cut_clips
+from backend.pipeline.clipper import cut_group_clips
 from backend.pipeline.tts import synthesize_commentary
 from backend.pipeline.captioner import generate_clip_ass, generate_commentary_ass
 from backend.pipeline.compositor import compose_group
@@ -246,7 +246,7 @@ class QueueManager:
                 reporter.progress_callback(msg, prog)
 
             group_clip_paths = await asyncio.to_thread(
-                cut_clips, job.source_path, [c.model_dump() for c in group.source_clips], job.id, clipper_progress, reporter
+                cut_group_clips, job.source_path, [c.model_dump() for c in group.source_clips], job.id, group_idx, clipper_progress, reporter
             )
             job.stage_data = {"status": "done", "group_index": group_idx, "clips_cut": len(group_clip_paths)}
             reporter.log_info(f"Group {group_idx+1}: Cut {len(group_clip_paths)} clips")

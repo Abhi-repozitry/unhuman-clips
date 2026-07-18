@@ -184,6 +184,8 @@ def compose_group(
     ] + encoder_opts + [
         "-r", "30", "-y", str(video_output)
     ]
+    print(f"[DEBUG] video_filter = {video_filter}")
+    print(f"[DEBUG] ffmpeg cmd = {ffmpeg_video}")
     if progress_cb:
         progress_cb(f"Group {group_idx+1}: Rendering video with captions...", 25)
     _run_ffmpeg(ffmpeg_video, f"Group {group_idx} video")
