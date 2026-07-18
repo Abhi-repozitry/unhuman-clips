@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+*.egg
+
+# Node
+node_modules/
+
+# OS / editors
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Env files (keep .env.example)
+.env
+.env.local
+
+# Storage (generated content)
+storage/
+
+# Large binaries / local dependencies
+bin/
+ffmpeg/
+ffmpeg.zip
+nvvm/
+compute-sanitizer/
+extras/
+
+# Nested git repos / worktrees
+kilo/
+frontend/
+
+# Logs
+*.log

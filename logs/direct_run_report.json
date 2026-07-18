@@ -1,0 +1,11 @@
+{
+  "job_id": "a50a8d80-8045-4d32-95af-b85962564b6b",
+  "ass_files": [],
+  "ass_contents": {},
+  "final_state": {
+    "status": "ERROR",
+    "stage": "DOWNLOADING",
+    "progress": 0.0,
+    "error": "ERROR: [youtube] fKoAOWQHP0o: Requested format is not available. Use --list-formats for a list of available formats"
+  }
+}

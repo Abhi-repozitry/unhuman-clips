@@ -1,0 +1,6 @@
+.env
+storage/downloads/
+storage/working/
+storage/outputs/
+storage/clips/
+__pycache__/

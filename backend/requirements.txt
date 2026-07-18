@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+yt-dlp
+pydantic
+python-multipart
+faster-whisper
+openai
+python-dotenv
+requests
+edge-tts
