@@ -39,10 +39,10 @@ def _build_encoder_opts(encoder: str) -> list:
         ]
 
 
-def _run_ffmpeg(cmd: list, description: str, attempt: int = 1, max_attempts: int = 2):
+def _run_ffmpeg(cmd: list, description: str, attempt: int = 1, max_attempts: int = 2, cwd: str = None):
     """Run ffmpeg, retrying with CPU encoder if NVENC fails."""
     try:
-        result = subprocess.run(cmd, capture_output=True, check=True)
+        result = subprocess.run(cmd, capture_output=True, check=True, cwd=cwd)
         return result
     except subprocess.CalledProcessError as e:
         if attempt < max_attempts and "h264_nvenc" in " ".join(cmd) and os.environ.get("ALLOW_CPU_FFMPEG_FALLBACK") == "1":
@@ -67,13 +67,13 @@ def _run_ffmpeg(cmd: list, description: str, attempt: int = 1, max_attempts: int
                     pass
                 else:
                     new_cmd.append(arg)
-            return _run_ffmpeg(new_cmd, description, attempt + 1, max_attempts)
+            return _run_ffmpeg(new_cmd, description, attempt + 1, max_attempts, cwd=cwd)
         raise RuntimeError(f"{description} failed: {e.stderr.decode() if e.stderr else 'unknown'}") from e
 
 
 def _ass_filter(path: str) -> str:
-    escaped = str(path).replace("\\", "/").replace(":", "\\:")
-    return f"ass=filename={escaped}"
+    filename = Path(path).name
+    return f"ass=filename={filename}"
 
 
 def _build_ducking_expression(narration_events: List[Dict[str, Any]]) -> str:
@@ -190,7 +190,7 @@ def compose_group(
     print(f"[DEBUG] ffmpeg cmd = {ffmpeg_video}")
     if progress_cb:
         progress_cb(f"Group {group_idx+1}: Rendering video with captions...", 25)
-    _run_ffmpeg(ffmpeg_video, f"Group {group_idx} video")
+    _run_ffmpeg(ffmpeg_video, f"Group {group_idx} video", cwd=str(working_dir))
 
     # 2. Build continuous clip audio from source_clips
     if progress_cb:
