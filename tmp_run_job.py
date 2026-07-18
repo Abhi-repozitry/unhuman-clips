@@ -4,7 +4,7 @@ import time
 import json
 import sys
 
-BASE = "http://127.0.0.1:9000"
+BASE = "http://127.0.0.1:8000"
 
 url = sys.argv[1] if len(sys.argv) > 1 else "https://youtu.be/fKoAOWQHP0o?si=DQnLjASXQaKnOwD6"
 
