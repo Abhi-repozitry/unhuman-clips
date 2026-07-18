@@ -73,7 +73,7 @@ def _run_ffmpeg(cmd: list, description: str, attempt: int = 1, max_attempts: int
 
 def _ass_filter(path: str) -> str:
     escaped = str(path).replace("\\", "/").replace("'", r"\'")
-    return f"ass='{escaped}'"
+    return f"ass=filename='{escaped}'"
 
 
 def _build_ducking_expression(narration_events: List[Dict[str, Any]]) -> str:
