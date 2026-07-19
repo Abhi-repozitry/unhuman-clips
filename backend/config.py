@@ -29,8 +29,8 @@ WHISPER_COMPUTE_TYPE_CPU = os.environ.get("WHISPER_COMPUTE_TYPE_CPU", "int8")
 
 NVIDIA_API_KEY = os.environ.get("NVIDIA_API_KEY")
 NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
-NVIDIA_MODEL = os.environ.get("NVIDIA_MODEL", "poolside/laguna-xs-2.1")
-NVIDIA_MODEL_FALLBACK = os.environ.get("NVIDIA_MODEL_FALLBACK", "stepfun-ai/step-3.7-flash")
+NVIDIA_MODEL = os.environ.get("NVIDIA_MODEL", "stepfun-ai/step-3.7-flash")
+NVIDIA_MODEL_FALLBACK = os.environ.get("NVIDIA_MODEL_FALLBACK", "poolside/laguna-xs-2.1")
 
 CLIP_COUNT_MIN = int(os.environ.get("CLIP_COUNT_MIN", "4"))
 CLIP_COUNT_MAX = int(os.environ.get("CLIP_COUNT_MAX", "5"))
