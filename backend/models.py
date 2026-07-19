@@ -8,6 +8,7 @@ import uuid
 class OutputReel(BaseModel):
     output_index: int
     output_path: Optional[str] = None
+    output_url: Optional[str] = None
     duration_seconds: float = 0.0
     group_reasoning: str = ""
     title: str = ""

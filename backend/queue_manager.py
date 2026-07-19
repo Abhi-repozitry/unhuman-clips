@@ -1,4 +1,5 @@
 import asyncio
+from pathlib import Path
 from typing import Optional, Callable, List
 from backend.models import VideoJob, JobStatus, ReelPlan, ReelGroup, OutputReel
 from backend.config import HOOK_SECONDS, get_job_working_dir, FFMPEG_PATH, FFPROBE_PATH
@@ -422,6 +423,7 @@ class QueueManager:
             )
 
             job.outputs[group_idx].output_path = final_path
+            job.outputs[group_idx].output_url = f"/outputs/{Path(final_path).name}"
             job.outputs[group_idx].duration_seconds = await self._probe_duration(final_path)
             job.outputs[group_idx].status = "done"
             reporter.log_info(f"Group {group_idx+1} complete: {final_path} ({job.outputs[group_idx].duration_seconds:.1f}s)")
@@ -435,7 +437,7 @@ class QueueManager:
         reporter.log_info(f"Job {job.id} complete with {job.num_output_groups} output(s)")
         await self._broadcast(broadcast_fn, job)
 
-    async def _final_edit_group(self, input_path: str, group: ReelGroup, working_dir) -> str:
+    def _final_edit_group(self, input_path: str, group: ReelGroup, working_dir) -> str:
         """Light final validation - probe duration, ensure under 90s."""
         from backend.config import OUTPUTS_DIR
         import subprocess
