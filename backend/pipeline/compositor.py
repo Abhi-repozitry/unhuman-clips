@@ -106,9 +106,14 @@ def _build_ducking_expression(narration_events: List[Dict[str, Any]]) -> str:
     if len(event_exprs) == 1:
         max_duck = event_exprs[0]
     else:
-        max_duck = "max(" + ",".join(event_exprs) + ")"
+        def _nest_max(exprs):
+            if len(exprs) == 1:
+                return exprs[0]
+            head, tail = exprs[0], _nest_max(exprs[1:])
+            return f"if(gte({head},{tail}),{head},{tail})"
+        max_duck = _nest_max(event_exprs)
 
-    return f"1.0-0.875*{max_duck}"
+    return f"1.0-0.95*{max_duck}"
 
 
 def compose_group(
@@ -262,7 +267,7 @@ def compose_group(
             "-i", str(clip_audio_output),
             "-i", str(narration_audio_output),
             "-filter_complex",
-            "[0:a][1:a]sidechaincompress=threshold=0.02:ratio=8:attack=5:release=300:makeup=1[ducked];[ducked][1:a]amix=inputs=2:duration=first:dropout_transition=0.1[mixed]",
+            f"[0:a]volume='{duck_expr}':eval=frame[ducked];[1:a]volume=1.6[narrboost];[ducked][narrboost]amix=inputs=2:duration=first:dropout_transition=0.1[mixed]",
             "-map", "[mixed]",
             "-c:a", "pcm_s16le", "-ar", "44100", "-ac", "2",
             "-y", str(mixed_audio_output)
