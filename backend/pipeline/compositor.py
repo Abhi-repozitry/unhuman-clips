@@ -264,7 +264,7 @@ def compose_group(
             "-i", str(clip_audio_output),
             "-i", str(narration_audio_output),
             "-filter_complex",
-            f"[0:a]volume={duck_expr}:eval=frame[ducked];[ducked][1:a]amix=inputs=2:duration=first:dropout_transition=0.1[mixed]",
+            f"[0:a]volume='{duck_expr}':eval=frame[ducked];[ducked][1:a]amix=inputs=2:duration=first:dropout_transition=0.1[mixed]",
             "-map", "[mixed]",
             "-c:a", "pcm_s16le", "-ar", "44100", "-ac", "2",
             "-y", str(mixed_audio_output)

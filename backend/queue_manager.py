@@ -398,7 +398,7 @@ class QueueManager:
                 [c.model_dump() for c in group.source_clips],
                 group_narration_audio,
                 group_clip_captions,
-                group_narration_captions,
+                [c["path"] for c in group_narration_captions],
                 job.source_path,
                 working_dir,
                 compositor_progress,
