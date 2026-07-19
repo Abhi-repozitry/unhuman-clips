@@ -1,10 +1,8 @@
 import subprocess
 import os
 from pathlib import Path
-from backend.config import HOOK_SECONDS, OUTPUTS_DIR, get_job_working_dir
+from backend.config import HOOK_SECONDS, OUTPUTS_DIR, get_job_working_dir, FFMPEG_PATH, FFPROBE_PATH
 from typing import Callable, Optional, List, Dict, Any
-
-FFMPEG_PATH = r"C:\Projects\unhuman-clips\ffmpeg\ffmpeg-8.1.2-full_build\bin\ffmpeg.exe"
 
 
 def _get_video_encoder(fallback=False):
@@ -235,7 +233,7 @@ def compose_group(
             )
 
         narration_inputs = "".join(f"[nar{i}]" for i in range(len(narration_audio)))
-        narration_filter_parts.append(f"{narration_inputs}amix=inputs={len(narration_audio)}:duration=first:dropout_transition=0.1[narration_mix]")
+        narration_filter_parts.append(f"{narration_inputs}amix=inputs={len(narration_audio)}:duration=longest:dropout_transition=0.1[narration_mix]")
 
         narration_audio_output = working_dir / f"group_{group_idx}_narration.wav"
         ffmpeg_narration = [
@@ -264,7 +262,7 @@ def compose_group(
             "-i", str(clip_audio_output),
             "-i", str(narration_audio_output),
             "-filter_complex",
-            f"[0:a]volume='{duck_expr}':eval=frame[ducked];[ducked][1:a]amix=inputs=2:duration=first:dropout_transition=0.1[mixed]",
+            "[0:a][1:a]sidechaincompress=threshold=0.02:ratio=8:attack=5:release=300:makeup=1[ducked];[ducked][1:a]amix=inputs=2:duration=first:dropout_transition=0.1[mixed]",
             "-map", "[mixed]",
             "-c:a", "pcm_s16le", "-ar", "44100", "-ac", "2",
             "-y", str(mixed_audio_output)
@@ -296,7 +294,7 @@ def compose_group(
 
     # Check duration
     probe = subprocess.run(
-        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+        [FFPROBE_PATH, "-v", "error", "-show_entries", "format=duration",
          "-of", "default=noprint_wrappers=1:nokey=1", str(output_path)],
         capture_output=True, text=True
     )

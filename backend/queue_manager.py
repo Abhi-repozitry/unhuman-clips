@@ -1,7 +1,7 @@
 import asyncio
 from typing import Optional, Callable, List
 from backend.models import VideoJob, JobStatus, ReelPlan, ReelGroup, OutputReel
-from backend.config import HOOK_SECONDS, get_job_working_dir
+from backend.config import HOOK_SECONDS, get_job_working_dir, FFMPEG_PATH, FFPROBE_PATH
 from backend.pipeline.downloader import download_video
 from backend.pipeline.transcriber import transcribe_video
 from backend.pipeline.analyzer import select_reel_plan, select_clips
@@ -441,7 +441,7 @@ class QueueManager:
         import subprocess
 
         probe = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+            [FFPROBE_PATH, "-v", "error", "-show_entries", "format=duration",
              "-of", "default=noprint_wrappers=1:nokey=1", input_path],
             capture_output=True, text=True
         )
@@ -451,7 +451,7 @@ class QueueManager:
             output_path = OUTPUTS_DIR / f"{group.group_index}_{group.reel_summary.title[:50]}.mp4"
             output_path.parent.mkdir(parents=True, exist_ok=True)
             subprocess.run(
-                ["ffmpeg", "-loglevel", "error", "-i", input_path, "-t", "90", "-c", "copy", "-y", str(output_path)],
+                [FFMPEG_PATH, "-loglevel", "error", "-i", input_path, "-t", "90", "-c", "copy", "-y", str(output_path)],
                 check=True
             )
             return str(output_path)
@@ -461,7 +461,7 @@ class QueueManager:
     async def _probe_duration(self, path: str) -> float:
         import subprocess
         probe = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+            [FFPROBE_PATH, "-v", "error", "-show_entries", "format=duration",
              "-of", "default=noprint_wrappers=1:nokey=1", path],
             capture_output=True, text=True
         )
