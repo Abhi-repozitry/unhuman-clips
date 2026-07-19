@@ -228,8 +228,8 @@ def generate_group_captions(
     # Narration captions (top zone) - reel-relative timing
     narration_caption_paths = []
     for i, event in enumerate(narration_events):
-        if not event.get("voice_id"):
-            continue  # skip non-TTS events
+        if event.get("event_type") not in ("hook", "commentary"):
+            continue
 
         out_path = working_dir / f"group_{group_idx}_narr_caption_{i}.ass"
 

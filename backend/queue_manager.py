@@ -253,7 +253,7 @@ class QueueManager:
 
             # --- VOICING for this group ---
             job.stage_index = 5
-            group_narration_events = [e for e in group.narration_events if e.voice_id is not None]
+            group_narration_events = [e for e in group.narration_events if e.event_type in ("hook", "commentary")]
             total_narration = len(group_narration_events)
             job.stage_data = {
                 "status": "voicing",
@@ -338,7 +338,7 @@ class QueueManager:
 
             # Narration captions (per narration_event, reel-relative)
             for i, event in enumerate(group.narration_events):
-                if not event.voice_id:
+                if event.event_type not in ("hook", "commentary"):
                     continue
                 job.stage_data = {
                     "status": "captioning",

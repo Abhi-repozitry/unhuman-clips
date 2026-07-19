@@ -221,57 +221,57 @@ def compose_group(
     _run_ffmpeg(ffmpeg_clip_audio, f"Group {group_idx} clip audio")
 
     # 3. Build narration audio track (narration events positioned at reel_start)
-    if progress_cb:
-        progress_cb(f"Group {group_idx+1}: Building narration audio track...", 55)
+    if narration_audio:
+        if progress_cb:
+            progress_cb(f"Group {group_idx+1}: Building narration audio track...", 55)
 
-    narration_filter_parts = []
-    for i, nar in enumerate(narration_audio):
-        path = nar["path"]
-        reel_start = nar["reel_start"]
-        # Use adelay to position narration at correct time
-        delay_ms = int(reel_start * 1000)
-        narration_filter_parts.append(
-            f"[{i+1}:a]adelay={delay_ms}|{delay_ms}[nar{i}]"
-        )
+        narration_filter_parts = []
+        for i, nar in enumerate(narration_audio):
+            path = nar["path"]
+            reel_start = nar["reel_start"]
+            delay_ms = int(reel_start * 1000)
+            narration_filter_parts.append(
+                f"[{i+1}:a]adelay={delay_ms}|{delay_ms}[nar{i}]"
+            )
 
-    narration_inputs = "".join(f"[nar{i}]" for i in range(len(narration_audio)))
-    narration_filter_parts.append(f"{narration_inputs}amix=inputs={len(narration_audio)}:duration=first:dropout_transition=0.1[narration_mix]")
+        narration_inputs = "".join(f"[nar{i}]" for i in range(len(narration_audio)))
+        narration_filter_parts.append(f"{narration_inputs}amix=inputs={len(narration_audio)}:duration=first:dropout_transition=0.1[narration_mix]")
 
-    narration_audio_output = working_dir / f"group_{group_idx}_narration.wav"
-    ffmpeg_narration = [
-        FFMPEG_PATH, "-loglevel", "error",
-        "-i", clip_audio_output,  # dummy input for filter chain
-    ]
-    # Add narration audio files as inputs
-    for nar in narration_audio:
-        ffmpeg_narration.extend(["-i", nar["path"]])
-    ffmpeg_narration.extend([
-        "-filter_complex", ";".join(narration_filter_parts),
-        "-map", "[narration_mix]",
-        "-c:a", "pcm_s16le", "-ar", "44100", "-ac", "2",
-        "-y", str(narration_audio_output)
-    ])
-    _run_ffmpeg(ffmpeg_narration, f"Group {group_idx} narration audio")
+        narration_audio_output = working_dir / f"group_{group_idx}_narration.wav"
+        ffmpeg_narration = [
+            FFMPEG_PATH, "-loglevel", "error",
+            "-i", clip_audio_output,
+        ]
+        for nar in narration_audio:
+            ffmpeg_narration.extend(["-i", nar["path"]])
+        ffmpeg_narration.extend([
+            "-filter_complex", ";".join(narration_filter_parts),
+            "-map", "[narration_mix]",
+            "-c:a", "pcm_s16le", "-ar", "44100", "-ac", "2",
+            "-y", str(narration_audio_output)
+        ])
+        _run_ffmpeg(ffmpeg_narration, f"Group {group_idx} narration audio")
 
-    # 4. Apply ducking to clip audio and mix with narration
-    if progress_cb:
-        progress_cb(f"Group {group_idx+1}: Applying audio ducking and mixing...", 70)
+        # 4. Apply ducking to clip audio and mix with narration
+        if progress_cb:
+            progress_cb(f"Group {group_idx+1}: Applying audio ducking and mixing...", 70)
 
-    # Build ducking expression from narration events
-    duck_expr = _build_ducking_expression(narration_audio)
+        duck_expr = _build_ducking_expression(narration_audio)
 
-    mixed_audio_output = working_dir / f"group_{group_idx}_mixed_audio.wav"
-    ffmpeg_mix = [
-        FFMPEG_PATH, "-loglevel", "error",
-        "-i", str(clip_audio_output),
-        "-i", str(narration_audio_output),
-        "-filter_complex",
-        f"[0:a]volume={duck_expr}:eval=frame[ducked];[ducked][1:a]amix=inputs=2:duration=first:dropout_transition=0.1[mixed]",
-        "-map", "[mixed]",
-        "-c:a", "pcm_s16le", "-ar", "44100", "-ac", "2",
-        "-y", str(mixed_audio_output)
-    ]
-    _run_ffmpeg(ffmpeg_mix, f"Group {group_idx} audio mix")
+        mixed_audio_output = working_dir / f"group_{group_idx}_mixed_audio.wav"
+        ffmpeg_mix = [
+            FFMPEG_PATH, "-loglevel", "error",
+            "-i", str(clip_audio_output),
+            "-i", str(narration_audio_output),
+            "-filter_complex",
+            f"[0:a]volume={duck_expr}:eval=frame[ducked];[ducked][1:a]amix=inputs=2:duration=first:dropout_transition=0.1[mixed]",
+            "-map", "[mixed]",
+            "-c:a", "pcm_s16le", "-ar", "44100", "-ac", "2",
+            "-y", str(mixed_audio_output)
+        ]
+        _run_ffmpeg(ffmpeg_mix, f"Group {group_idx} audio mix")
+    else:
+        mixed_audio_output = clip_audio_output
 
     # 5. Final mux: video + mixed audio
     if progress_cb:
