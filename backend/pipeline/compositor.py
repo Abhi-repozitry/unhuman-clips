@@ -94,7 +94,7 @@ def _build_ducking_filter_chain(narration_events, input_label="0:a", output_labe
         ramp_in = f"min(1,max(0,(t-{s})/0.12))"
         ramp_out = f"min(1,max(0,(t-({e}-0.18))/0.18))"
         duck = f"({ramp_in})*(1-{ramp_out})"
-        vol_expr = f"1.0-0.95*{duck}"
+        vol_expr = f"1.0-{duck}"
         nxt = output_label if i == len(valid_events) - 1 else f"duckstage{i}"
         parts.append(f"[{current}]volume='{vol_expr}':eval=frame[{nxt}]")
         current = nxt
