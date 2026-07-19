@@ -40,7 +40,7 @@ def _call_llm(messages: list, progress_cb: Optional[Callable[[str, float], None]
                 "model": model,
                 "messages": messages,
                 "temperature": 0.1,
-                "max_tokens": 2000,
+                "max_tokens": 4000,
             }
             try:
                 kwargs["response_format"] = {"type": "json_object"}
@@ -57,6 +57,7 @@ def _call_llm(messages: list, progress_cb: Optional[Callable[[str, float], None]
                     f"Refusal: {refusal}. "
                     f"Full response: {response}"
                 )
+            print(f"[DEBUG] LLM finish_reason: {response.choices[0].finish_reason}")
             return raw_content.strip()
         except Exception as e:
             last_error = e
@@ -287,6 +288,8 @@ def select_reel_plan(
         reel_plan = json.loads(raw_json)
         print(f"[DEBUG] Raw LLM reel_plan: {raw_json[:500].encode('ascii', 'replace').decode()}...")
     except Exception as e:
+        print(f"[WARN] First LLM response failed to parse: {e}")
+        print(f"[DEBUG] Raw content (first attempt): {raw_content[:2000].encode('ascii','replace').decode()}")
         if progress_cb:
             progress_cb("LLM returned non-JSON. Retrying with stricter constraints...", 40)
 
@@ -305,6 +308,7 @@ def select_reel_plan(
             reel_plan = json.loads(raw_json)
             print(f"[DEBUG] Raw LLM reel_plan (retry): {raw_json[:500].encode('ascii', 'replace').decode()}...")
         except Exception as e2:
+            print(f"[DEBUG] Raw content (retry attempt): {raw_content_retry[:2000].encode('ascii','replace').decode()}")
             print(f"[WARN] LLM failed to produce JSON after retry: {e2}")
             print("[INFO] Using fallback reel plan")
             return ReelPlan(**_fallback_reel_plan(transcript, video_title))
