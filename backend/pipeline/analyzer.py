@@ -22,9 +22,9 @@ from typing import Callable, Optional
 MIN_COMMENTARY_WINDOW_SECONDS = 2.5
 
 
-def _summarize_transcript_for_llm(transcript: list, max_total_chars: int = 14000) -> str:
+def _summarize_transcript_for_llm(transcript: list, max_total_chars: int = 15000) -> str:
     """
-    Summarize a long transcript for LLM consumption, targeting 12000-15000 chars.
+    Summarize a long transcript for LLM consumption, targeting 13000-16000 chars.
     Prioritizes segments with high emotional impact, questions, surprises,
     skill displays, contrasts, strong action, and high-stakes statements.
     Preserves context around key moments — does not over-merge or cut aggressively.
@@ -351,7 +351,13 @@ TRANSCRIPT:
 {transcript_text}
 
 CRITICAL INSTRUCTION:
-Create 4 to 6 distinct, high-impact reel_groups from the video. Each group MUST use 4-7 source clips to tell a complete, self-contained story. Do NOT create fewer than 4 groups. Each reel MUST be 60-90 seconds (75+ seconds ideal).
+Create 5 to 6 distinct, high-impact reel_groups from the video. Each group MUST use 5-8 source clips to tell a complete, self-contained story. Do NOT create fewer than 5 groups. Each reel MUST be 60-90 seconds (75+ seconds ideal).
+
+CLIP SELECTION — CHOOSE FOR CURIOSITY GAP:
+- Pick clips that create strong curiosity gaps — moments where the viewer NEEDS to know what happens next
+- Examples: setup of a challenge before we see the result, a surprising statement before the explanation, a tense moment before the resolution
+- Choose clips that naturally build on each other: setup clip → tension clip → payoff clip
+- Avoid picking clips that are just talking heads or filler explanations without narrative tension
 
 VIRAL HOOK PSYCHOLOGY & CURIOSITY GAP:
 
@@ -392,14 +398,14 @@ VIRAL HOOK PSYCHOLOGY & CURIOSITY GAP:
    ✗ "This shows teamwork." (generic label, not specific insight)
 
 4. SOURCE CLIPS (source_clips array):
-   - Use 4-7 source clips per group to build a complete story
+   - Use 5-8 source clips per group to build a complete story
    - Each clip should serve a specific narrative purpose: establish context, add tension, or deliver payoff
    - Choose substantial clips (6-15 seconds each) — enough to feel the moment but not drag
    - The total raw source duration should be ~35-55s per group (narration fills the rest)
 
 5. OUTPUT RULES:
    - Each reel_group MUST have estimated_duration_seconds between 60 and 90 seconds
-   - 4-6 groups total with 4-7 clips each
+   - 5-6 groups total with 5-8 clips each
    - The complete JSON must parse correctly — do NOT truncate or omit any fields
    - Do NOT output incomplete JSON. Always produce the full reel_groups array.
    - Use precise source timestamps that align with actual transcript segments
@@ -658,8 +664,8 @@ def select_reel_plan(
     if not transcript:
         raise RuntimeError("Transcript is empty; cannot build reel plan.")
 
-    # Smart transcript summarization targeting 12000-15000 chars
-    transcript_text = _summarize_transcript_for_llm(transcript, max_total_chars=14000)
+    # Smart transcript summarization targeting 13000-16000 chars
+    transcript_text = _summarize_transcript_for_llm(transcript, max_total_chars=15000)
 
     description = (video_description or "")[:500]
 
@@ -934,7 +940,7 @@ def select_clips(transcript: list, video_title: str, video_description: str, pro
     if not transcript:
         raise RuntimeError("Transcript is empty; cannot select clips.")
 
-    transcript_text = _summarize_transcript_for_llm(transcript, max_total_chars=14000)
+    transcript_text = _summarize_transcript_for_llm(transcript, max_total_chars=15000)
 
     description = (video_description or "")[:500]
 
