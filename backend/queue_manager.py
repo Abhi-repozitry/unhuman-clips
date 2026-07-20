@@ -323,6 +323,7 @@ class QueueManager:
             group_narration_captions = []
 
             # Clip captions (from transcript, per source_clip)
+            cumulative_offset = 0.0
             for i, clip in enumerate(group.source_clips):
                 reporter.update_clip_progress(i, "captioning", (i / len(group.source_clips)) * 100)
                 job.stage_data = {
@@ -345,8 +346,10 @@ class QueueManager:
                     clip.source_end,
                     str(clip_caption_path),
                     caption_progress,
+                    cumulative_offset,
                 )
                 group_clip_captions.append(str(clip_caption_path))
+                cumulative_offset += (clip.source_end - clip.source_start)
 
             # Narration captions (per synthesized audio item, reel-relative)
             for i, nar in enumerate(group_narration_audio):

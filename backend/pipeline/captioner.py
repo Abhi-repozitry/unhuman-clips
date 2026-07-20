@@ -67,7 +67,8 @@ def _make_style(name: str, font: str, size: int, alignment: int, margin_v: int,
 
 def generate_clip_ass(transcript: list, clip_start: float, clip_end: float,
                       out_path: str,
-                      progress_cb: Optional[Callable[[str, float], None]] = None) -> str:
+                      progress_cb: Optional[Callable[[str, float], None]] = None,
+                      start_time: float = 0.0) -> str:
     """Generate captions for original-clip segments — bottom-aligned with background box."""
     if progress_cb:
         progress_cb("Filtering transcript for clip...", 20)
@@ -99,8 +100,8 @@ def generate_clip_ass(transcript: list, clip_start: float, clip_end: float,
     for entry in filtered:
         wrapped = _wrap_text_ass(entry["text"], max_chars=28)
         text = _escape_ass_text(wrapped)
-        start_ts = _format_timestamp(entry["start"])
-        end_ts = _format_timestamp(entry["end"])
+        start_ts = _format_timestamp(entry["start"] + start_time)
+        end_ts = _format_timestamp(entry["end"] + start_time)
         dialogues.append(
             f"Dialogue: 0,{start_ts},{end_ts},ClipCaption,,0,0,0,,"
             f"{{\\bord3\\shad2\\fn{CAPTION_FONT}}}{text}"
