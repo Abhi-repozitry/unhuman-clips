@@ -22,10 +22,12 @@ from typing import Callable, Optional
 MIN_COMMENTARY_WINDOW_SECONDS = 2.5
 
 
-def _summarize_transcript_for_llm(transcript: list, max_total_chars: int = 3500) -> str:
+def _summarize_transcript_for_llm(transcript: list, max_total_chars: int = 10000) -> str:
     """
-    Aggressively summarize a long transcript for LLM consumption.
-    Keeps only the most informative segments within the char limit.
+    Summarize a long transcript for LLM consumption, targeting 8000-12000 chars.
+    Prioritizes segments with high emotional impact, questions, surprises,
+    skill displays, contrasts, and strong statements.
+    Keeps more context around key moments instead of heavy merging.
     """
     if not transcript:
         return ""
@@ -39,48 +41,151 @@ def _summarize_transcript_for_llm(transcript: list, max_total_chars: int = 3500)
     if len(full_text) <= max_total_chars:
         return full_text
 
-    print(f"[INFO] Transcript too long ({len(full_text)} chars), aggressive summarization...")
+    print(f"[INFO] Transcript too long ({len(full_text)} chars), smart summarization targeting ~{max_total_chars} chars...")
 
-    # Score segments by informativeness
-    scored = []
+    # Score segments by engagement/informativeness signals
     filler_words = {"okay", "yeah", "right", "uh", "um", "oh", "so", "well", "huh", "like", "just", "wow", "ah", "hmm"}
+
+    # High-signal keywords that indicate engaging content
+    strong_terms = {
+        "but", "because", "actually", "important", "problem", "why", "how",
+        "wait", "what", "really", "never", "always", "must", "need",
+        "secret", "hidden", "truth", "reveal", "shock", "insane", "crazy",
+        "best", "worst", "most", "ever", "first", "finally", "finally",
+        "impossible", "possible", "change", "different", "compare",
+        "win", "lose", "beat", "amazing", "incredible", "unbelievable",
+        "watch", "look", "listen", "notice", "see this", "check",
+        "breakthrough", "discover", "found", "invent", "create",
+        "struggle", "fail", "success", "achieve", "master", "expert",
+        "versus", "vs", "vs.", "verses", "battle", "fight", "contest",
+        "lesson", "learn", "teach", "explain", "understand", "realize",
+        "surprising", "curious", "fascinating", "interesting",
+        "guarantee", "prove", "evidence", "research", "study", "data",
+        "before", "after", "result", "outcome", "impact", "effect",
+        "challenge", "difficult", "hard", "easy", "simple", "complex",
+        "controversial", "debate", "argument", "opinion", "fact",
+        "dangerous", "risky", "safe", "protect", "save", "avoid",
+        "guaranteed", "certain", "uncertain", "maybe", "perhaps",
+        "dream", "goal", "ambition", "vision", "future", "potential",
+        "shocking", "stunning", "remarkable", "extraordinary", "unusual",
+    }
+
+    scored = []
     for i, entry in enumerate(transcript):
         duration = entry['end'] - entry['start']
         text = entry['text'].strip()
         words = text.split()
         word_count = len(words)
+        lowered = text.lower()
 
-        # Score: longer segments with more words = more informative
+        # Base score from word count (more words = more substance)
         score = word_count
+
+        # Penalize very short filler segments
         if duration < 0.8:
             score -= 5
-        if word_count <= 2 and text.lower() in filler_words:
+        if word_count <= 2 and lowered.strip() in filler_words:
             score -= 10
+
+        # --- POSITIVE SIGNALS ---
+
+        # Questions create engagement
         if "?" in text:
+            score += 5
+
+        # Exclamations / strong statements
+        if text.endswith("!"):
+            score += 4
+
+        # Strong/emotional keywords
+        for term in strong_terms:
+            if term in lowered:
+                score += 3
+
+        # Contrast indicators (but, however, although, yet, still)
+        if any(w in lowered.split() for w in ("but", "however", "although", "yet", "still", "despite", "though")):
+            score += 5
+
+        # Surprise indicators
+        if any(w in lowered.split() for w in ("wow", "whoa", "oh", "ah", "ha", "surprise", "unexpected", "suddenly")):
+            score += 5
+
+        # Skill / expertise displays (numbers, data, specific terminology)
+        if re.search(r'\d+', text):  # numbers
             score += 3
-        if any(w in text.lower() for w in ("but", "because", "actually", "important", "problem", "why", "how")):
+        if any(len(w) > 12 for w in words):  # technical/long words
+            score += 2
+
+        # Emotional impact signals
+        emotion_words = {"love", "hate", "fear", "scared", "excited", "amazing", "terrible",
+                         "beautiful", "ugly", "happy", "sad", "angry", "frustrated",
+                         "proud", "embarrassed", "shocked", "disgust", "hope", "despair",
+                         "thrilled", "devastated", "stunning", "horrifying", "delight",
+                         "heartbreaking", "breathtaking", "hilarious", "intense"}
+        if any(ew in lowered.split() for ew in emotion_words):
+            score += 4
+
+        # Self-corrections, hesitations, emphasis (authentic moments)
+        if any(w in lowered.split() for w in ("i mean", "actually", "literally", "basically",
+                                                "honestly", "truthfully", "frankly", "truly",
+                                                "really", "seriously", "absolutely", "definitely")):
             score += 3
 
-        scored.append((score, i, entry["start"], entry["end"], text))
+        scored.append((score, i, entry["start"], entry["end"], text, lowered))
 
-    # Sort by score descending, take top segments
+    # Sort by score descending
     scored.sort(key=lambda x: -x[0])
 
-    result_lines = []
+    # Build result with context windows: when we pick a high-scoring segment,
+    # also include its immediate neighbors for narrative continuity
+    result_indices = set()
+    selected_segments = []
     total_chars = 0
-    for score, i, start, end, text in scored:
-        line = f"Seg {i} [{start:.1f}-{end:.1f}s]: {text}\n"
-        if total_chars + len(line) > max_total_chars:
+    context_window = 1  # number of adjacent segments to include on each side
+
+    for score, i, start, end, text, lowered in scored:
+        if total_chars >= max_total_chars:
             break
-        result_lines.append((i, line))
-        total_chars += len(line)
+        if i in result_indices:
+            continue
+
+        # Add the segment itself
+        line = f"Seg {i} [{start:.1f}-{end:.1f}s]: {text}\n"
+        if total_chars + len(line) <= max_total_chars:
+            result_indices.add(i)
+            selected_segments.append((i, line))
+            total_chars += len(line)
+        else:
+            continue
+
+        # Add neighbor segments for context (before and after)
+        for offset in range(1, context_window + 1):
+            # Try adding segment after
+            after_idx = i + offset
+            if after_idx < len(transcript) and after_idx not in result_indices and total_chars < max_total_chars:
+                entry_after = transcript[after_idx]
+                line_after = f"Seg {after_idx} [{entry_after['start']:.1f}-{entry_after['end']:.1f}s]: {entry_after['text']}\n"
+                if total_chars + len(line_after) <= max_total_chars:
+                    result_indices.add(after_idx)
+                    selected_segments.append((after_idx, line_after))
+                    total_chars += len(line_after)
+
+            # Try adding segment before
+            before_idx = i - offset
+            if before_idx >= 0 and before_idx not in result_indices and total_chars < max_total_chars:
+                entry_before = transcript[before_idx]
+                line_before = f"Seg {before_idx} [{entry_before['start']:.1f}-{entry_before['end']:.1f}s]: {entry_before['text']}\n"
+                if total_chars + len(line_before) <= max_total_chars:
+                    result_indices.add(before_idx)
+                    selected_segments.append((before_idx, line_before))
+                    total_chars += len(line_before)
 
     # Re-sort by segment index to maintain chronological order
-    result_lines.sort(key=lambda x: x[0])
-    compressed = "".join(line for _, line in result_lines)
+    selected_segments.sort(key=lambda x: x[0])
+    compressed = "".join(line for _, line in selected_segments)
 
     print(f"[INFO] Transcript compressed from {len(full_text)} to {len(compressed)} chars "
-          f"({len(result_lines)} of {len(transcript)} segments kept)")
+          f"({len(selected_segments)} of {len(transcript)} segments kept)")
     return compressed
 
 
@@ -108,8 +213,8 @@ def _call_llm(messages: list, progress_cb: Optional[Callable[[str, float], None]
                     "model": model,
                     "messages": messages,
                     "temperature": 0.1,
-                    "max_tokens": 32768,
-                    "timeout": 240.0,
+                    "max_tokens": 65536,
+                    "timeout": 480.0,
                 }
                 try:
                     kwargs["response_format"] = {"type": "json_object"}
@@ -158,20 +263,23 @@ def _call_llm(messages: list, progress_cb: Optional[Callable[[str, float], None]
 
 
 def _try_repair_truncated_json(text: str) -> str:
-    """Try to repair a truncated JSON by balancing braces and brackets."""
+    """Try to repair a truncated JSON by balancing braces and brackets,
+    fixing trailing commas, and adding missing array/object separators."""
     if not text:
         return ""
 
+    # Remove trailing whitespace and commas
+    repaired = text.rstrip().rstrip(",")
+
     # Count opening/closing braces and brackets
-    open_braces = text.count("{")
-    close_braces = text.count("}")
-    open_brackets = text.count("[")
-    close_brackets = text.count("]")
+    open_braces = repaired.count("{")
+    close_braces = repaired.count("}")
+    open_brackets = repaired.count("[")
+    close_brackets = repaired.count("]")
 
     # Add missing closing braces/brackets
-    repaired = text.rstrip().rstrip(",")
-    repaired += "}" * (open_braces - close_braces)
-    repaired += "]" * (open_brackets - close_brackets)
+    repaired += "}" * max(0, open_braces - close_braces)
+    repaired += "]" * max(0, open_brackets - close_brackets)
 
     # Try to parse
     try:
@@ -180,21 +288,71 @@ def _try_repair_truncated_json(text: str) -> str:
     except json.JSONDecodeError:
         pass
 
-    # If still broken, try to find the last complete JSON object
+    # If still broken, try more aggressive repairs
+    # 1. Fix trailing commas before closing brackets/braces
+    repaired = re.sub(r',\s*([}\]])', r'\1', text)
+
+    # Add missing braces again after comma fix
+    open_braces = repaired.count("{")
+    close_braces = repaired.count("}")
+    open_brackets = repaired.count("[")
+    close_brackets = repaired.count("]")
+    repaired += "}" * max(0, open_braces - close_braces)
+    repaired += "]" * max(0, open_brackets - close_brackets)
+
+    try:
+        json.loads(repaired)
+        return repaired
+    except json.JSONDecodeError:
+        pass
+
+    # 2. Try to find the last complete JSON object by scanning backwards
     try:
         # Find the outermost object
-        start = repaired.find("{")
-        if start >= 0:
+        for start_pos in [repaired.find("{"), repaired.find("[")]:
+            if start_pos < 0:
+                continue
             depth = 0
-            for i in range(start, len(repaired)):
-                if repaired[i] == "{":
+            in_string = False
+            escape = False
+            for i in range(start_pos, len(repaired)):
+                ch = repaired[i]
+                if escape:
+                    escape = False
+                    continue
+                if ch == '\\' and in_string:
+                    escape = True
+                    continue
+                if ch == '"':
+                    in_string = not in_string
+                    continue
+                if in_string:
+                    continue
+                if ch in ('{', '['):
                     depth += 1
-                elif repaired[i] == "}":
+                elif ch in ('}', ']'):
                     depth -= 1
                     if depth == 0:
-                        candidate = repaired[start:i+1]
+                        candidate = repaired[start_pos:i+1]
+                        try:
+                            json.loads(candidate)
+                            return candidate
+                        except json.JSONDecodeError:
+                            continue
+    except (json.JSONDecodeError, IndexError):
+        pass
+
+    # 3. Last resort: try to find any valid JSON substring
+    try:
+        for start_pos in range(len(repaired)):
+            if repaired[start_pos] in ('{', '['):
+                for end_pos in range(len(repaired), start_pos, -1):
+                    candidate = repaired[start_pos:end_pos]
+                    try:
                         json.loads(candidate)
                         return candidate
+                    except json.JSONDecodeError:
+                        continue
     except (json.JSONDecodeError, IndexError):
         pass
 
@@ -202,23 +360,80 @@ def _try_repair_truncated_json(text: str) -> str:
 
 
 def _build_reel_plan_prompt(video_title: str, video_description: str, transcript_text: str) -> str:
-    """Build the full LLM prompt for reel_plan generation with persona."""
-    return f"""You are a viral content strategist. Turn this video into scroll-stopping reels (<=90s each).
+    """Build the full LLM prompt for reel_plan generation with enhanced persona and instructions."""
+    return f"""You are a world-class short-form content strategist who creates viral YouTube Shorts and Instagram Reels. Your reels consistently achieve high retention because you understand narrative structure, emotional pacing, and scroll-stopping hooks.
 
 TITLE: {video_title}
-DESC: {video_description[:300]}
+DESC: {video_description[:500]}
 TRANSCRIPT:
 {transcript_text}
 
-RULES:
-1. HOOK (0-3s): Specific scroll-stopper. Formula: [specific moment] + [why it matters]. NEVER "This is amazing!" or "You won't believe this!"
-2. ARC: SETUP (context) -> TENSION (stakes) -> PAYOFF (no narration over payoff). First clip gives context. Last clip resolves.
-3. PRIORITIZE: emotional impact > surprise > skill > stakes > spectacle. Exclude filler.
-4. COMMENTARY: Insider explaining what/why. NOT hype. ✓ "Notice his hands shaking." ✗ "This is crazy!"
-5. NARRATION: ~1 per 15-20s. Min 2 (hook + 1). Max 3-5 for 45-90s. Most clips play on original audio. Silence between events. 2-3 sentences max.
-6. Output complete valid JSON. Do NOT truncate.
+CRITICAL INSTRUCTION:
+Always create 3 to 6 distinct, high-value reel_groups from the video. Each reel_group must be a complete, self-contained story unit. Do NOT create fewer than 3 groups.
 
-OUTPUT ONLY JSON:
+DURATION TARGET: Each reel MUST be 60-90 seconds long. Do NOT create reels shorter than 60 seconds. 75+ seconds is ideal. The final output is meant for YouTube Shorts and Instagram Reels where 60-90 seconds is the sweet spot for deep engagement.
+
+REEL STRUCTURE REQUIREMENTS:
+
+1. VIRAL HOOK (first 0-3 seconds of each reel):
+   - Must be a specific, curiosity-driven statement anchored to a real moment in the clip(s)
+   - Formula: [specific moment/observation] + [why it matters / what's at stake]
+   - Creates an information gap that can ONLY be resolved by watching further
+
+   GOOD examples:
+   ✓ "The inventor spent 3 years building a robot that can cry. But when he turned it on, something happened he never expected."
+   ✓ "Most people think AI just memorizes answers. But watch what happens when you ask it a question it was never trained on."
+   ✓ "This 30-second clip reveals why Google's top engineer quit to start his own lab."
+
+   BAD examples:
+   ✗ "This is crazy!" (generic hype, no specific moment)
+   ✗ "You won't believe what happens next!" (clickbait without substance)
+   ✗ "Let's talk about AI." (too vague, no hook mechanism)
+
+2. NARRATIVE ARC - Each reel must have:
+   - SETUP (context): Establishes who, what, where, why this matters. Use 1-2 clips for setup
+   - RISING ACTION / TENSION: Builds stakes, reveals complications, deepens understanding. Use 2-3 clips
+   - SATISFYING PAYOFF: The resolution, reveal, or key insight. Let 1-2 clips of original audio speak without narration over it
+   - To reach 60-90s, multiply the total source_clips: each clip should average 8-15 seconds and you need 4-6 clips per group
+
+3. INSIGHTFUL COMMENTARY (narration_events):
+   - Act as an insider explainer who reveals what's REALLY happening
+   - Each commentary should deepen understanding, not restate what's visible
+   - ~1 narration per 10-15 seconds of reel (more narration = longer, richer reel)
+   - Minimum 3-4 narration events per group
+   - Maximum 5-7 narration events for 60-90 second reels
+   - 2-3 sentences max per event
+   - Never state the obvious
+
+   GOOD examples:
+   ✓ "Notice his hands are shaking — that's not nervousness. That's years of muscle memory fighting with a new technique he's never tried in competition."
+   ✓ "Most people miss the critical detail here: the instrument cluster shows the car was still in second gear. He never shifted."
+
+   BAD examples:
+   ✗ "This is amazing!" (hype without insight — tell us WHY)
+   ✗ "He's driving really fast." (describes what we can already see)
+   ✗ "This shows teamwork." (generic label, not specific insight)
+
+4. SOURCE CLIPS (source_clips array):
+   - Use MULTIPLE source_clips per group (at least 4, ideally 5-6) when it strengthens the story
+   - Each clip should serve a specific narrative purpose: establish context, add tension, or deliver payoff
+   - Clip selection should feel intentional — each one adds something the others don't
+   - Choose substantial clips (8-15 seconds each) — small snippets under 5 seconds cannot build a compelling narrative
+
+5. OUTPUT RULES:
+   - Each reel_group MUST have an estimated_duration_seconds between 60 and 90 seconds
+   - source_clips total raw duration should be ~40-60s of the final runtime
+   - narration_events plus the hook should add ~20-30s more
+   - The complete JSON must parse correctly — do NOT truncate or omit any fields
+   - Do NOT output incomplete JSON. Always produce the full reel_groups array.
+   - Use precise source timestamps that align with actual transcript segments
+
+PRIORITIZATION (in order):
+   emotional impact > surprise > skill demonstration > stakes > spectacle > interesting fact
+
+Exclude: filler content, rambling, off-topic tangents, repetitive statements.
+
+OUTPUT ONLY VALID JSON — no explanations, no thinking, no text before or after:
 {{
   "reel_groups": [
     {{
@@ -247,7 +462,7 @@ OUTPUT ONLY JSON:
 def _fallback_reel_plan(transcript: list, video_title: str) -> dict:
     """
     Fallback: generate 3-5 reel groups from transcript segments.
-    Each group gets 3-4 clips forming a mini-story arc.
+    Each group gets 3-5 clips forming a mini-story arc spread across the video.
     """
     if not transcript:
         return {"reel_groups": []}
@@ -258,13 +473,25 @@ def _fallback_reel_plan(transcript: list, video_title: str) -> dict:
         duration = entry["end"] - entry["start"]
         text = entry["text"].strip()
         words = text.split()
+        lowered = text.lower()
         score = len(words)
         if duration >= 3.0:
             score += 2
         if "?" in text:
             score += 3
-        if any(w in text.lower() for w in ("but", "because", "actually", "important", "problem", "why", "how", "win", "lose", "beat", "amazing", "incredible")):
+        if text.endswith("!"):
             score += 2
+        # Strong engagement signals
+        strong_terms = (
+            "but", "because", "actually", "important", "problem", "why", "how",
+            "win", "lose", "beat", "amazing", "incredible", "secret", "hidden",
+            "truth", "reveal", "shock", "insane", "crazy", "best", "worst",
+            "most", "ever", "first", "finally", "impossible", "possible",
+            "change", "different", "wait", "what", "really", "never",
+        )
+        for term in strong_terms:
+            if term in lowered:
+                score += 2
         scored_segments.append((score, i, entry["start"], entry["end"], text, duration))
 
     scored_segments.sort(key=lambda x: -x[0])
@@ -272,8 +499,8 @@ def _fallback_reel_plan(transcript: list, video_title: str) -> dict:
     # Pick top segments, spread across the video timeline
     total_duration = transcript[-1]["end"] - transcript[0]["start"]
     groups = []
-    clips_per_group = 3
-    num_groups = min(5, max(3, len(transcript) // 20))
+    clips_per_group = 4  # Increased from 3 to 4 for richer groups
+    num_groups = min(5, max(3, len(transcript) // 15))
 
     for g in range(num_groups):
         group_clips = []
@@ -288,26 +515,52 @@ def _fallback_reel_plan(transcript: list, video_title: str) -> dict:
         for score, i, start, end, text, duration in zone_segments:
             if len(group_clips) >= clips_per_group:
                 break
-            if group_duration + duration > 25.0:
+            if group_duration + duration > 30.0:  # Increased from 25s to allow more content
                 continue
             group_clips.append({
                 "source_start": start,
                 "source_end": end,
-                "reason": f"Key moment: {text[:80]}"
+                "reason": f"Key moment: {text[:100]}"
             })
             group_duration += duration
 
-        # If zone had no good segments, grab from anywhere
-        if not group_clips:
-            for score, i, start, end, text, duration in scored_segments:
+        # If zone had few good segments, supplement from adjacent zones
+        if len(group_clips) < clips_per_group:
+            # Look for additional strong segments nearby
+            nearby_range = total_duration / num_groups
+            nearby_start = max(0, target_zone_start - nearby_range * 0.5)
+            nearby_end = min(total_duration, target_zone_end + nearby_range * 0.5)
+            nearby_segments = [
+                s for s in scored_segments
+                if nearby_start <= s[2] <= nearby_end and s[1] not in [c["source_start"] for c in group_clips]
+            ]
+            nearby_segments.sort(key=lambda x: -x[0])
+            for score, i, start, end, text, duration in nearby_segments:
                 if len(group_clips) >= clips_per_group:
                     break
-                if group_duration + duration > 25.0:
+                if group_duration + duration > 30.0:
+                    continue
+                # Avoid duplicate
+                if any(abs(c["source_start"] - start) < 1.0 for c in group_clips):
                     continue
                 group_clips.append({
                     "source_start": start,
                     "source_end": end,
-                    "reason": f"Key moment: {text[:80]}"
+                    "reason": f"Key moment: {text[:100]}"
+                })
+                group_duration += duration
+
+        # If still not enough clips, grab from anywhere
+        if not group_clips:
+            for score, i, start, end, text, duration in scored_segments:
+                if len(group_clips) >= clips_per_group:
+                    break
+                if group_duration + duration > 30.0:
+                    continue
+                group_clips.append({
+                    "source_start": start,
+                    "source_end": end,
+                    "reason": f"Key moment: {text[:100]}"
                 })
                 group_duration += duration
 
@@ -315,14 +568,15 @@ def _fallback_reel_plan(transcript: list, video_title: str) -> dict:
             continue
 
         hook_duration = 3.0
-        commentary_duration = len(group_clips) * 3.0
+        commentary_count = min(len(group_clips), 4)
+        commentary_duration = commentary_count * 3.0
         estimated = group_duration + hook_duration + commentary_duration
 
         group_title = f"{video_title[:50]} - Part {g+1}" if video_title else f"Part {g+1}"
 
         groups.append({
             "group_index": g,
-            "group_reasoning": f"Fallback group {g+1}: {len(group_clips)} clips from video segment",
+            "group_reasoning": f"Fallback group {g+1}: {len(group_clips)} clips from video segment (approx {group_duration:.0f}s of source footage)",
             "estimated_duration_seconds": min(estimated, 90.0),
             "reel_summary": {
                 "title": group_title,
@@ -351,7 +605,7 @@ def _fallback_reel_plan(transcript: list, video_title: str) -> dict:
                     "text": f"Notice what happens here — {c['reason'][:50]}",
                     "voice_id": None
                 }
-                for j, c in enumerate(group_clips)
+                for j, c in enumerate(group_clips[:commentary_count])
             ]
         })
 
@@ -359,9 +613,9 @@ def _fallback_reel_plan(transcript: list, video_title: str) -> dict:
         # Absolute fallback: one group with first few segments
         source_clips = []
         total_dur = 0.0
-        for entry in transcript[:5]:
+        for entry in transcript[:8]:
             dur = entry["end"] - entry["start"]
-            if total_dur + dur > 30.0:
+            if total_dur + dur > 35.0:
                 break
             source_clips.append({
                 "source_start": entry["start"],
@@ -389,7 +643,10 @@ def _fallback_reel_plan(transcript: list, video_title: str) -> dict:
             ]
         })
 
-    print(f"[INFO] Fallback generated {len(groups)} group(s) with {sum(len(g['source_clips']) for g in groups)} total clips")
+    # Log stats
+    total_clips = sum(len(g['source_clips']) for g in groups)
+    avg_duration = sum(g.get('estimated_duration_seconds', 0) for g in groups) / max(len(groups), 1)
+    print(f"[INFO] Fallback generated {len(groups)} group(s) with {total_clips} total clips, avg duration {avg_duration:.0f}s")
     return {"reel_groups": groups}
 
 
@@ -422,15 +679,16 @@ def select_reel_plan(
     if not transcript:
         raise RuntimeError("Transcript is empty; cannot build reel plan.")
 
-    # Aggressive transcript summarization
-    transcript_text = _summarize_transcript_for_llm(transcript, max_total_chars=3500)
+    # Smart transcript summarization targeting 8000-12000 chars
+    transcript_text = _summarize_transcript_for_llm(transcript, max_total_chars=10000)
 
-    description = (video_description or "")[:300]
+    description = (video_description or "")[:500]
 
     if progress_cb:
         progress_cb("Sending transcript to LLM for reel planning...", 30)
 
     prompt = _build_reel_plan_prompt(video_title, description, transcript_text)
+    print(f"[DEBUG] Prompt length: {len(prompt)} chars, transcript chunk: {len(transcript_text)} chars")
 
     try:
         raw_content = _call_llm(
@@ -445,14 +703,27 @@ def select_reel_plan(
         print("[INFO] Using fallback reel plan (multi-group)")
         if progress_cb:
             progress_cb("Using fallback reel plan...", 50)
-        return ReelPlan(**_fallback_reel_plan(transcript, video_title), is_fallback=True)
+        result = _fallback_reel_plan(transcript, video_title)
+        groups = result.get("reel_groups", [])
+        total_clips = sum(len(g.get("source_clips", [])) for g in groups)
+        print(f"[INFO] FALLBACK RESULT: {len(groups)} groups, {total_clips} total clips")
+        return ReelPlan(**result, is_fallback=True)
 
     if progress_cb:
         progress_cb("Parsing reel plan...", 80)
 
     try:
         raw_json = _extract_json_object(raw_content)
-        reel_plan = json.loads(raw_json)
+        # Try to parse — if it fails, attempt repair
+        try:
+            reel_plan = json.loads(raw_json)
+        except json.JSONDecodeError:
+            repaired = _try_repair_truncated_json(raw_json)
+            if repaired:
+                print(f"[INFO] Repaired malformed JSON from LLM")
+                reel_plan = json.loads(repaired)
+            else:
+                raise
         truncated = raw_json[:500].encode('ascii', 'replace').decode()
         print(f"[DEBUG] Raw LLM reel_plan: {truncated}...")
     except Exception as e:
@@ -466,7 +737,7 @@ def select_reel_plan(
             [
                 {
                     "role": "user",
-                    "content": prompt + "\n\nCRITICAL: Output ONLY the JSON object. No additional text."
+                    "content": prompt + "\n\nCRITICAL: Output ONLY the complete JSON object. No additional text. Do not truncate."
                 }
             ],
             progress_cb,
@@ -474,7 +745,15 @@ def select_reel_plan(
 
         try:
             raw_json = _extract_json_object(raw_content_retry)
-            reel_plan = json.loads(raw_json)
+            try:
+                reel_plan = json.loads(raw_json)
+            except json.JSONDecodeError:
+                repaired = _try_repair_truncated_json(raw_json)
+                if repaired:
+                    print(f"[INFO] Repaired malformed JSON from LLM retry")
+                    reel_plan = json.loads(repaired)
+                else:
+                    raise
             retry_truncated = raw_json[:500].encode('ascii', 'replace').decode()
             print(f"[DEBUG] Raw LLM reel_plan (retry): {retry_truncated}...")
         except Exception as e2:
@@ -482,17 +761,29 @@ def select_reel_plan(
             print(f"[DEBUG] Raw content (retry attempt): {retry_preview}")
             print(f"[WARN] LLM failed to produce JSON after retry: {e2}")
             print("[INFO] Using fallback reel plan")
-            return ReelPlan(**_fallback_reel_plan(transcript, video_title), is_fallback=True)
+            result = _fallback_reel_plan(transcript, video_title)
+            groups = result.get("reel_groups", [])
+            total_clips = sum(len(g.get("source_clips", [])) for g in groups)
+            print(f"[INFO] FALLBACK RESULT: {len(groups)} groups, {total_clips} total clips")
+            return ReelPlan(**result, is_fallback=True)
 
     if not isinstance(reel_plan, dict) or "reel_groups" not in reel_plan:
         print(f"[WARN] LLM returned object without 'reel_groups' key: {reel_plan}")
         print("[INFO] Using fallback reel plan")
-        return ReelPlan(**_fallback_reel_plan(transcript, video_title), is_fallback=True)
+        result = _fallback_reel_plan(transcript, video_title)
+        groups = result.get("reel_groups", [])
+        total_clips = sum(len(g.get("source_clips", [])) for g in groups)
+        print(f"[INFO] FALLBACK RESULT: {len(groups)} groups, {total_clips} total clips")
+        return ReelPlan(**result, is_fallback=True)
 
     groups = reel_plan["reel_groups"]
     if not isinstance(groups, list) or len(groups) == 0:
         print(f"[WARN] 'reel_groups' must be a non-empty array, got {type(groups)}. Using fallback.")
-        return ReelPlan(**_fallback_reel_plan(transcript, video_title), is_fallback=True)
+        result = _fallback_reel_plan(transcript, video_title)
+        groups = result.get("reel_groups", [])
+        total_clips = sum(len(g.get("source_clips", [])) for g in groups)
+        print(f"[INFO] FALLBACK RESULT: {len(groups)} groups, {total_clips} total clips")
+        return ReelPlan(**result, is_fallback=True)
 
     for i, group in enumerate(groups):
         if not isinstance(group, dict):
@@ -500,11 +791,19 @@ def select_reel_plan(
 
         if "source_clips" not in group or not isinstance(group["source_clips"], list) or len(group["source_clips"]) == 0:
             print(f"[WARN] Group {i} missing valid 'source_clips'. Using fallback.")
-            return ReelPlan(**_fallback_reel_plan(transcript, video_title), is_fallback=True)
+            result = _fallback_reel_plan(transcript, video_title)
+            groups = result.get("reel_groups", [])
+            total_clips = sum(len(g.get("source_clips", [])) for g in groups)
+            print(f"[INFO] FALLBACK RESULT: {len(groups)} groups, {total_clips} total clips")
+            return ReelPlan(**result, is_fallback=True)
 
         if "narration_events" not in group or not isinstance(group["narration_events"], list):
             print(f"[WARN] Group {i} missing 'narration_events'. Using fallback.")
-            return ReelPlan(**_fallback_reel_plan(transcript, video_title), is_fallback=True)
+            result = _fallback_reel_plan(transcript, video_title)
+            groups = result.get("reel_groups", [])
+            total_clips = sum(len(g.get("source_clips", [])) for g in groups)
+            print(f"[INFO] FALLBACK RESULT: {len(groups)} groups, {total_clips} total clips")
+            return ReelPlan(**result, is_fallback=True)
 
         if group.get("estimated_duration_seconds", 0) > 90:
             print(f"[WARN] Group {i} estimated duration {group['estimated_duration_seconds']}s exceeds 90s cap")
@@ -515,6 +814,13 @@ def select_reel_plan(
 
     if progress_cb:
         progress_cb(f"Built reel plan with {len(groups)} group(s)", 100)
+
+    # Log key stats
+    total_clips = sum(len(g.get("source_clips", [])) for g in groups)
+    total_narrations = sum(len(g.get("narration_events", [])) for g in groups)
+    avg_duration = sum(g.get("estimated_duration_seconds", 0) for g in groups) / max(len(groups), 1)
+    print(f"[INFO] REEL PLAN STATS: {len(groups)} groups, {total_clips} total clips, "
+          f"{total_narrations} total narrations, avg duration {avg_duration:.1f}s")
 
     return ReelPlan(**reel_plan)
 
@@ -649,9 +955,9 @@ def select_clips(transcript: list, video_title: str, video_description: str, pro
     if not transcript:
         raise RuntimeError("Transcript is empty; cannot select clips.")
 
-    transcript_text = _summarize_transcript_for_llm(transcript, max_total_chars=3500)
+    transcript_text = _summarize_transcript_for_llm(transcript, max_total_chars=10000)
 
-    description = (video_description or "")[:300]
+    description = (video_description or "")[:500]
 
     if progress_cb:
         progress_cb("Sending transcript to LLM for clip selection...", 30)
