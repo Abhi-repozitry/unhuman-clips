@@ -99,6 +99,25 @@ CONSTRAINTS:
 - Narration events are TIME WINDOWS on the continuous video, not separate visual segments.
 - Source clips play back-to-back continuously; narration audio/captions overlay on top.
 
+NARRATIVE ARC — every group MUST have a clear purpose, not just related clips:
+- The group's source_clips, IN ORDER, must form a complete arc: SETUP (establish
+  what's happening / why we're watching) -> DEVELOPMENT (tension, stakes, or
+  progression) -> PAYOFF (the resolution — the reason this reel exists).
+- The FIRST clip must give the viewer enough context to understand what's going
+  on. Do not open on a clip that starts mid-sentence or mid-action with zero
+  setup — the viewer has no context from the rest of the source video.
+- The LAST clip must deliver an actual resolution or payoff — not just
+  whichever clip happened to fit before the 90s cap. If the real payoff moment
+  doesn't fit within 90s alongside enough setup, trim the setup/middle instead
+  of cutting off before the payoff.
+- reel_summary.key_moment must describe a genuine resolution — an answer, an
+  outcome, a reveal — not "the middle of an ongoing scene."
+- Prefer clip boundaries that align to natural sentence/thought breaks in the
+  transcript over arbitrary timestamps, so clips don't start or end mid-word.
+- If the available footage genuinely has no clear beginning-middle-end, don't
+  force a group out of it — leave it out rather than produce a reel that goes
+  nowhere.
+
 PERSONA GUIDE - VOICE: sharp insider who explains what's happening and why it
 matters — not a wall-to-wall commentary track.
 
