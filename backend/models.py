@@ -47,6 +47,7 @@ class ReelGroup(BaseModel):
 
 class ReelPlan(BaseModel):
     reel_groups: List[ReelGroup]
+    is_fallback: bool = False
 
 
 class JobStatus(StrEnum):

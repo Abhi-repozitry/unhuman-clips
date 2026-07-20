@@ -323,7 +323,7 @@ def select_reel_plan(
         print("[INFO] Using fallback reel plan (single group)")
         if progress_cb:
             progress_cb("Using fallback reel plan...", 50)
-        return ReelPlan(**_fallback_reel_plan(transcript, video_title))
+        return ReelPlan(**_fallback_reel_plan(transcript, video_title), is_fallback=True)
 
     if progress_cb:
         progress_cb("Parsing reel plan...", 80)
@@ -356,7 +356,7 @@ def select_reel_plan(
             print(f"[DEBUG] Raw content (retry attempt): {raw_content_retry[:2000].encode('ascii','replace').decode()}")
             print(f"[WARN] LLM failed to produce JSON after retry: {e2}")
             print("[INFO] Using fallback reel plan")
-            return ReelPlan(**_fallback_reel_plan(transcript, video_title))
+            return ReelPlan(**_fallback_reel_plan(transcript, video_title), is_fallback=True)
 
     if not isinstance(reel_plan, dict) or "reel_groups" not in reel_plan:
         raise RuntimeError(f"Expected object with 'reel_groups' array, got: {reel_plan}")

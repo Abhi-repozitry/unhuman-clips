@@ -182,6 +182,14 @@ class QueueManager:
                 "ANALYZING exceeded 20-minute hard ceiling — LLM never responded "
                 "in time even after retries. Check NVIDIA API status."
             )
+        if getattr(reel_plan, "is_fallback", False):
+            job.status = JobStatus.ERROR
+            job.stage_data = {
+                "status": "error",
+                "message": "LLM planning failed after retries \u2014 refusing to render fallback content.",
+            }
+            reporter.log_info("Refusing to render: reel_plan is fallback-derived, not LLM-planned.")
+            raise RuntimeError("Refusing to render: reel_plan is fallback-derived, not LLM-planned.")
         job.reel_plan = reel_plan
         job.num_output_groups = len(reel_plan.reel_groups)
         job.current_group_index = 0
