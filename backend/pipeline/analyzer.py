@@ -29,7 +29,7 @@ def _call_llm(messages: list, progress_cb: Optional[Callable[[str, float], None]
             "NVIDIA_API_KEY is not set. Skipping LLM analysis and using local fallback."
         )
 
-    client = openai.OpenAI(base_url=NVIDIA_BASE_URL, api_key=NVIDIA_API_KEY)
+    client = openai.OpenAI(base_url=NVIDIA_BASE_URL, api_key=NVIDIA_API_KEY, max_retries=0)
     models_to_try = [NVIDIA_MODEL]
     if NVIDIA_MODEL_FALLBACK:
         models_to_try.append(NVIDIA_MODEL_FALLBACK)
@@ -43,7 +43,7 @@ def _call_llm(messages: list, progress_cb: Optional[Callable[[str, float], None]
                     "messages": messages,
                     "temperature": 0.1,
                     "max_tokens": 8000,
-                    "timeout": 180.0,
+                    "timeout": 240.0,
                 }
                 try:
                     kwargs["response_format"] = {"type": "json_object"}

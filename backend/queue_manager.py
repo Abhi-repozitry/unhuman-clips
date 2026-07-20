@@ -170,9 +170,18 @@ class QueueManager:
             reporter.progress_callback(msg, prog)
 
         video_description = result.get("description", "")
-        reel_plan: ReelPlan = await asyncio.to_thread(
-            select_reel_plan, job.transcript, job.title or "", video_description, analyzer_progress
-        )
+        try:
+            reel_plan: ReelPlan = await asyncio.wait_for(
+                asyncio.to_thread(
+                    select_reel_plan, job.transcript, job.title or "", video_description, analyzer_progress
+                ),
+                timeout=1200.0,  # 20 min hard ceiling; covers 2-model x 2-attempt x 240s budget.
+            )
+        except asyncio.TimeoutError:
+            raise RuntimeError(
+                "ANALYZING exceeded 20-minute hard ceiling — LLM never responded "
+                "in time even after retries. Check NVIDIA API status."
+            )
         job.reel_plan = reel_plan
         job.num_output_groups = len(reel_plan.reel_groups)
         job.current_group_index = 0
