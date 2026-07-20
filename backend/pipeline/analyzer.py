@@ -22,9 +22,9 @@ from typing import Callable, Optional
 MIN_COMMENTARY_WINDOW_SECONDS = 2.5
 
 
-def _summarize_transcript_for_llm(transcript: list, max_total_chars: int = 15000) -> str:
+def _summarize_transcript_for_llm(transcript: list, max_total_chars: int = 30000) -> str:
     """
-    Summarize a long transcript for LLM consumption, targeting 13000-16000 chars.
+    Summarize a long transcript for LLM consumption, targeting ~30000 chars.
     Prioritizes segments with high emotional impact, questions, surprises,
     skill displays, contrasts, strong action, and high-stakes statements.
     Preserves context around key moments — does not over-merge or cut aggressively.
@@ -215,7 +215,7 @@ def _call_llm(messages: list, progress_cb: Optional[Callable[[str, float], None]
                     "model": model,
                     "messages": messages,
                     "temperature": 0.1,
-                    "max_tokens": 65536,
+                    "max_tokens": 131072,
                     "timeout": 480.0,
                 }
                 try:
@@ -351,7 +351,7 @@ TRANSCRIPT:
 {transcript_text}
 
 CRITICAL INSTRUCTION:
-Create 5 to 6 distinct, high-impact reel_groups from the video. Each group MUST use 5-8 source clips to tell a complete, self-contained story. Do NOT create fewer than 5 groups. Each reel MUST be 60-90 seconds (75+ seconds ideal).
+Create 5 to 6 distinct, high-impact reel_groups from the video. Each group MUST use 5-8 source clips to tell a complete, self-contained story. Do NOT create fewer than 5 groups. Each reel MUST be 120-130 seconds (125+ seconds ideal).
 
 CLIP SELECTION — CHOOSE FOR CURIOSITY GAP:
 - Pick clips that create strong curiosity gaps — moments where the viewer NEEDS to know what happens next
@@ -385,7 +385,7 @@ VIRAL HOOK PSYCHOLOGY & CURIOSITY GAP:
    - Use SPARINGLY — only when it adds real insight or explains "why this matters"
    - Let powerful original audio moments speak for themselves
    - Minimum 2-3 narration events per group (hook + 1-2 commentaries)
-   - Maximum 3-5 events for 60-90s reels
+   - Maximum 5-8 events for 120-130s reels
    - Each commentary should reveal something the viewer can't see or wouldn't notice
    
    GOOD examples:
@@ -401,10 +401,10 @@ VIRAL HOOK PSYCHOLOGY & CURIOSITY GAP:
    - Use 5-8 source clips per group to build a complete story
    - Each clip should serve a specific narrative purpose: establish context, add tension, or deliver payoff
    - Choose substantial clips (6-15 seconds each) — enough to feel the moment but not drag
-   - The total raw source duration should be ~35-55s per group (narration fills the rest)
+   - The total raw source duration should be ~60-80s per group (narration fills the rest)
 
 5. OUTPUT RULES:
-   - Each reel_group MUST have estimated_duration_seconds between 60 and 90 seconds
+   - Each reel_group MUST have estimated_duration_seconds between 120 and 130 seconds
    - 5-6 groups total with 5-8 clips each
    - The complete JSON must parse correctly — do NOT truncate or omit any fields
    - Do NOT output incomplete JSON. Always produce the full reel_groups array.
@@ -664,8 +664,8 @@ def select_reel_plan(
     if not transcript:
         raise RuntimeError("Transcript is empty; cannot build reel plan.")
 
-    # Smart transcript summarization targeting 13000-16000 chars
-    transcript_text = _summarize_transcript_for_llm(transcript, max_total_chars=15000)
+    # Smart transcript summarization targeting ~30000 chars
+    transcript_text = _summarize_transcript_for_llm(transcript, max_total_chars=30000)
 
     description = (video_description or "")[:500]
 
@@ -790,8 +790,8 @@ def select_reel_plan(
             print(f"[INFO] FALLBACK RESULT: {len(groups)} groups, {total_clips} total clips")
             return ReelPlan(**result, is_fallback=True)
 
-        if group.get("estimated_duration_seconds", 0) > 90:
-            print(f"[WARN] Group {i} estimated duration {group['estimated_duration_seconds']}s exceeds 90s cap")
+        if group.get("estimated_duration_seconds", 0) > 130:
+            print(f"[WARN] Group {i} estimated duration {group['estimated_duration_seconds']}s exceeds 130s cap")
 
         for event in group["narration_events"]:
             if event.get("event_type") == "hook" and event.get("reel_start", 1) != 0.0:
@@ -940,7 +940,7 @@ def select_clips(transcript: list, video_title: str, video_description: str, pro
     if not transcript:
         raise RuntimeError("Transcript is empty; cannot select clips.")
 
-    transcript_text = _summarize_transcript_for_llm(transcript, max_total_chars=15000)
+    transcript_text = _summarize_transcript_for_llm(transcript, max_total_chars=30000)
 
     description = (video_description or "")[:500]
 
