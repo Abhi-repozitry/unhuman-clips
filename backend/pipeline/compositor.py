@@ -77,11 +77,11 @@ def _ass_filter(path: str) -> str:
 def _build_ducking_filter_chain(narration_events, input_label="0:a", output_label="ducked"):
     """
     Chain of per-event volume filters instead of one nested max() expression.
-    Each stage evaluates to 1.0 (passthrough) outside its own event window,
-    so chaining N of them sequentially is equivalent to taking the max duck
-    across all events — but the filter string grows linearly in N instead
-    of exponentially (confirmed: old approach was 3.5MB at 15 events, this
-    is ~1.6KB).
+    Each stage evaluates to 1.0 (passthrough) outside its own event window.
+    
+    GENTLE DUCKING: Duck to 0.5 (50%) instead of 0.0 (full silence).
+    This keeps original audio clearly audible while allowing narration to sit on top.
+    Ramp in/out are slightly slower for a more natural sound.
     """
     valid_events = [ev for ev in narration_events if ev["reel_end"] - ev["reel_start"] >= 0.3]
     if not valid_events:
@@ -91,10 +91,13 @@ def _build_ducking_filter_chain(narration_events, input_label="0:a", output_labe
     current = input_label
     for i, ev in enumerate(valid_events):
         s, e = ev["reel_start"], ev["reel_end"]
-        ramp_in = f"min(1,max(0,(t-{s})/0.12))"
-        ramp_out = f"min(1,max(0,(t-({e}-0.18))/0.18))"
+        # Gentle ducking: reduce to 0.5 (50% volume) instead of 0.0
+        # Slower ramps: 0.2s in, 0.25s out for smoother transitions
+        ramp_in = f"min(1,max(0,(t-{s})/0.2))"
+        ramp_out = f"min(1,max(0,(t-({e}-0.25))/0.25))"
         duck = f"({ramp_in})*(1-{ramp_out})"
-        vol_expr = f"1.0-{duck}"
+        # Duck to 0.5 instead of 0.0 — original audio stays clearly audible
+        vol_expr = f"1.0-({duck}*0.5)"
         nxt = output_label if i == len(valid_events) - 1 else f"duckstage{i}"
         parts.append(f"[{current}]volume='{vol_expr}':eval=frame[{nxt}]")
         current = nxt
@@ -252,7 +255,7 @@ def compose_group(
             "-i", str(clip_audio_output),
             "-i", str(narration_audio_output),
             "-filter_complex",
-            f"{duck_chain};[1:a]volume=1.6[narrboost];[ducked][narrboost]amix=inputs=2:duration=first:dropout_transition=0.1[mixed]",
+            f"{duck_chain};[1:a]volume=1.2[narrboost];[ducked][narrboost]amix=inputs=2:duration=first:dropout_transition=0.1[mixed]",
             "-map", "[mixed]",
             "-c:a", "pcm_s16le", "-ar", "44100", "-ac", "2",
             "-y", str(mixed_audio_output)

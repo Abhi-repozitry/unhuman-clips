@@ -282,9 +282,9 @@ def apply_edits(
             "silence_duration": 0.3,         # Catch shorter pauses
             "min_audio_gap": 0.2,            # Trim more aggressively
             "enable_silence_trim": True,
-            "enable_speed_adjust": True,     # New: subtle speed up of slow parts
-            "speed_target": 1.05,            # 5% speed up for energy (very subtle)
-            "max_speed_ratio": 1.10,         # Max 10% speed up on slowest segments
+            "enable_speed_adjust": False,    # Disabled: natural pacing at 1.0x
+            "speed_target": 1.0,             # No speed adjustment
+            "max_speed_ratio": 1.0,
         }
 
     working_path = Path(working_dir)
@@ -323,40 +323,7 @@ def apply_edits(
                 # Use trimmed output as new input for next steps
                 input_path = str(temp_path)
 
-    # Step 2: Subtle speed adjustment for energy
-    if config.get("enable_speed_adjust", True) and total_time_saved < 5.0:
-        current_duration = get_video_duration(input_path)
-        if current_duration > 30.0:
-            # Apply very subtle speed up (1.05x) to give the reel more energy
-            speed_ratio = config.get("speed_target", 1.05)
-            speed_path = working_path / f"temp_speed_{input_path_obj.name}"
-
-            cmd_speed = [
-                _get_ffmpeg_path(), "-loglevel", "error",
-                "-i", str(input_path),
-                "-filter_complex",
-                f"[0:v]setpts={1.0/speed_ratio:.4f}*PTS[v];[0:a]atempo={speed_ratio:.4f}[a]",
-                "-map", "[v]", "-map", "[a]",
-                "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-                "-c:a", "aac", "-ar", "44100", "-ac", "2",
-                "-y", str(speed_path)
-            ]
-            try:
-                subprocess.run(cmd_speed, capture_output=True, check=True, timeout=120)
-                new_duration = get_video_duration(str(speed_path))
-                time_saved_speed = current_duration - new_duration
-                edits_applied.append({
-                    "type": "speed_adjust",
-                    "ratio": speed_ratio,
-                    "time_saved": round(time_saved_speed, 2)
-                })
-                total_time_saved += time_saved_speed
-                input_path = str(speed_path)
-                print(f"[INFO] Speed adjusted {speed_ratio}x: {current_duration:.1f}s -> {new_duration:.1f}s")
-            except subprocess.CalledProcessError as e:
-                print(f"[WARN] Speed adjustment failed: {e.stderr.decode() if e.stderr else 'unknown'}")
-
-    # Step 3: Final copy
+    # Step 2: Final copy (no speed adjustment — natural pacing at 1.0x)
     final_cmd = [_get_ffmpeg_path(), "-loglevel", "error", "-i", str(input_path), "-c", "copy", "-y", str(output_path)]
     try:
         subprocess.run(final_cmd, capture_output=True, check=True, timeout=60)
