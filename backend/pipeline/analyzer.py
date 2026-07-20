@@ -118,6 +118,13 @@ NARRATIVE ARC — every group MUST have a clear purpose, not just related clips:
   force a group out of it — leave it out rather than produce a reel that goes
   nowhere.
 
+Before finalizing, check your own plan against these:
+- Would someone who never saw the source video understand what's happening?
+- Does the first clip give enough context, or does it start mid-thought?
+- Does the last clip actually resolve something, or just stop?
+- Is there any clip that adds nothing — would the reel work without it?
+If any answer is no, revise the plan before outputting it.
+
 PERSONA GUIDE - VOICE: sharp insider who explains what's happening and why it
 matters — not a wall-to-wall commentary track.
 
