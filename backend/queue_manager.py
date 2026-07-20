@@ -286,10 +286,12 @@ class QueueManager:
                 duration = await asyncio.to_thread(
                     synthesize_commentary, event.text, str(out_path), tts_progress
                 )
+                actual_reel_end = event.reel_start + duration
                 group_narration_audio.append({
                     "event_type": event.event_type,
                     "reel_start": event.reel_start,
-                    "reel_end": event.reel_end,
+                    "reel_end": actual_reel_end,
+                    "text": event.text,
                     "path": str(out_path),
                     "duration": duration,
                 })
