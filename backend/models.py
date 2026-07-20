@@ -17,6 +17,7 @@ class OutputReel(BaseModel):
 
 class ReelSummary(BaseModel):
     title: str
+    short_description: str = ""
     source_understanding: str
     narrative_angle: str
     key_moment: str

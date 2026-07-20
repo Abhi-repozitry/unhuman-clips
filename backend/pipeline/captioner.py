@@ -1,6 +1,32 @@
 from backend.config import CAPTION_FONT, CAPTION_FONT_SIZE
 from typing import Callable, Optional, List, Dict, Any
 from backend.pipeline.ocr import detect_existing_captions
+from pathlib import Path
+
+
+# Caption sizes (9:16 portrait, 1080x1920)
+CLIP_CAPTION_SIZE = 56       # Larger than before (was 48 default)
+COMMENTARY_CAPTION_SIZE = 64  # Larger than before (was 48+8=56)
+NARRATION_CAPTION_SIZE = 62  # Top narration captions
+
+# Key words to highlight with color
+KEY_WORDS = {
+    "wait", "what", "why", "how", "never", "always", "secret", "hidden",
+    "truth", "reveal", "shock", "insane", "crazy", "best", "worst",
+    "first", "last", "ever", "never", "impossible", "possible",
+    "breakthrough", "discover", "invent", "create", "change",
+    "amazing", "incredible", "unbelievable", "stunning", "remarkable",
+    "win", "lose", "beat", "victory", "defeat", "champion",
+    "dangerous", "risky", "safe", "protect", "save", "avoid",
+    "love", "hate", "fear", "scared", "excited", "terrible", "beautiful",
+    "shocked", "thrilled", "devastated", "hilarious", "intense",
+    "literally", "actually", "honestly", "absolutely", "guaranteed",
+    "not", "no", "yes", "wrong", "right", "stop", "go", "look", "watch",
+    "boom", "bang", "pow", "wow", "whoa", "oh", "no way",
+}
+
+# Highlight color
+HIGHLIGHT_COLOR = "&H00FFFF66"  # Warm yellow highlight
 
 
 def _escape_ass_text(text: str) -> str:
@@ -20,8 +46,8 @@ def _format_timestamp(seconds: float) -> str:
     return f"{hours}:{minutes:02d}:{secs:02d}.{centis:02d}"
 
 
-def _wrap_text_ass(text: str, max_chars: int = 28) -> str:
-    """Wrap text for 9:16 portrait — narrower lines for readability."""
+def _wrap_text_ass(text: str, max_chars: int = 24) -> str:
+    """Wrap text for 9:16 portrait — narrower lines for readability. Was 28, tightened to 24 for larger font."""
     words = text.split()
     lines = []
     current_line = ""
@@ -55,21 +81,41 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
 
 def _make_style(name: str, font: str, size: int, alignment: int, margin_v: int,
-                bold: int = 0, outline: int = 3, shadow: int = 2,
+                bold: int = 0, outline: int = 4, shadow: int = 3,
                 primary: str = "&H00FFFFFF", back: str = "&H80000000") -> str:
     """Build a single ASS Style line.
     Alignment: 2=bottom center, 8=top center
+    Increased outline from 3->4 and shadow from 2->3 for better readability.
     """
     return (f"Style: {name},{font},{size},{primary},&H00000008,"
             f"&H00000000,{back},{bold},0,0,0,100,100,0,0,"
             f"1,{outline},{shadow},{alignment},40,40,{margin_v},0")
 
 
+def _highlight_key_words(text: str) -> str:
+    """
+    Wrap key words in ASS override tags to highlight them with a different color.
+    Returns text with {\\c&Hxxxxxx&} tags around key words.
+    """
+    escaped = _escape_ass_text(text)
+    words = escaped.split()
+    result_parts = []
+    for word in words:
+        # Strip ASS tags for checking
+        clean = word.replace("\\N", "").strip(".,!?;:'\"()[]{}")
+        if clean.lower() in KEY_WORDS:
+            result_parts.append(f"{{\\c{HIGHLIGHT_COLOR}}}{word}{{\\c}}")
+        else:
+            result_parts.append(word)
+    return " ".join(result_parts)
+
+
 def generate_clip_ass(transcript: list, clip_start: float, clip_end: float,
                       out_path: str,
                       progress_cb: Optional[Callable[[str, float], None]] = None,
                       start_time: float = 0.0) -> str:
-    """Generate captions for original-clip segments — bottom-aligned with background box."""
+    """Generate captions for original-clip segments — bottom-aligned with background box.
+    Enhanced with larger font, key word highlighting, and better positioning."""
     if progress_cb:
         progress_cb("Filtering transcript for clip...", 20)
 
@@ -88,23 +134,25 @@ def generate_clip_ass(transcript: list, clip_start: float, clip_end: float,
                 "text": entry["text"],
             })
 
+    # Use larger clip caption size
     style_line = _make_style(
-        "ClipCaption", CAPTION_FONT, CAPTION_FONT_SIZE,
+        "ClipCaption", CAPTION_FONT, CLIP_CAPTION_SIZE,
         alignment=2,   # bottom center
-        margin_v=80,   # 80px from bottom edge
-        outline=3, shadow=2,
+        margin_v=100,  # 100px from bottom edge (more breathing room for mobile)
+        outline=4, shadow=3,  # thicker outline for readability
+        bold=1,  # bold for clip captions too
         primary="&H00FFFFFF", back="&H80000000"
     )
 
     dialogues = []
     for entry in filtered:
-        wrapped = _wrap_text_ass(entry["text"], max_chars=28)
-        text = _escape_ass_text(wrapped)
+        wrapped = _wrap_text_ass(entry["text"], max_chars=22)  # Tighter wrap for larger font
+        highlighted = _highlight_key_words(wrapped)
         start_ts = _format_timestamp(entry["start"] + start_time)
         end_ts = _format_timestamp(entry["end"] + start_time)
         dialogues.append(
             f"Dialogue: 0,{start_ts},{end_ts},ClipCaption,,0,0,0,,"
-            f"{{\\bord3\\shad2\\fn{CAPTION_FONT}}}{text}"
+            f"{{\\bord4\\shad3\\b1\\fn{CAPTION_FONT}}}{highlighted}"
         )
 
     ass_content = _ass_header(style_line, "\n".join(dialogues))
@@ -124,32 +172,33 @@ def generate_clip_ass(transcript: list, clip_start: float, clip_end: float,
 def generate_commentary_ass(text: str, duration: float, out_path: str,
                             progress_cb: Optional[Callable[[str, float], None]] = None,
                             start_time: float = 0.0) -> str:
-    """Generate white captions for TTS hook/insight segments."""
+    """Generate commentary (hook/insight) captions — bottom center, larger, with key word highlights."""
     if progress_cb:
         progress_cb("Wrapping commentary text...", 30)
 
-    font_size = CAPTION_FONT_SIZE + 8
-    wrapped = _wrap_text_ass(text, max_chars=26)
+    wrapped = _wrap_text_ass(text, max_chars=22)  # Tighter for readability
+    highlighted = _highlight_key_words(wrapped)
 
     if progress_cb:
         progress_cb("Generating ASS format...", 70)
 
     style_line = _make_style(
-        "CommentaryCaption", CAPTION_FONT, font_size,
-        alignment=2,   # bottom center (match ClipCaption placement)
-        margin_v=80,   # 80px from bottom edge (same as ClipCaption)
-        outline=3, shadow=2,
+        "CommentaryCaption", CAPTION_FONT, COMMENTARY_CAPTION_SIZE,
+        alignment=2,     # bottom center
+        margin_v=100,    # 100px from bottom (more room)
+        outline=4, shadow=3,
+        bold=1,          # Bold for emphasis
         primary="&H00FFFFFF",
         back="&H80000000"
     )
 
     start_ts = _format_timestamp(start_time)
     end_ts = _format_timestamp(start_time + duration)
-    text_escaped = _escape_ass_text(wrapped)
+    text_escaped = _escape_ass_text(highlighted)
 
     dialogue = (
         f"Dialogue: 0,{start_ts},{end_ts},CommentaryCaption,,0,0,0,,"
-        f"{{\\bord3\\shad2\\fn{CAPTION_FONT}}}{text_escaped}"
+        f"{{\\bord4\\shad3\\b1\\fn{CAPTION_FONT}}}{text_escaped}"
     )
 
     ass_content = _ass_header(style_line, dialogue)
@@ -179,8 +228,8 @@ def generate_group_captions(
     Generate all captions for a single reel group.
     
     Returns dict with:
-    - "clip_captions": list of paths (bottom zone, alignment=2, margin_v=80)
-    - "narration_captions": list of paths (top zone, alignment=8, margin_v=60)
+    - "clip_captions": list of paths (bottom zone)
+    - "narration_captions": list of paths (top zone)
     - "has_existing_captions": list of bool per source_clip (from OCR)
     
     OCR Integration: Runs detect_existing_captions on source_clips.
@@ -264,32 +313,34 @@ def generate_group_captions(
 
 def generate_narration_ass(text: str, duration: float, out_path: str,
                            progress_cb: Optional[Callable[[str, float], None]] = None) -> str:
-    """Generate narration caption — TOP zone (alignment=8, margin_v=60)."""
+    """Generate narration caption — TOP zone (alignment=8, margin_v=80).
+    Enhanced with larger font, key word highlighting, and better positioning."""
     if progress_cb:
         progress_cb("Wrapping narration text...", 30)
 
-    font_size = CAPTION_FONT_SIZE + 8
-    wrapped = _wrap_text_ass(text, max_chars=26)
+    wrapped = _wrap_text_ass(text, max_chars=22)
+    highlighted = _highlight_key_words(wrapped)
 
     if progress_cb:
         progress_cb("Generating ASS format...", 70)
 
     style_line = _make_style(
-        "NarrationCaption", CAPTION_FONT, font_size,
-        alignment=8,   # top center
-        margin_v=60,   # 60px from top edge
-        outline=3, shadow=2,
+        "NarrationCaption", CAPTION_FONT, NARRATION_CAPTION_SIZE,
+        alignment=8,     # top center
+        margin_v=80,     # 80px from top edge
+        outline=4, shadow=3,
+        bold=1,          # Bold for emphasis
         primary="&H00FFFFFF",
         back="&H80000000"
     )
 
     start_ts = _format_timestamp(0.0)
     end_ts = _format_timestamp(duration)
-    text_escaped = _escape_ass_text(wrapped)
+    text_escaped = _escape_ass_text(highlighted)
 
     dialogue = (
         f"Dialogue: 0,{start_ts},{end_ts},NarrationCaption,,0,0,0,,"
-        f"{{\\bord3\\shad2\\fn{CAPTION_FONT}}}{text_escaped}"
+        f"{{\\bord4\\shad3\\b1\\fn{CAPTION_FONT}}}{text_escaped}"
     )
 
     ass_content = _ass_header(style_line, dialogue)

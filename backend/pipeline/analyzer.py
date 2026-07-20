@@ -442,6 +442,7 @@ OUTPUT ONLY VALID JSON — no explanations, no thinking, no text before or after
       "estimated_duration_seconds": 45.0,
       "reel_summary": {{
         "title": "Scroll-stopping title",
+        "short_description": "One sentence hook description for social media posting (max 100 chars)",
         "source_understanding": "What the video is about",
         "narrative_angle": "Framing for this reel",
         "key_moment": "The payoff moment"
