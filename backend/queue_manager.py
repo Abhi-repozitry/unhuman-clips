@@ -339,16 +339,14 @@ class QueueManager:
                 )
                 group_clip_captions.append(str(clip_caption_path))
 
-            # Narration captions (per narration_event, reel-relative)
-            for i, event in enumerate(group.narration_events):
-                if event.event_type not in ("hook", "commentary"):
-                    continue
+            # Narration captions (per synthesized audio item, reel-relative)
+            for i, nar in enumerate(group_narration_audio):
                 job.stage_data = {
                     "status": "captioning",
                     "group_index": group_idx,
                     "sub": "narration",
                     "current": i + 1,
-                    "total": len(group.narration_events),
+                    "total": len(group_narration_audio),
                 }
 
                 narr_caption_path = working_dir / f"group_{group_idx}_narr_caption_{i}.ass"
@@ -358,15 +356,16 @@ class QueueManager:
 
                 await asyncio.to_thread(
                     generate_commentary_ass,
-                    event.text,
-                    event.reel_end - event.reel_start,
+                    nar["text"],
+                    nar["duration"],
                     str(narr_caption_path),
                     narr_caption_progress,
+                    nar["reel_start"],
                 )
                 group_narration_captions.append({
-                    "event_type": event.event_type,
-                    "reel_start": event.reel_start,
-                    "reel_end": event.reel_end,
+                    "event_type": nar["event_type"],
+                    "reel_start": nar["reel_start"],
+                    "reel_end": nar["reel_end"],
                     "path": str(narr_caption_path),
                 })
 

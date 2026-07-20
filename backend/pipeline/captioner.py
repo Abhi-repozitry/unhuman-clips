@@ -121,7 +121,8 @@ def generate_clip_ass(transcript: list, clip_start: float, clip_end: float,
 
 
 def generate_commentary_ass(text: str, duration: float, out_path: str,
-                            progress_cb: Optional[Callable[[str, float], None]] = None) -> str:
+                            progress_cb: Optional[Callable[[str, float], None]] = None,
+                            start_time: float = 0.0) -> str:
     """Generate white captions for TTS hook/insight segments."""
     if progress_cb:
         progress_cb("Wrapping commentary text...", 30)
@@ -141,8 +142,8 @@ def generate_commentary_ass(text: str, duration: float, out_path: str,
         back="&H80000000"
     )
 
-    start_ts = _format_timestamp(0.0)
-    end_ts = _format_timestamp(duration)
+    start_ts = _format_timestamp(start_time)
+    end_ts = _format_timestamp(start_time + duration)
     text_escaped = _escape_ass_text(wrapped)
 
     dialogue = (
