@@ -22,16 +22,10 @@ from typing import Callable, Optional
 MIN_COMMENTARY_WINDOW_SECONDS = 2.5
 
 
-def _summarize_transcript_for_llm(transcript: list, max_total_chars: int = 6000) -> str:
+def _summarize_transcript_for_llm(transcript: list, max_total_chars: int = 3500) -> str:
     """
-    Intelligently summarize a long transcript for LLM consumption.
-
-    Strategy: If the raw transcript text is within the limit, return it verbatim.
-    Otherwise, compress by:
-    - Dropping very short segments (< 0.8s, likely noise)
-    - Concatenating adjacent short segments
-    - Truncating low-signal segments (single words, filler)
-    - If still too long, sample evenly across the timeline
+    Aggressively summarize a long transcript for LLM consumption.
+    Keeps only the most informative segments within the char limit.
     """
     if not transcript:
         return ""
@@ -42,92 +36,51 @@ def _summarize_transcript_for_llm(transcript: list, max_total_chars: int = 6000)
         if duration > 0.5:
             full_text += f"Seg {i} [{entry['start']:.1f}-{entry['end']:.1f}s]: {entry['text']}\n"
 
-    # If already short enough, return as-is
     if len(full_text) <= max_total_chars:
         return full_text
 
-    print(f"[INFO] Transcript too long ({len(full_text)} chars), summarizing for LLM...")
+    print(f"[INFO] Transcript too long ({len(full_text)} chars), aggressive summarization...")
 
-    filtered = []
+    # Score segments by informativeness
+    scored = []
+    filler_words = {"okay", "yeah", "right", "uh", "um", "oh", "so", "well", "huh", "like", "just", "wow", "ah", "hmm"}
     for i, entry in enumerate(transcript):
         duration = entry['end'] - entry['start']
         text = entry['text'].strip()
+        words = text.split()
+        word_count = len(words)
 
-        # Filter: skip very short segments / single non-informative words
+        # Score: longer segments with more words = more informative
+        score = word_count
         if duration < 0.8:
-            continue
-        if len(text.split()) <= 2 and text.lower() in ("okay", "yeah", "right", "uh", "um", "oh", "so", "well", "huh", "like", "just"):
-            continue
-        filtered.append({
-            "i": i,
-            "start": entry['start'],
-            "end": entry['end'],
-            "text": text,
-            "duration": duration,
-        })
+            score -= 5
+        if word_count <= 2 and text.lower() in filler_words:
+            score -= 10
+        if "?" in text:
+            score += 3
+        if any(w in text.lower() for w in ("but", "because", "actually", "important", "problem", "why", "how")):
+            score += 3
 
-    if not filtered:
-        filtered = [{"i": i, **entry} for i, entry in enumerate(transcript)]
+        scored.append((score, i, entry["start"], entry["end"], text))
 
-    # Concatenate adjacent short segments back into coherent blocks
-    merged = []
-    cur_text = ""
-    cur_start = filtered[0]["start"]
-    cur_end = filtered[0]["end"]
-    cur_segs = []
+    # Sort by score descending, take top segments
+    scored.sort(key=lambda x: -x[0])
 
-    for seg in filtered:
-        gap = seg["start"] - cur_end
-        if gap < 1.5 and (cur_end - cur_start) < 30.0:
-            if cur_text:
-                cur_text += " "
-            cur_text += seg["text"]
-            cur_end = seg["end"]
-            cur_segs.append(seg["i"])
-        else:
-            if cur_text:
-                merged.append({
-                    "segments": cur_segs,
-                    "start": cur_start,
-                    "end": cur_end,
-                    "text": cur_text,
-                })
-            cur_text = seg["text"]
-            cur_start = seg["start"]
-            cur_end = seg["end"]
-            cur_segs = [seg["i"]]
-
-    if cur_text:
-        merged.append({
-            "segments": cur_segs,
-            "start": cur_start,
-            "end": cur_end,
-            "text": cur_text,
-        })
-
-    # Build the compressed transcript
     result_lines = []
-    total_chars_used = 0
-
-    # If merged is still too large, sample evenly to reduce further
-    if len(merged) > 150:
-        step = max(1, len(merged) // 100)
-        merged = merged[::step]
-
-    for entry in merged:
-        seg_label = f"Seg {entry['segments'][0]}-{entry['segments'][-1]}"
-        line = f"{seg_label} [{entry['start']:.1f}-{entry['end']:.1f}s]: {entry['text']}\n"
-        if total_chars_used + len(line) > max_total_chars:
-            remaining = max_total_chars - total_chars_used
-            if remaining > 80:
-                result_lines.append(line[:remaining - 3] + "...\n")
+    total_chars = 0
+    for score, i, start, end, text in scored:
+        line = f"Seg {i} [{start:.1f}-{end:.1f}s]: {text}\n"
+        if total_chars + len(line) > max_total_chars:
             break
-        result_lines.append(line)
-        total_chars_used += len(line)
+        result_lines.append((i, line))
+        total_chars += len(line)
 
-    compressed = "".join(result_lines)
+    # Re-sort by segment index to maintain chronological order
+    result_lines.sort(key=lambda x: x[0])
+    compressed = "".join(line for _, line in result_lines)
+
     print(f"[INFO] Transcript compressed from {len(full_text)} to {len(compressed)} chars "
-          f"({len(merged)} merged blocks -> {len(result_lines)} lines)")
+          f"({len(result_lines)} of {len(transcript)} segments kept)")
     return compressed
 
 
@@ -146,7 +99,7 @@ def _call_llm(messages: list, progress_cb: Optional[Callable[[str, float], None]
     print(f"[DEBUG] Resolved models_to_try at runtime: {models_to_try}")
 
     last_error = None
-    backoff_delays = [3, 8, 15]  # Exponential backoff: 3s, 8s, 15s
+    backoff_delays = [3, 8, 15]
 
     for model in models_to_try:
         for attempt in range(2):
@@ -155,7 +108,7 @@ def _call_llm(messages: list, progress_cb: Optional[Callable[[str, float], None]
                     "model": model,
                     "messages": messages,
                     "temperature": 0.1,
-                    "max_tokens": 16384,
+                    "max_tokens": 32768,
                     "timeout": 240.0,
                 }
                 try:
@@ -171,9 +124,20 @@ def _call_llm(messages: list, progress_cb: Optional[Callable[[str, float], None]
                         f"NVIDIA API returned empty content. "
                         f"Finish reason: {finish_reason}. Refusal: {refusal}."
                     )
-                print(f"[DEBUG] LLM finish_reason: {response.choices[0].finish_reason}")
+                finish_reason = response.choices[0].finish_reason
+                print(f"[DEBUG] LLM finish_reason: {finish_reason}")
                 truncated = raw_content[:300] + "..." if len(raw_content) > 300 else raw_content
                 print(f"[DEBUG] LLM response preview: {truncated}")
+
+                # If truncated by length, try to close the JSON
+                if finish_reason == "length":
+                    print(f"[WARN] LLM response was truncated (finish_reason=length, {len(raw_content)} chars)")
+                    # Try to find a valid JSON prefix by balancing braces
+                    raw_content = _try_repair_truncated_json(raw_content)
+                    if raw_content:
+                        print(f"[INFO] Repaired truncated JSON ({len(raw_content)} chars)")
+                        return raw_content
+
                 return raw_content.strip()
             except Exception as e:
                 last_error = e
@@ -193,23 +157,68 @@ def _call_llm(messages: list, progress_cb: Optional[Callable[[str, float], None]
     raise RuntimeError(f"All NVIDIA models failed after retries. Last error: {last_error}")
 
 
+def _try_repair_truncated_json(text: str) -> str:
+    """Try to repair a truncated JSON by balancing braces and brackets."""
+    if not text:
+        return ""
+
+    # Count opening/closing braces and brackets
+    open_braces = text.count("{")
+    close_braces = text.count("}")
+    open_brackets = text.count("[")
+    close_brackets = text.count("]")
+
+    # Add missing closing braces/brackets
+    repaired = text.rstrip().rstrip(",")
+    repaired += "}" * (open_braces - close_braces)
+    repaired += "]" * (open_brackets - close_brackets)
+
+    # Try to parse
+    try:
+        json.loads(repaired)
+        return repaired
+    except json.JSONDecodeError:
+        pass
+
+    # If still broken, try to find the last complete JSON object
+    try:
+        # Find the outermost object
+        start = repaired.find("{")
+        if start >= 0:
+            depth = 0
+            for i in range(start, len(repaired)):
+                if repaired[i] == "{":
+                    depth += 1
+                elif repaired[i] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        candidate = repaired[start:i+1]
+                        json.loads(candidate)
+                        return candidate
+    except (json.JSONDecodeError, IndexError):
+        pass
+
+    return ""
+
+
 def _build_reel_plan_prompt(video_title: str, video_description: str, transcript_text: str) -> str:
     """Build the full LLM prompt for reel_plan generation with persona."""
     return f"""You are a viral content strategist. Turn this video into scroll-stopping reels (<=90s each).
 
-VIDEO TITLE: {video_title}
-VIDEO DESCRIPTION: {video_description[:500]}
+TITLE: {video_title}
+DESC: {video_description[:300]}
 TRANSCRIPT:
 {transcript_text}
 
 RULES:
 1. HOOK (0-3s): Specific scroll-stopper. Formula: [specific moment] + [why it matters]. NEVER "This is amazing!" or "You won't believe this!"
-2. NARRATIVE ARC: SETUP (context) -> TENSION (stakes) -> PAYOFF (no narration over payoff). First clip gives context. Last clip resolves.
-3. PRIORITIZE: emotional impact > surprise > skill > stakes > spectacle. Exclude moments with none of these.
-4. COMMENTARY: Insider explaining what/why. NOT hype. ✓ GOOD: "Notice his hands shaking before the throw." ✗ BAD: "This is crazy!"
+2. ARC: SETUP (context) -> TENSION (stakes) -> PAYOFF (no narration over payoff). First clip gives context. Last clip resolves.
+3. PRIORITIZE: emotional impact > surprise > skill > stakes > spectacle. Exclude filler.
+4. COMMENTARY: Insider explaining what/why. NOT hype. ✓ "Notice his hands shaking." ✗ "This is crazy!"
 5. NARRATION: ~1 per 15-20s. Min 2 (hook + 1). Max 3-5 for 45-90s. Most clips play on original audio. Silence between events. 2-3 sentences max.
+6. Output complete valid JSON. Do NOT truncate.
 
-OUTPUT ONLY JSON (no markdown):
+OUTPUT ONLY JSON:
 {{
   "reel_groups": [
     {{
@@ -223,8 +232,8 @@ OUTPUT ONLY JSON (no markdown):
         "key_moment": "The payoff moment"
       }},
       "source_clips": [
-        {{"source_start": 12.3, "source_end": 18.7, "reason": "Why this clip is essential to the story"}},
-        {{"source_start": 35.1, "source_end": 42.0, "reason": "What tension or progression this adds"}}
+        {{"source_start": 12.3, "source_end": 18.7, "reason": "Why this clip is essential"}},
+        {{"source_start": 35.1, "source_end": 42.0, "reason": "What tension this adds"}}
       ],
       "narration_events": [
         {{"event_type": "hook", "reel_start": 0.0, "reel_end": 3.0, "text": "Scroll-stopping hook anchored to real moment", "voice_id": null}},
@@ -236,75 +245,152 @@ OUTPUT ONLY JSON (no markdown):
 
 
 def _fallback_reel_plan(transcript: list, video_title: str) -> dict:
-    """Fallback: single group covering first viable clips when LLM unavailable."""
+    """
+    Fallback: generate 3-5 reel groups from transcript segments.
+    Each group gets 3-4 clips forming a mini-story arc.
+    """
     if not transcript:
         return {"reel_groups": []}
 
-    source_clips = []
-    total_duration = 0.0
-    max_total = 30.0
-
+    # Score segments by informativeness
+    scored_segments = []
     for i, entry in enumerate(transcript):
-        if len(source_clips) >= 4:
-            break
         duration = entry["end"] - entry["start"]
-        if duration >= 2.0 and total_duration + duration <= max_total:
-            source_clips.append({
-                "source_start": entry["start"],
-                "source_end": entry["end"],
-                "reason": f"Fallback segment {i}: {entry['text'][:60]}"
+        text = entry["text"].strip()
+        words = text.split()
+        score = len(words)
+        if duration >= 3.0:
+            score += 2
+        if "?" in text:
+            score += 3
+        if any(w in text.lower() for w in ("but", "because", "actually", "important", "problem", "why", "how", "win", "lose", "beat", "amazing", "incredible")):
+            score += 2
+        scored_segments.append((score, i, entry["start"], entry["end"], text, duration))
+
+    scored_segments.sort(key=lambda x: -x[0])
+
+    # Pick top segments, spread across the video timeline
+    total_duration = transcript[-1]["end"] - transcript[0]["start"]
+    groups = []
+    clips_per_group = 3
+    num_groups = min(5, max(3, len(transcript) // 20))
+
+    for g in range(num_groups):
+        group_clips = []
+        group_duration = 0.0
+        target_zone_start = (g / num_groups) * total_duration
+        target_zone_end = ((g + 1) / num_groups) * total_duration
+
+        # Find best segments in this time zone
+        zone_segments = [s for s in scored_segments if target_zone_start <= s[2] <= target_zone_end]
+        zone_segments.sort(key=lambda x: -x[0])
+
+        for score, i, start, end, text, duration in zone_segments:
+            if len(group_clips) >= clips_per_group:
+                break
+            if group_duration + duration > 25.0:
+                continue
+            group_clips.append({
+                "source_start": start,
+                "source_end": end,
+                "reason": f"Key moment: {text[:80]}"
             })
-            total_duration += duration
+            group_duration += duration
 
-    if not source_clips and transcript:
-        entry = transcript[0]
-        source_clips.append({
-            "source_start": entry["start"],
-            "source_end": min(entry["end"], entry["start"] + 8.0),
-            "reason": "Fallback: first segment"
-        })
-        total_duration = source_clips[0]["source_end"] - source_clips[0]["source_start"]
+        # If zone had no good segments, grab from anywhere
+        if not group_clips:
+            for score, i, start, end, text, duration in scored_segments:
+                if len(group_clips) >= clips_per_group:
+                    break
+                if group_duration + duration > 25.0:
+                    continue
+                group_clips.append({
+                    "source_start": start,
+                    "source_end": end,
+                    "reason": f"Key moment: {text[:80]}"
+                })
+                group_duration += duration
 
-    hook_duration = 3.0
-    commentary_duration = len(source_clips) * 3.0
-    estimated = total_duration + hook_duration + commentary_duration
+        if not group_clips:
+            continue
 
-    return {
-        "reel_groups": [{
-            "group_index": 0,
-            "group_reasoning": "Fallback: single cohesive unit (LLM unavailable)",
+        hook_duration = 3.0
+        commentary_duration = len(group_clips) * 3.0
+        estimated = group_duration + hook_duration + commentary_duration
+
+        group_title = f"{video_title[:50]} - Part {g+1}" if video_title else f"Part {g+1}"
+
+        groups.append({
+            "group_index": g,
+            "group_reasoning": f"Fallback group {g+1}: {len(group_clips)} clips from video segment",
             "estimated_duration_seconds": min(estimated, 90.0),
             "reel_summary": {
-                "title": video_title[:80] if video_title else "Untitled",
-                "source_understanding": "Auto-selected segments from transcript",
-                "narrative_angle": "Key moments from the video",
-                "key_moment": source_clips[0]["reason"] if source_clips else "Opening"
+                "title": group_title,
+                "source_understanding": f"Key moments from {video_title[:60] if video_title else 'the video'}",
+                "narrative_angle": f"Compelling moments from the video - Part {g+1}",
+                "key_moment": group_clips[-1]["reason"][:60] if group_clips else "The climax"
             },
-            "source_clips": source_clips,
+            "source_clips": group_clips,
             "narration_events": [
                 {
                     "event_type": "hook",
                     "reel_start": 0.0,
                     "reel_end": hook_duration,
-                    "text": "What you're about to see changes how you understand this.",
+                    "text": f"Watch what happens in this {group_duration:.0f}-second moment — it changes everything.",
                     "voice_id": None
                 }
             ] + [
                 {
                     "event_type": "commentary",
                     "reel_start": hook_duration + sum(
-                        (c["source_end"] - c["source_start"]) for c in source_clips[:j]
+                        (c["source_end"] - c["source_start"]) for c in group_clips[:j]
                     ) + j * 2.5,
                     "reel_end": hook_duration + sum(
-                        (c["source_end"] - c["source_start"]) for c in source_clips[:j+1]
+                        (c["source_end"] - c["source_start"]) for c in group_clips[:j+1]
                     ) + j * 2.5 + 2.5,
                     "text": f"Notice what happens here — {c['reason'][:50]}",
                     "voice_id": None
                 }
+                for j, c in enumerate(group_clips)
+            ]
+        })
+
+    if not groups:
+        # Absolute fallback: one group with first few segments
+        source_clips = []
+        total_dur = 0.0
+        for entry in transcript[:5]:
+            dur = entry["end"] - entry["start"]
+            if total_dur + dur > 30.0:
+                break
+            source_clips.append({
+                "source_start": entry["start"],
+                "source_end": entry["end"],
+                "reason": f"Opening segment: {entry['text'][:60]}"
+            })
+            total_dur += dur
+
+        groups.append({
+            "group_index": 0,
+            "group_reasoning": "Fallback: opening segments",
+            "estimated_duration_seconds": min(total_dur + 10.0, 90.0),
+            "reel_summary": {
+                "title": video_title[:80] if video_title else "Untitled",
+                "source_understanding": "Opening moments from the video",
+                "narrative_angle": "Key moments from the video",
+                "key_moment": source_clips[-1]["reason"][:60] if source_clips else "Opening"
+            },
+            "source_clips": source_clips,
+            "narration_events": [
+                {"event_type": "hook", "reel_start": 0.0, "reel_end": 3.0, "text": "What you're about to see changes how you understand this.", "voice_id": None}
+            ] + [
+                {"event_type": "commentary", "reel_start": 3.0 + j * 2.5 + sum((c["source_end"] - c["source_start"]) for c in source_clips[:j]), "reel_end": 3.0 + j * 2.5 + sum((c["source_end"] - c["source_start"]) for c in source_clips[:j+1]) + 2.5, "text": f"Notice what happens here — {c['reason'][:50]}", "voice_id": None}
                 for j, c in enumerate(source_clips)
             ]
-        }]
-    }
+        })
+
+    print(f"[INFO] Fallback generated {len(groups)} group(s) with {sum(len(g['source_clips']) for g in groups)} total clips")
+    return {"reel_groups": groups}
 
 
 def _extract_json_object(text: str) -> str:
@@ -336,10 +422,10 @@ def select_reel_plan(
     if not transcript:
         raise RuntimeError("Transcript is empty; cannot build reel plan.")
 
-    # Use transcript summarization to keep LLM prompts manageable
-    transcript_text = _summarize_transcript_for_llm(transcript, max_total_chars=6000)
+    # Aggressive transcript summarization
+    transcript_text = _summarize_transcript_for_llm(transcript, max_total_chars=3500)
 
-    description = (video_description or "")[:500]
+    description = (video_description or "")[:300]
 
     if progress_cb:
         progress_cb("Sending transcript to LLM for reel planning...", 30)
@@ -356,7 +442,7 @@ def select_reel_plan(
         )
     except Exception as e:
         print(f"[WARN] LLM reel planning unavailable: {e}")
-        print("[INFO] Using fallback reel plan (single group)")
+        print("[INFO] Using fallback reel plan (multi-group)")
         if progress_cb:
             progress_cb("Using fallback reel plan...", 50)
         return ReelPlan(**_fallback_reel_plan(transcript, video_title), is_fallback=True)
@@ -404,19 +490,21 @@ def select_reel_plan(
         return ReelPlan(**_fallback_reel_plan(transcript, video_title), is_fallback=True)
 
     groups = reel_plan["reel_groups"]
-    if not isinstance(groups, list):
-        print(f"[WARN] 'reel_groups' must be an array, got {type(groups)}. Using fallback.")
+    if not isinstance(groups, list) or len(groups) == 0:
+        print(f"[WARN] 'reel_groups' must be a non-empty array, got {type(groups)}. Using fallback.")
         return ReelPlan(**_fallback_reel_plan(transcript, video_title), is_fallback=True)
 
     for i, group in enumerate(groups):
         if not isinstance(group, dict):
             raise RuntimeError(f"Group {i} must be an object")
 
-        if "source_clips" not in group or not isinstance(group["source_clips"], list):
-            raise RuntimeError(f"Group {i} missing 'source_clips' array")
+        if "source_clips" not in group or not isinstance(group["source_clips"], list) or len(group["source_clips"]) == 0:
+            print(f"[WARN] Group {i} missing valid 'source_clips'. Using fallback.")
+            return ReelPlan(**_fallback_reel_plan(transcript, video_title), is_fallback=True)
 
         if "narration_events" not in group or not isinstance(group["narration_events"], list):
-            raise RuntimeError(f"Group {i} missing 'narration_events' array")
+            print(f"[WARN] Group {i} missing 'narration_events'. Using fallback.")
+            return ReelPlan(**_fallback_reel_plan(transcript, video_title), is_fallback=True)
 
         if group.get("estimated_duration_seconds", 0) > 90:
             print(f"[WARN] Group {i} estimated duration {group['estimated_duration_seconds']}s exceeds 90s cap")
@@ -561,9 +649,9 @@ def select_clips(transcript: list, video_title: str, video_description: str, pro
     if not transcript:
         raise RuntimeError("Transcript is empty; cannot select clips.")
 
-    transcript_text = _summarize_transcript_for_llm(transcript, max_total_chars=6000)
+    transcript_text = _summarize_transcript_for_llm(transcript, max_total_chars=3500)
 
-    description = (video_description or "")[:500]
+    description = (video_description or "")[:300]
 
     if progress_cb:
         progress_cb("Sending transcript to LLM for clip selection...", 30)
