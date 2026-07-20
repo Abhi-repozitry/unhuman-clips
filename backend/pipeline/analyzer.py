@@ -22,8 +22,119 @@ from typing import Callable, Optional
 MIN_COMMENTARY_WINDOW_SECONDS = 2.5
 
 
+def _summarize_transcript_for_llm(transcript: list, max_total_chars: int = 12000) -> str:
+    """
+    Intelligently summarize a long transcript for LLM consumption.
+
+    Strategy: If the raw transcript text is within the limit, return it verbatim.
+    Otherwise, compress by:
+    - Dropping very short segments (< 0.8s, likely noise)
+    - Concatenating adjacent short segments
+    - Truncating low-signal segments (single words, filler)
+    - If still too long, sample evenly across the timeline
+    """
+    if not transcript:
+        return ""
+
+    full_text = ""
+    for i, entry in enumerate(transcript):
+        duration = entry['end'] - entry['start']
+        if duration > 0.5:
+            full_text += f"Seg {i} [{entry['start']:.1f}-{entry['end']:.1f}s]: {entry['text']}\n"
+
+    # If already short enough, return as-is
+    if len(full_text) <= max_total_chars:
+        return full_text
+
+    print(f"[INFO] Transcript too long ({len(full_text)} chars), summarizing for LLM...")
+
+    filtered = []
+    for i, entry in enumerate(transcript):
+        duration = entry['end'] - entry['start']
+        text = entry['text'].strip()
+
+        # Filter: skip very short segments / single non-informative words
+        if duration < 0.8:
+            continue
+        if len(text.split()) <= 2 and text.lower() in ("okay", "yeah", "right", "uh", "um", "oh", "so", "well", "huh", "like", "just"):
+            continue
+        filtered.append({
+            "i": i,
+            "start": entry['start'],
+            "end": entry['end'],
+            "text": text,
+            "duration": duration,
+        })
+
+    if not filtered:
+        filtered = [{"i": i, **entry} for i, entry in enumerate(transcript)]
+
+    # Concatenate adjacent short segments back into coherent blocks
+    merged = []
+    cur_text = ""
+    cur_start = filtered[0]["start"]
+    cur_end = filtered[0]["end"]
+    cur_segs = []
+
+    for seg in filtered:
+        gap = seg["start"] - cur_end
+        if gap < 1.5 and (cur_end - cur_start) < 30.0:
+            # Merge adjacent segments that are close in time
+            if cur_text:
+                cur_text += " "
+            cur_text += seg["text"]
+            cur_end = seg["end"]
+            cur_segs.append(seg["i"])
+        else:
+            if cur_text:
+                merged.append({
+                    "segments": cur_segs,
+                    "start": cur_start,
+                    "end": cur_end,
+                    "text": cur_text,
+                })
+            cur_text = seg["text"]
+            cur_start = seg["start"]
+            cur_end = seg["end"]
+            cur_segs = [seg["i"]]
+
+    if cur_text:
+        merged.append({
+            "segments": cur_segs,
+            "start": cur_start,
+            "end": cur_end,
+            "text": cur_text,
+        })
+
+    # Build the compressed transcript
+    result_lines = []
+    total_chars_used = 0
+
+    # If merged is still too large, sample evenly
+    if len(merged) > 200:
+        step = max(1, len(merged) // 150)
+        merged = merged[::step]
+
+    for entry in merged:
+        seg_label = f"Seg {entry['segments'][0]}-{entry['segments'][-1]}"
+        line = f"{seg_label} [{entry['start']:.1f}-{entry['end']:.1f}s]: {entry['text']}\n"
+        if total_chars_used + len(line) > max_total_chars:
+            remaining = max_total_chars - total_chars_used
+            if remaining > 80:
+                result_lines.append(line[:remaining - 3] + "...\n")
+            break
+        result_lines.append(line)
+        total_chars_used += len(line)
+
+    compressed = "".join(result_lines)
+    print(f"[INFO] Transcript compressed from {len(full_text)} to {len(compressed)} chars "
+          f"({len(merged)} segments -> {len(filtered)} filtered -> {len(result_lines)} lines)")
+    return compressed
+
+
 def _call_llm(messages: list, progress_cb: Optional[Callable[[str, float], None]] = None) -> str:
-    """Call NVIDIA LLM with primary model, retry with fallback on failure."""
+    """Call NVIDIA LLM with primary model, retry with fallback on failure.
+    Uses exponential backoff between retries."""
     if not NVIDIA_API_KEY:
         raise RuntimeError(
             "NVIDIA_API_KEY is not set. Skipping LLM analysis and using local fallback."
@@ -36,8 +147,10 @@ def _call_llm(messages: list, progress_cb: Optional[Callable[[str, float], None]
     print(f"[DEBUG] Resolved models_to_try at runtime: {models_to_try}")
 
     last_error = None
+    backoff_delays = [3, 8, 15]  # Exponential backoff: 3s, 8s, 15s
+
     for model in models_to_try:
-        for attempt in range(2):  # one retry per model before falling through
+        for attempt in range(2):  # two attempts per model before falling through
             try:
                 kwargs = {
                     "model": model,
@@ -60,14 +173,18 @@ def _call_llm(messages: list, progress_cb: Optional[Callable[[str, float], None]
                         f"Finish reason: {finish_reason}. Refusal: {refusal}."
                     )
                 print(f"[DEBUG] LLM finish_reason: {response.choices[0].finish_reason}")
+                truncated = raw_content[:300] + "..." if len(raw_content) > 300 else raw_content
+                print(f"[DEBUG] LLM response preview: {truncated}")
                 return raw_content.strip()
             except Exception as e:
                 last_error = e
+                delay = backoff_delays[min(attempt, len(backoff_delays) - 1)]
                 print(f"[WARN] LLM call failed with model {model} (attempt {attempt+1}/2): {e}")
                 if attempt == 0:
                     if progress_cb:
-                        progress_cb(f"Model {model} failed, retrying...", 30)
-                    time.sleep(3)
+                        progress_cb(f"Model {model} failed, retrying in {delay}s...", 30)
+                    print(f"[INFO] Waiting {delay}s before retry...")
+                    time.sleep(delay)
                     continue
                 else:
                     if progress_cb:
@@ -305,11 +422,8 @@ def select_reel_plan(
     if not transcript:
         raise RuntimeError("Transcript is empty; cannot build reel plan.")
 
-    transcript_text = ""
-    for i, entry in enumerate(transcript):
-        duration = entry['end'] - entry['start']
-        if duration > 0.5:
-            transcript_text += f"Seg {i} [{entry['start']:.1f}-{entry['end']:.1f}s]: {entry['text']}\n"
+    # Use transcript summarization to keep LLM prompts manageable
+    transcript_text = _summarize_transcript_for_llm(transcript, max_total_chars=12000)
 
     description = (video_description or "")[:500]
 
@@ -339,10 +453,12 @@ def select_reel_plan(
     try:
         raw_json = _extract_json_object(raw_content)
         reel_plan = json.loads(raw_json)
-        print(f"[DEBUG] Raw LLM reel_plan: {raw_json[:500].encode('ascii', 'replace').decode()}...")
+        truncated = raw_json[:500].encode('ascii', 'replace').decode()
+        print(f"[DEBUG] Raw LLM reel_plan: {truncated}...")
     except Exception as e:
         print(f"[WARN] First LLM response failed to parse: {e}")
-        print(f"[DEBUG] Raw content (first attempt): {raw_content[:2000].encode('ascii','replace').decode()}")
+        raw_preview = raw_content[:2000].encode('ascii','replace').decode()
+        print(f"[DEBUG] Raw content (first attempt): {raw_preview}")
         if progress_cb:
             progress_cb("LLM returned non-JSON. Retrying with stricter constraints...", 40)
 
@@ -359,19 +475,24 @@ def select_reel_plan(
         try:
             raw_json = _extract_json_object(raw_content_retry)
             reel_plan = json.loads(raw_json)
-            print(f"[DEBUG] Raw LLM reel_plan (retry): {raw_json[:500].encode('ascii', 'replace').decode()}...")
+            retry_truncated = raw_json[:500].encode('ascii', 'replace').decode()
+            print(f"[DEBUG] Raw LLM reel_plan (retry): {retry_truncated}...")
         except Exception as e2:
-            print(f"[DEBUG] Raw content (retry attempt): {raw_content_retry[:2000].encode('ascii','replace').decode()}")
+            retry_preview = raw_content_retry[:2000].encode('ascii','replace').decode()
+            print(f"[DEBUG] Raw content (retry attempt): {retry_preview}")
             print(f"[WARN] LLM failed to produce JSON after retry: {e2}")
             print("[INFO] Using fallback reel plan")
             return ReelPlan(**_fallback_reel_plan(transcript, video_title), is_fallback=True)
 
     if not isinstance(reel_plan, dict) or "reel_groups" not in reel_plan:
-        raise RuntimeError(f"Expected object with 'reel_groups' array, got: {reel_plan}")
+        print(f"[WARN] LLM returned object without 'reel_groups' key: {reel_plan}")
+        print("[INFO] Using fallback reel plan")
+        return ReelPlan(**_fallback_reel_plan(transcript, video_title), is_fallback=True)
 
     groups = reel_plan["reel_groups"]
     if not isinstance(groups, list):
-        raise RuntimeError(f"'reel_groups' must be an array, got {type(groups)}")
+        print(f"[WARN] 'reel_groups' must be an array, got {type(groups)}. Using fallback.")
+        return ReelPlan(**_fallback_reel_plan(transcript, video_title), is_fallback=True)
 
     for i, group in enumerate(groups):
         if not isinstance(group, dict):
@@ -526,11 +647,8 @@ def select_clips(transcript: list, video_title: str, video_description: str, pro
     if not transcript:
         raise RuntimeError("Transcript is empty; cannot select clips.")
 
-    transcript_text = ""
-    for i, entry in enumerate(transcript):
-        duration = entry['end'] - entry['start']
-        if duration > 0.5:
-            transcript_text += f"Seg {i} [{entry['start']:.1f}-{entry['end']:.1f}s]: {entry['text']}\n"
+    # Use transcript summarization here too
+    transcript_text = _summarize_transcript_for_llm(transcript, max_total_chars=12000)
 
     description = (video_description or "")[:500]
 
@@ -615,6 +733,8 @@ Output this EXACT format with NO other text:
             clip_data = json.loads(raw_json_array)
         except Exception as e2:
             print(f"[WARN] LLM failed to produce JSON after retry: {e2}")
+            retry_preview = raw_content_retry[:2000].encode('ascii','replace').decode()
+            print(f"[DEBUG] Raw content (retry): {retry_preview}")
             print("[INFO] Using fallback clip selection based on transcript analysis")
             clip_data = _fallback_clip_selection(transcript)
             if progress_cb:

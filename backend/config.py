@@ -2,9 +2,9 @@ import os
 from pathlib import Path
 from dotenv import load_dotenv
 
-load_dotenv()
-
+# Load .env from backend/ directory with absolute path to be robust regardless of CWD
 BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / '.env')
 
 DOWNLOADS_DIR = BASE_DIR / "storage" / "downloads"
 WORKING_DIR = BASE_DIR / "storage" / "working"
