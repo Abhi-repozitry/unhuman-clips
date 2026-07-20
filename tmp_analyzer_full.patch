@@ -1,0 +1,145 @@
+diff --git a/backend/pipeline/analyzer.py b/backend/pipeline/analyzer.py
+index 914c1ae..2e69235 100644
+--- a/backend/pipeline/analyzer.py
++++ b/backend/pipeline/analyzer.py
+@@ -1,6 +1,7 @@
+ import json
+ import openai
+ import re
++import time
+ from backend.config import (
+     NVIDIA_API_KEY,
+     NVIDIA_BASE_URL,
+@@ -35,38 +36,44 @@ def _call_llm(messages: list, progress_cb: Optional[Callable[[str, float], None]
+ 
+     last_error = None
+     for model in models_to_try:
+-        try:
+-            kwargs = {
+-                "model": model,
+-                "messages": messages,
+-                "temperature": 0.1,
+-                "max_tokens": 4000,
+-            }
++        for attempt in range(2):  # one retry per model before falling through
+             try:
+-                kwargs["response_format"] = {"type": "json_object"}
+-            except Exception:
+-                pass
+-            response = client.chat.completions.create(**kwargs)
+-            raw_content = response.choices[0].message.content
+-            if raw_content is None:
+-                finish_reason = response.choices[0].finish_reason
+-                refusal = getattr(response.choices[0].message, 'refusal', None)
+-                raise RuntimeError(
+-                    f"NVIDIA API returned empty content. "
+-                    f"Finish reason: {finish_reason}. "
+-                    f"Refusal: {refusal}. "
+-                    f"Full response: {response}"
+-                )
+-            print(f"[DEBUG] LLM finish_reason: {response.choices[0].finish_reason}")
+-            return raw_content.strip()
+-        except Exception as e:
+-            last_error = e
+-            if progress_cb:
+-                progress_cb(f"Model {model} failed, trying fallback...", 30)
+-            print(f"[WARN] LLM call failed with model {model}: {e}")
+-            continue
+-
+-    raise RuntimeError(f"All NVIDIA models failed. Last error: {last_error}")
++                kwargs = {
++                    "model": model,
++                    "messages": messages,
++                    "temperature": 0.1,
++                    "max_tokens": 8000,
++                    "timeout": 180.0,
++                }
++                try:
++                    kwargs["response_format"] = {"type": "json_object"}
++                except Exception:
++                    pass
++                response = client.chat.completions.create(**kwargs)
++                raw_content = response.choices[0].message.content
++                if raw_content is None:
++                    finish_reason = response.choices[0].finish_reason
++                    refusal = getattr(response.choices[0].message, 'refusal', None)
++                    raise RuntimeError(
++                        f"NVIDIA API returned empty content. "
++                        f"Finish reason: {finish_reason}. Refusal: {refusal}."
++                    )
++                print(f"[DEBUG] LLM finish_reason: {response.choices[0].finish_reason}")
++                return raw_content.strip()
++            except Exception as e:
++                last_error = e
++                print(f"[WARN] LLM call failed with model {model} (attempt {attempt+1}/2): {e}")
++                if attempt == 0:
++                    if progress_cb:
++                        progress_cb(f"Model {model} failed, retrying...", 30)
++                    time.sleep(3)
++                    continue
++                else:
++                    if progress_cb:
++                        progress_cb(f"Model {model} failed twice, trying next model...", 30)
++                    break
++
++    raise RuntimeError(f"All NVIDIA models failed after retries. Last error: {last_error}")
+ 
+ 
+ def _build_reel_plan_prompt(video_title: str, video_description: str, transcript_text: str) -> str:
+@@ -92,26 +99,45 @@ CONSTRAINTS:
+ - Narration events are TIME WINDOWS on the continuous video, not separate visual segments.
+ - Source clips play back-to-back continuously; narration audio/captions overlay on top.
+ 
+-PERSONA GUIDE - VOICE: sharp insider, already in the know, pointing out what others missed
+-
+-✓ GOOD:
++PERSONA GUIDE - VOICE: sharp insider who explains what's happening and why it
++matters — not a wall-to-wall commentary track.
++
++HOOK (event_type="hook", one per group, reel_start=0.0):
++A direct "check this out" cold open — confident, pulls the viewer in, no
++vague hype claims.
++✓ GOOD: "Check this out.", "Watch what happens at the media wall.", "This
++almost didn't happen."
++✗ BAD (hype with no content): "This is amazing!", "You won't believe what
++happens next.", "The truth will shock you."
++
++COMMENTARY (event_type="commentary"):
++✓ GOOD — mixes brief context/explanation (what's happening, why) with insider
++observation:
++- "He's been turned away twice already — this is the last shot before the gates close."
+ - "Notice the politician's hands — they're shaking before the answer, then perfectly still after."
+ - "The code comment says 'todo' from 2018. It's still there."
+-- "Watch the background actor's reaction at 0:47. That's the real story."
+-- "They cut from wide shot to close-up right as he lies — classic misdirection."
+-
+-✗ BAD:
++✗ BAD — generic hype, nothing anchored to the footage:
+ - "This is amazing!"
+ - "You won't believe what happens next."
+-- "The truth will shock you."
+ - "This changes everything."
+ 
++NARRATION BUDGET — do not narrate over everything:
++- Total narration events per group (hook + commentary): roughly 1 per 15-20s
++  of reel runtime. Minimum 2 (hook + 1 commentary). Typically 3-5 for a
++  45-90s reel. Most clips should play on their original audio alone — do NOT
++  add a commentary event for every clip.
++- NEVER place a narration event over the group's own key_moment / payoff (the
++  moment reel_summary.key_moment describes). That moment plays on original
++  audio only — no hook, no commentary. Let it land on its own.
++- Leave real silent gaps between narration events — not back-to-back.
++
+ RULES:
+ 1. Every line MUST be anchored to a specific visible moment or exact transcript quote.
+ 2. If you can't point to WHAT the viewer should see or hear, DELETE the line.
+-3. Structure: Short observation sentence. Then a closer that explains WHY it matters.
+-4. Voice: Insider who's already in the know, not a hype person.
+-5. Length: Each narration block = 2-3 sentences max. Never more than 4.
++3. Structure: short context/observation sentence, then a closer explaining WHY it matters.
++4. Voice: insider explaining the story as it unfolds — not a hype person, not silent narration either.
++5. Length: each narration block = 2-3 sentences max, never more than 4.
++6. The budget and silence rules above are hard constraints, not suggestions.
+ 
+ OUTPUT FORMAT — JSON OBJECT ONLY, NO MARKDOWN, NO EXPLANATION:
+ {{

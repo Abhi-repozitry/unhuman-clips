@@ -33,6 +33,7 @@ def _call_llm(messages: list, progress_cb: Optional[Callable[[str, float], None]
     models_to_try = [NVIDIA_MODEL]
     if NVIDIA_MODEL_FALLBACK:
         models_to_try.append(NVIDIA_MODEL_FALLBACK)
+    print(f"[DEBUG] Resolved models_to_try at runtime: {models_to_try}")
 
     last_error = None
     for model in models_to_try:

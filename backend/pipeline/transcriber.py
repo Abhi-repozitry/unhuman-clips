@@ -4,6 +4,10 @@ import sys
 from pathlib import Path
 
 
+def _is_windows() -> bool:
+    return sys.platform.startswith("win")
+
+
 def _prepare_cuda_runtime_libraries() -> list[str]:
     """
     Make CUDA runtime libraries installed by NVIDIA pip wheels visible to
@@ -14,19 +18,36 @@ def _prepare_cuda_runtime_libraries() -> list[str]:
     cuDNN. Those may live inside the project virtualenv instead of a system CUDA
     install. Loading them with RTLD_GLOBAL avoids runtime failures like:
     "Library libcublas.so.12 is not found or cannot be loaded".
+
+    On Windows, the DLLs live in `bin` subdirectories and need to be added to
+    the `PATH` or loaded explicitly. On Linux, the `.so` files live in `lib`
+    subdirectories.
     """
     here = Path(__file__).resolve()
     backend_dir = here.parents[1]
-    pyver = f"python{sys.version_info.major}.{sys.version_info.minor}"
+    nvidia_lib_subdir = "bin" if _is_windows() else "lib"
+    nvidia_lib_ext = ".dll" if _is_windows() else ".so"
 
-    candidate_site_packages = []
-    for venv_name in (".venv", "venv"):
-        candidate_site_packages.append(
-            backend_dir / venv_name / "lib" / pyver / "site-packages"
+    # On Windows, use the standard site-packages layout (Lib\site-packages)
+    if _is_windows():
+        candidate_site_packages = []
+        for venv_name in (".venv", "venv"):
+            candidate_site_packages.append(
+                backend_dir / venv_name / "Lib" / "site-packages"
+            )
+        candidate_site_packages.extend(
+            Path(p) for p in sys.path if p.endswith("site-packages")
         )
-    candidate_site_packages.extend(
-        Path(p) for p in sys.path if p.endswith("site-packages")
-    )
+    else:
+        pyver = f"python{sys.version_info.major}.{sys.version_info.minor}"
+        candidate_site_packages = []
+        for venv_name in (".venv", "venv"):
+            candidate_site_packages.append(
+                backend_dir / venv_name / "lib" / pyver / "site-packages"
+            )
+        candidate_site_packages.extend(
+            Path(p) for p in sys.path if p.endswith("site-packages")
+        )
 
     lib_dirs: list[Path] = []
     for site_packages in candidate_site_packages:
@@ -34,25 +55,46 @@ def _prepare_cuda_runtime_libraries() -> list[str]:
         if not nvidia_dir.exists():
             continue
         for subdir in ("cublas", "cuda_nvrtc", "cudnn", "cuda_runtime"):
-            lib_dir = nvidia_dir / subdir / "lib"
+            lib_dir = nvidia_dir / subdir / nvidia_lib_subdir
             if lib_dir.exists() and lib_dir not in lib_dirs:
                 lib_dirs.append(lib_dir)
 
-    # Keep this useful for subprocesses spawned by the app as well.
-    existing = [p for p in os.environ.get("LD_LIBRARY_PATH", "").split(":") if p]
-    merged = [str(p) for p in lib_dirs] + existing
-    if merged:
-        os.environ["LD_LIBRARY_PATH"] = ":".join(dict.fromkeys(merged))
+    if _is_windows():
+        # On Windows, add DLL directories to PATH so ctypes can find them
+        existing = [p for p in os.environ.get("PATH", "").split(";") if p]
+        merged = [str(p) for p in lib_dirs] + existing
+        os.environ["PATH"] = ";".join(dict.fromkeys(merged))
+        # Also use add_dll_directory if available (Python 3.8+)
+        if hasattr(os, "add_dll_directory"):
+            for d in lib_dirs:
+                try:
+                    os.add_dll_directory(str(d))
+                except Exception:
+                    pass
+    else:
+        # Keep this useful for subprocesses spawned by the app as well.
+        existing = [p for p in os.environ.get("LD_LIBRARY_PATH", "").split(":") if p]
+        merged = [str(p) for p in lib_dirs] + existing
+        if merged:
+            os.environ["LD_LIBRARY_PATH"] = ":".join(dict.fromkeys(merged))
 
     loaded: list[str] = []
-    # Load lower-level dependencies first, then cuBLAS/cuDNN front libraries.
-    preferred_names = (
-        "libcudart.so.12",
-        "libnvrtc.so.12",
-        "libcublasLt.so.12",
-        "libcublas.so.12",
-        "libcudnn.so.9",
-    )
+    if _is_windows():
+        preferred_names = (
+            "cudart64_12.dll",
+            "nvrtc64_120_0.dll",
+            "cublasLt64_12.dll",
+            "cublas64_12.dll",
+            "cudnn64_9.dll",
+        )
+    else:
+        preferred_names = (
+            "libcudart.so.12",
+            "libnvrtc.so.12",
+            "libcublasLt.so.12",
+            "libcublas.so.12",
+            "libcudnn.so.9",
+        )
     for name in preferred_names:
         for lib_dir in lib_dirs:
             lib_path = lib_dir / name
