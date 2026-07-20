@@ -22,7 +22,7 @@ from typing import Callable, Optional
 MIN_COMMENTARY_WINDOW_SECONDS = 2.5
 
 
-def _summarize_transcript_for_llm(transcript: list, max_total_chars: int = 12000) -> str:
+def _summarize_transcript_for_llm(transcript: list, max_total_chars: int = 6000) -> str:
     """
     Intelligently summarize a long transcript for LLM consumption.
 
@@ -79,7 +79,6 @@ def _summarize_transcript_for_llm(transcript: list, max_total_chars: int = 12000
     for seg in filtered:
         gap = seg["start"] - cur_end
         if gap < 1.5 and (cur_end - cur_start) < 30.0:
-            # Merge adjacent segments that are close in time
             if cur_text:
                 cur_text += " "
             cur_text += seg["text"]
@@ -110,9 +109,9 @@ def _summarize_transcript_for_llm(transcript: list, max_total_chars: int = 12000
     result_lines = []
     total_chars_used = 0
 
-    # If merged is still too large, sample evenly
-    if len(merged) > 200:
-        step = max(1, len(merged) // 150)
+    # If merged is still too large, sample evenly to reduce further
+    if len(merged) > 150:
+        step = max(1, len(merged) // 100)
         merged = merged[::step]
 
     for entry in merged:
@@ -128,7 +127,7 @@ def _summarize_transcript_for_llm(transcript: list, max_total_chars: int = 12000
 
     compressed = "".join(result_lines)
     print(f"[INFO] Transcript compressed from {len(full_text)} to {len(compressed)} chars "
-          f"({len(merged)} segments -> {len(filtered)} filtered -> {len(result_lines)} lines)")
+          f"({len(merged)} merged blocks -> {len(result_lines)} lines)")
     return compressed
 
 
@@ -150,13 +149,13 @@ def _call_llm(messages: list, progress_cb: Optional[Callable[[str, float], None]
     backoff_delays = [3, 8, 15]  # Exponential backoff: 3s, 8s, 15s
 
     for model in models_to_try:
-        for attempt in range(2):  # two attempts per model before falling through
+        for attempt in range(2):
             try:
                 kwargs = {
                     "model": model,
                     "messages": messages,
                     "temperature": 0.1,
-                    "max_tokens": 8000,
+                    "max_tokens": 16384,
                     "timeout": 240.0,
                 }
                 try:
@@ -196,125 +195,40 @@ def _call_llm(messages: list, progress_cb: Optional[Callable[[str, float], None]
 
 def _build_reel_plan_prompt(video_title: str, video_description: str, transcript_text: str) -> str:
     """Build the full LLM prompt for reel_plan generation with persona."""
-    return f"""You are a sharp insider analyst. Analyze this video and produce a reel_plan.
+    return f"""You are a viral content strategist. Turn this video into scroll-stopping reels (<=90s each).
 
 VIDEO TITLE: {video_title}
 VIDEO DESCRIPTION: {video_description[:500]}
-
-TRANSCRIPT (segment index: [start-end] text):
+TRANSCRIPT:
 {transcript_text}
 
-TASK:
-1. Understand what this video is actually about — the core story, argument, or moments.
-2. Decide: does it tell ONE cohesive story (one group), or contain MULTIPLE distinct, self-contained moments (multiple groups)?
-3. For each group, output a reel_plan object.
-
-CONSTRAINTS:
-- Each group's final output MUST be <= 90 seconds.
-- Each group gets its own 0-based timeline (hook starts at reel_start=0.0 for THAT group).
-- MIN_COMMENTARY_WINDOW_SECONDS = 2.5 — commentary blocks must have room to breathe.
-- Hook per group: ~3s. Commentary per clip: ~2-4s. Clip duration from source.
-- Narration events are TIME WINDOWS on the continuous video, not separate visual segments.
-- Source clips play back-to-back continuously; narration audio/captions overlay on top.
-
-NARRATIVE ARC — every group MUST have a clear purpose, not just related clips:
-- The group's source_clips, IN ORDER, must form a complete arc: SETUP (establish
-  what's happening / why we're watching) -> DEVELOPMENT (tension, stakes, or
-  progression) -> PAYOFF (the resolution — the reason this reel exists).
-- The FIRST clip must give the viewer enough context to understand what's going
-  on. Do not open on a clip that starts mid-sentence or mid-action with zero
-  setup — the viewer has no context from the rest of the source video.
-- The LAST clip must deliver an actual resolution or payoff — not just
-  whichever clip happened to fit before the 90s cap. If the real payoff moment
-  doesn't fit within 90s alongside enough setup, trim the setup/middle instead
-  of cutting off before the payoff.
-- reel_summary.key_moment must describe a genuine resolution — an answer, an
-  outcome, a reveal — not "the middle of an ongoing scene."
-- Prefer clip boundaries that align to natural sentence/thought breaks in the
-  transcript over arbitrary timestamps, so clips don't start or end mid-word.
-- If the available footage genuinely has no clear beginning-middle-end, don't
-  force a group out of it — leave it out rather than produce a reel that goes
-  nowhere.
-
-Before finalizing, check your own plan against these:
-- Would someone who never saw the source video understand what's happening?
-- Does the first clip give enough context, or does it start mid-thought?
-- Does the last clip actually resolve something, or just stop?
-- Is there any clip that adds nothing — would the reel work without it?
-If any answer is no, revise the plan before outputting it.
-
-PERSONA GUIDE - VOICE: sharp insider who explains what's happening and why it
-matters — not a wall-to-wall commentary track.
-
-HOOK (event_type="hook", one per group, reel_start=0.0):
-A direct "check this out" cold open — confident, pulls the viewer in, no
-vague hype claims.
-✓ GOOD: "Check this out.", "Watch what happens at the media wall.", "This
-almost didn't happen."
-✗ BAD (hype with no content): "This is amazing!", "You won't believe what
-happens next.", "The truth will shock you."
-
-COMMENTARY (event_type="commentary"):
-✓ GOOD — mixes brief context/explanation (what's happening, why) with insider
-observation:
-- "He's been turned away twice already — this is the last shot before the gates close."
-- "Notice the politician's hands — they're shaking before the answer, then perfectly still after."
-- "The code comment says 'todo' from 2018. It's still there."
-✗ BAD — generic hype, nothing anchored to the footage:
-- "This is amazing!"
-- "You won't believe what happens next."
-- "This changes everything."
-
-NARRATION BUDGET — do not narrate over everything:
-- Total narration events per group (hook + commentary): roughly 1 per 15-20s
-  of reel runtime. Minimum 2 (hook + 1 commentary). Typically 3-5 for a
-  45-90s reel. Most clips should play on their original audio alone — do NOT
-  add a commentary event for every clip.
-- NEVER place a narration event over the group's own key_moment / payoff (the
-  moment reel_summary.key_moment describes). That moment plays on original
-  audio only — no hook, no commentary. Let it land on its own.
-- Leave real silent gaps between narration events — not back-to-back.
-
 RULES:
-1. Every line MUST be anchored to a specific visible moment or exact transcript quote.
-2. If you can't point to WHAT the viewer should see or hear, DELETE the line.
-3. Structure: short context/observation sentence, then a closer explaining WHY it matters.
-4. Voice: insider explaining the story as it unfolds — not a hype person, not silent narration either.
-5. Length: each narration block = 2-3 sentences max, never more than 4.
-6. The budget and silence rules above are hard constraints, not suggestions.
+1. HOOK (0-3s): Specific scroll-stopper. Formula: [specific moment] + [why it matters]. NEVER "This is amazing!" or "You won't believe this!"
+2. NARRATIVE ARC: SETUP (context) -> TENSION (stakes) -> PAYOFF (no narration over payoff). First clip gives context. Last clip resolves.
+3. PRIORITIZE: emotional impact > surprise > skill > stakes > spectacle. Exclude moments with none of these.
+4. COMMENTARY: Insider explaining what/why. NOT hype. ✓ GOOD: "Notice his hands shaking before the throw." ✗ BAD: "This is crazy!"
+5. NARRATION: ~1 per 15-20s. Min 2 (hook + 1). Max 3-5 for 45-90s. Most clips play on original audio. Silence between events. 2-3 sentences max.
 
-OUTPUT FORMAT — JSON OBJECT ONLY, NO MARKDOWN, NO EXPLANATION:
+OUTPUT ONLY JSON (no markdown):
 {{
   "reel_groups": [
     {{
       "group_index": 0,
-      "group_reasoning": "Why this is a distinct story unit",
+      "group_reasoning": "Why this is a distinct compelling story unit",
       "estimated_duration_seconds": 45.0,
       "reel_summary": {{
-        "title": "Hook-worthy title",
-        "source_understanding": "What the source video is about",
-        "narrative_angle": "Insider framing for this reel",
+        "title": "Scroll-stopping title",
+        "source_understanding": "What the video is about",
+        "narrative_angle": "Framing for this reel",
         "key_moment": "The payoff moment"
       }},
       "source_clips": [
-        {{"source_start": 12.3, "source_end": 18.7, "reason": "Specific reason this clip matters"}},
-        {{"source_start": 35.1, "source_end": 42.0, "reason": "Another reason"}}
+        {{"source_start": 12.3, "source_end": 18.7, "reason": "Why this clip is essential to the story"}},
+        {{"source_start": 35.1, "source_end": 42.0, "reason": "What tension or progression this adds"}}
       ],
       "narration_events": [
-        {{
-          "event_type": "hook",
-          "reel_start": 0.0,
-          "reel_end": 3.0,
-          "text": "Sharp insider hook text anchored to visible moment",
-          "voice_id": null
-        }},
-        {{
-          "event_type": "commentary",
-          "reel_start": 8.7,
-          "reel_end": 11.2,
-          "text": "Short observation. Closer explaining why it matters.",
-          "voice_id": null
-        }}
+        {{"event_type": "hook", "reel_start": 0.0, "reel_end": 3.0, "text": "Scroll-stopping hook anchored to real moment", "voice_id": null}},
+        {{"event_type": "commentary", "reel_start": 8.7, "reel_end": 11.2, "text": "Insider observation explaining why this matters", "voice_id": null}}
       ]
     }}
   ]
@@ -423,7 +337,7 @@ def select_reel_plan(
         raise RuntimeError("Transcript is empty; cannot build reel plan.")
 
     # Use transcript summarization to keep LLM prompts manageable
-    transcript_text = _summarize_transcript_for_llm(transcript, max_total_chars=12000)
+    transcript_text = _summarize_transcript_for_llm(transcript, max_total_chars=6000)
 
     description = (video_description or "")[:500]
 
@@ -647,8 +561,7 @@ def select_clips(transcript: list, video_title: str, video_description: str, pro
     if not transcript:
         raise RuntimeError("Transcript is empty; cannot select clips.")
 
-    # Use transcript summarization here too
-    transcript_text = _summarize_transcript_for_llm(transcript, max_total_chars=12000)
+    transcript_text = _summarize_transcript_for_llm(transcript, max_total_chars=6000)
 
     description = (video_description or "")[:500]
 
