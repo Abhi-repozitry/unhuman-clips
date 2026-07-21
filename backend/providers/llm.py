@@ -173,8 +173,8 @@ class LLMProvider:
 
     def get_model_config(self, stage: str) -> Tuple[str, str]:
         nvidia_config = self.config.providers.get("nvidia_nim", {})
-        primary = nvidia_config.get("primary", "mistralai/mistral-medium-3.5-128b")
-        fallback = nvidia_config.get("fallback", "google/diffusiongemma-26b-a4b-it")
+        primary = nvidia_config.get("primary", "openai/gpt-oss-20b")
+        fallback = nvidia_config.get("fallback", "stepfun-ai/step-3.7-flash")
         return primary, fallback
 
     @staticmethod
