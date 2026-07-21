@@ -2,14 +2,14 @@
 TTS Module - edge-tts Implementation
 
 Uses Microsoft Edge's free TTS service (no server required).
-Enhanced with SSML for natural pauses between sentences.
+edge-tts's built-in SentenceBoundary handling provides natural pacing.
 """
 
 import asyncio
 import edge_tts
 import subprocess
 import os
-import re
+
 from typing import Callable, Optional
 
 
@@ -24,55 +24,22 @@ FFPROBE_PATH = os.path.join(FFMPEG_DIR, "ffprobe.exe")
 TTS_RATE = "+10%"  # Slightly faster for energetic delivery
 
 
-def _add_natural_pauses(text: str) -> str:
-    """
-    Add SSML timing tags to create natural rhythm.
-    - Pause (200ms) after each sentence-ending period/question/exclamation.
-    - Pause (100ms) after commas for natural breath.
-    - Keeps overall delivery smooth and varied.
-    """
-    if not text:
-        return text
-
-    # Convert to SSML with breaks for natural speech rhythm
-    # Break after sentences: . ! ?
-    text = re.sub(r'\.(?!\d)\s*', '. <break time="280ms"/> ', text)
-    text = re.sub(r'\?\s*', '? <break time="300ms"/> ', text)
-    text = re.sub(r'!\s*', '! <break time="300ms"/> ', text)
-    text = re.sub(r',\s*', ', <break time="120ms"/> ', text)
-    text = re.sub(r';\s*', '; <break time="150ms"/> ', text)
-
-    # Clean up double spaces and trailing breaks
-    text = re.sub(r'\s+', ' ', text).strip()
-    text = re.sub(r'<break[^>]*/>\s*<break[^>]*/>', '<break time="300ms"/>', text)
-
-    return text
-
-
 def synthesize_commentary(text: str, out_path: str, progress_cb: Optional[Callable[[str, float], None]] = None) -> float:
     if progress_cb:
         progress_cb("Generating TTS audio...", 10)
 
+    # edge-tts's Communicate() XML-escapes its text input before building SSML,
+    # so manually injected <break> tags would be escaped into inert literal text.
+    # edge-tts's built-in SentenceBoundary handling already provides natural pacing
+    # at sentence punctuation — no manual SSML break injection needed.
     try:
-        # Add natural pauses for better rhythm
-        ssml_text = _add_natural_pauses(text)
-
-        # edge-tts is async, so we need to run it in a new event loop
         async def _run_tts():
-            communicate = edge_tts.Communicate(ssml_text, TTS_VOICE, rate=TTS_RATE)
+            communicate = edge_tts.Communicate(text, TTS_VOICE, rate=TTS_RATE)
             await communicate.save(out_path)
 
         asyncio.run(_run_tts())
     except Exception as e:
-        # If SSML fails, fall back to plain text
-        print(f"[WARN] edge-tts SSML failed: {e}, retrying with plain text")
-        try:
-            async def _run_tts_plain():
-                communicate = edge_tts.Communicate(text, TTS_VOICE, rate=TTS_RATE)
-                await communicate.save(out_path)
-            asyncio.run(_run_tts_plain())
-        except Exception as e2:
-            raise RuntimeError(f"edge-tts failed: {e2}") from e2
+        raise RuntimeError(f"edge-tts failed: {e}") from e
 
     if progress_cb:
         progress_cb("Getting audio duration...", 80)
