@@ -1,7 +1,7 @@
 providers:
   nvidia_nim:
-    primary: stepfun-ai/step-3.7-flash
-    fallback: openai/gpt-oss-20b
+    primary: openai/gpt-oss-20b
+    fallback: openai/gpt-oss-120b
     base_url: https://integrate.api.nvidia.com/v1
     api_key_env: NVIDIA_API_KEY
 
@@ -10,7 +10,7 @@ rate_limits:
     requests_per_minute: 35
     window_seconds: 60
   per_job:
-    requests_per_minute: 10
+    requests_per_minute: 30
     window_seconds: 60
 
 cache:

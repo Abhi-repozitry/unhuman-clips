@@ -79,7 +79,7 @@ def _build_ducking_filter_chain(narration_events, input_label="0:a", output_labe
     Chain of per-event volume filters.
     Each stage evaluates to 1.0 (passthrough) outside its own event window.
     
-    MODERATE DUCKING: Duck to 0.35 during narration — original audio stays clear but narration is audible.
+    AGGRESSIVE DUCKING: Duck to ~0.05 during narration — original audio is near-silent, avoiding voice overlap.
     Smooth ramps for natural transitions.
     """
     valid_events = [ev for ev in narration_events if ev["reel_end"] - ev["reel_start"] >= 0.3]
@@ -93,8 +93,8 @@ def _build_ducking_filter_chain(narration_events, input_label="0:a", output_labe
         ramp_in = f"min(1,max(0,(t-{s})/0.15))"
         ramp_out = f"min(1,max(0,(t-({e}-0.15))/0.15))"
         duck = f"({ramp_in})*(1-{ramp_out})"
-        # Duck to 0.35 — original audio stays clear, narration is complementary
-        vol_expr = f"1.0-({duck}*0.65)"
+        # Duck to ~0.05 — original audio is near-silent during narration, preventing voice overlap
+        vol_expr = f"1.0-({duck}*0.95)"
         nxt = output_label if i == len(valid_events) - 1 else f"duckstage{i}"
         parts.append(f"[{current}]volume='{vol_expr}':eval=frame[{nxt}]")
         current = nxt
@@ -134,6 +134,10 @@ def compose_group(
     - Clip captions at BOTTOM (alignment=2, margin_v=80)
     - Narration captions at TOP (alignment=8, margin_v=60)
     - Audio: clip audio ducked during narration windows + narration audio mixed
+    
+    NOTE: group_clip_paths param (from CLIPPING stage) is currently unused.
+    The function re-trims video/audio directly from source_path instead of using
+    the pre-cut clip files. The CLIPPING stage output is effectively orphaned.
     """
     from backend.config import MAX_OUTPUT_DURATION, MIN_OUTPUT_DURATION
     working_dir = Path(working_dir)

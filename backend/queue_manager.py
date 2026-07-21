@@ -314,6 +314,58 @@ class QueueManager:
             job.stage_data = {"status": "done", "group_index": group_idx, "files_generated": len(group_narration_audio)}
             reporter.log_info(f"Group {group_idx+1}: Generated {len(group_narration_audio)} narration audio files")
 
+            # --- Narration-overlap validation: check if narration lands on existing dialogue ---
+            # Build cumulative source-clip offsets (reel → source time mapping)
+            cumulative_durations = []
+            reel_offset = 0.0
+            for clip in group.source_clips:
+                clip_dur = clip.source_end - clip.source_start
+                cumulative_durations.append(reel_offset)
+                reel_offset += clip_dur
+
+            def reel_to_source_time(reel_time: float) -> float:
+                """Convert reel-relative time to source-video timestamp."""
+                for i, clip in enumerate(group.source_clips):
+                    clip_dur = clip.source_end - clip.source_start
+                    if i < len(cumulative_durations) - 1 and reel_time >= cumulative_durations[i + 1]:
+                        continue
+                    if reel_time < cumulative_durations[i]:
+                        return clip.source_start  # before this clip edge
+                    offset_in_clip = reel_time - cumulative_durations[i]
+                    return clip.source_start + min(offset_in_clip, clip_dur)
+                # Past the last clip: map to end of last clip
+                return group.source_clips[-1].source_end if group.source_clips else 0.0
+
+            for nar in group_narration_audio:
+                src_start = reel_to_source_time(nar["reel_start"])
+                src_end = reel_to_source_time(nar["reel_end"])
+                # Guard: if the reel range is degenerate, skip
+                if src_end <= src_start:
+                    continue
+                # Scan transcript for overlapping segments
+                overlap_total = 0.0
+                overlap_texts = []
+                for seg in job.transcript:
+                    seg_start = seg["start"]
+                    seg_end = seg["end"]
+                    # Calculate overlap between [src_start, src_end] and [seg_start, seg_end]
+                    ov_start = max(src_start, seg_start)
+                    ov_end = min(src_end, seg_end)
+                    if ov_start < ov_end:
+                        overlap_dur = ov_end - ov_start
+                        overlap_total += overlap_dur
+                        overlap_texts.append(seg["text"])
+                nar_duration = src_end - src_start
+                if nar_duration > 0 and (overlap_total / nar_duration) > 0.5:
+                    sample_text = overlap_texts[0][:80] + "..." if overlap_texts and len(overlap_texts[0]) > 80 else (overlap_texts[0] if overlap_texts else "")
+                    reporter.log_info(
+                        f"[WARN] Group {group_idx+1}: Narration {nar['event_type']} at "
+                        f"reel_start={nar['reel_start']:.1f}s, reel_end={nar['reel_end']:.1f}s "
+                        f"overlaps {(overlap_total/nar_duration)*100:.0f}% with transcript segment "
+                        f"at source [{src_start:.1f}s-{src_end:.1f}s]: "
+                        f"\"{sample_text}\""
+                    )
+
             # Guard: check if TTS narration extends beyond estimated_duration, then cap
             est_duration = group.estimated_duration_seconds
             if est_duration > 0:
