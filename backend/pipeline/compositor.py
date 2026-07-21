@@ -76,29 +76,28 @@ def _ass_filter(path: str) -> str:
 
 def _build_ducking_filter_chain(narration_events, input_label="0:a", output_label="ducked"):
     """
-    Chain of per-event volume filters.
-    Each stage evaluates to 1.0 (passthrough) outside its own event window.
-    
-    AGGRESSIVE DUCKING: Duck to ~0.05 during narration — original audio is near-silent, avoiding voice overlap.
-    Smooth ramps for natural transitions.
+    Build a robust single-filter ducking expression.
+    Ducks audio to ~0.05 during narration events — original audio is near-silent, avoiding voice overlap.
+    Uses smooth ramps (0.15s) for natural transitions.
     """
-    valid_events = [ev for ev in narration_events if ev["reel_end"] - ev["reel_start"] >= 0.3]
+    valid_events = [ev for ev in narration_events if ev.get("reel_end", 0) - ev.get("reel_start", 0) >= 0.3]
     if not valid_events:
         return f"[{input_label}]anull[{output_label}]"
 
-    parts = []
-    current = input_label
-    for i, ev in enumerate(valid_events):
+    duck_terms = []
+    for ev in valid_events:
         s, e = ev["reel_start"], ev["reel_end"]
-        ramp_in = f"min(1,max(0,(t-{s})/0.15))"
-        ramp_out = f"min(1,max(0,(t-({e}-0.15))/0.15))"
-        duck = f"({ramp_in})*(1-{ramp_out})"
-        # Duck to ~0.05 — original audio is near-silent during narration, preventing voice overlap
-        vol_expr = f"1.0-({duck}*0.95)"
-        nxt = output_label if i == len(valid_events) - 1 else f"duckstage{i}"
-        parts.append(f"[{current}]volume='{vol_expr}':eval=frame[{nxt}]")
-        current = nxt
-    return ";".join(parts)
+        ramp_in = f"min(1,max(0,(t-{s:.3f})/0.15))"
+        ramp_out = f"min(1,max(0,(t-({e:.3f}-0.15))/0.15))"
+        duck_terms.append(f"if(between(t,{s:.3f},{e:.3f}),({ramp_in})*(1-({ramp_out})),0)")
+
+    if len(duck_terms) == 1:
+        duck_expr = duck_terms[0]
+    else:
+        duck_expr = f"min(1.0,{'+'.join(duck_terms)})"
+
+    vol_expr = f"1.0-({duck_expr}*0.95)"
+    return f"[{input_label}]volume='{vol_expr}':eval=frame[{output_label}]"
 
 
 def _get_video_duration_seconds(video_path: str) -> float:
@@ -129,15 +128,11 @@ def compose_group(
 ) -> str:
     """
     Build a single group's output reel.
-    - Continuous video from concatenated source_clips (trimmed from source video)
-    - Video is padded with last-frame freeze to fill estimated_duration_seconds
+    - Continuous video from pre-cut group_clip_paths (if available) or trimmed from source_clips
+    - Video is padded with last-frame freeze to fill target_duration
     - Clip captions at BOTTOM (alignment=2, margin_v=80)
     - Narration captions at TOP (alignment=8, margin_v=60)
-    - Audio: clip audio ducked during narration windows + narration audio mixed
-    
-    NOTE: group_clip_paths param (from CLIPPING stage) is currently unused.
-    The function re-trims video/audio directly from source_path instead of using
-    the pre-cut clip files. The CLIPPING stage output is effectively orphaned.
+    - Audio: clip audio padded to target_duration & ducked during narration windows + narration audio mixed
     """
     from backend.config import MAX_OUTPUT_DURATION, MIN_OUTPUT_DURATION
     working_dir = Path(working_dir)
@@ -150,6 +145,17 @@ def compose_group(
     n_clips = len(source_clips)
     if n_clips == 0:
         raise RuntimeError("No source clips in group")
+
+    # Check whether to use pre-cut clip files from CLIPPING stage
+    use_precut = bool(
+        group_clip_paths
+        and len(group_clip_paths) == n_clips
+        and all(os.path.exists(p) for p in group_clip_paths)
+    )
+    if use_precut:
+        print(f"[INFO] Group {group_idx}: Using {n_clips} pre-cut clip files from CLIPPING stage.")
+    else:
+        print(f"[INFO] Group {group_idx}: Pre-cut clips unavailable or incomplete; trimming from source video.")
 
     if progress_cb:
         progress_cb(f"Group {group_idx+1}: Building continuous video from {n_clips} clips...", 5)
@@ -167,17 +173,24 @@ def compose_group(
     print(f"[INFO] Group {group_idx}: total_clip_duration={total_clip_duration:.1f}s, "
           f"max_narration_end={max_narration_end:.1f}s, est={estimated_duration_seconds:.1f}s, target={target_duration:.1f}s, pad={pad_duration:.1f}s")
 
-    # Build filter_complex for video: trim each clip, concat, freeze-last-frame pad, overlay captions
-    video_filter_parts = []
-    for i, clip in enumerate(source_clips):
-        start = clip["source_start"]
-        end = clip["source_end"]
-        video_filter_parts.append(
-            f"[0:v]trim=start={start}:end={end},setpts=PTS-STARTPTS[v{i}]"
-        )
-
-    concat_inputs = "".join(f"[v{i}]" for i in range(n_clips))
-    video_filter_parts.append(f"{concat_inputs}concat=n={n_clips}:v=1:a=0[base_v]")
+    # 1. Build video filter complex
+    if use_precut:
+        ffmpeg_video_inputs = []
+        for p in group_clip_paths:
+            ffmpeg_video_inputs.extend(["-i", str(p)])
+        concat_inputs = "".join(f"[{i}:v]" for i in range(n_clips))
+        video_filter_parts = [f"{concat_inputs}concat=n={n_clips}:v=1:a=0[base_v]"]
+    else:
+        ffmpeg_video_inputs = ["-i", source_path]
+        video_filter_parts = []
+        for i, clip in enumerate(source_clips):
+            start = clip["source_start"]
+            end = clip["source_end"]
+            video_filter_parts.append(
+                f"[0:v]trim=start={start}:end={end},setpts=PTS-STARTPTS[v{i}]"
+            )
+        concat_inputs = "".join(f"[v{i}]" for i in range(n_clips))
+        video_filter_parts.append(f"{concat_inputs}concat=n={n_clips}:v=1:a=0[base_v]")
 
     # Freeze last frame to pad video to target duration
     if pad_duration > 0.5:
@@ -206,8 +219,8 @@ def compose_group(
 
     video_output = working_dir / f"group_{group_idx}_video.mp4"
     ffmpeg_video = [
-        FFMPEG_PATH, "-loglevel", "error",
-        "-i", source_path,
+        FFMPEG_PATH, "-loglevel", "error"
+    ] + ffmpeg_video_inputs + [
         "-filter_complex", video_filter,
         "-map", f"[{last_v}]",
     ] + encoder_opts + [
@@ -221,27 +234,36 @@ def compose_group(
     vid_dur = _get_video_duration_seconds(str(video_output))
     print(f"[INFO] Group {group_idx}: video output duration: {vid_dur:.1f}s")
 
-    # 2. Build continuous clip audio from source_clips
+    # 2. Build continuous clip audio & pad with silence to target_duration
     if progress_cb:
-        progress_cb(f"Group {group_idx+1}: Building continuous clip audio...", 40)
+        progress_cb(f"Group {group_idx+1}: Building continuous clip audio (padded to {target_duration:.1f}s)...", 40)
 
-    audio_filter_parts = []
-    for i, clip in enumerate(source_clips):
-        start = clip["source_start"]
-        end = clip["source_end"]
+    if use_precut:
+        ffmpeg_audio_inputs = []
+        for p in group_clip_paths:
+            ffmpeg_audio_inputs.extend(["-i", str(p)])
+        concat_audio_inputs = "".join(f"[{i}:a]" for i in range(n_clips))
+        audio_filter = f"{concat_audio_inputs}concat=n={n_clips}:v=0:a=1[raw_audio];[raw_audio]apad=whole_dur={target_duration:.2f},atrim=end={target_duration:.2f}[clip_audio]"
+    else:
+        ffmpeg_audio_inputs = ["-i", source_path]
+        audio_filter_parts = []
+        for i, clip in enumerate(source_clips):
+            start = clip["source_start"]
+            end = clip["source_end"]
+            audio_filter_parts.append(
+                f"[0:a]atrim=start={start}:end={end},asetpts=PTS-STARTPTS[a{i}]"
+            )
+        concat_audio_inputs = "".join(f"[a{i}]" for i in range(n_clips))
         audio_filter_parts.append(
-            f"[0:a]atrim=start={start}:end={end},asetpts=PTS-STARTPTS[a{i}]"
+            f"{concat_audio_inputs}concat=n={n_clips}:v=0:a=1[raw_audio];"
+            f"[raw_audio]apad=whole_dur={target_duration:.2f},atrim=end={target_duration:.2f}[clip_audio]"
         )
-
-    concat_audio_inputs = "".join(f"[a{i}]" for i in range(n_clips))
-    audio_filter_parts.append(f"{concat_audio_inputs}concat=n={n_clips}:v=0:a=1[clip_audio]")
-
-    audio_filter = ";".join(audio_filter_parts)
+        audio_filter = ";".join(audio_filter_parts)
 
     clip_audio_output = working_dir / f"group_{group_idx}_clip_audio.wav"
     ffmpeg_clip_audio = [
-        FFMPEG_PATH, "-loglevel", "error",
-        "-i", source_path,
+        FFMPEG_PATH, "-loglevel", "error"
+    ] + ffmpeg_audio_inputs + [
         "-filter_complex", audio_filter,
         "-map", "[clip_audio]",
         "-c:a", "pcm_s16le", "-ar", "44100", "-ac", "2",
@@ -249,14 +271,18 @@ def compose_group(
     ]
     _run_ffmpeg(ffmpeg_clip_audio, f"Group {group_idx} clip audio")
 
-    # 3. Build narration audio track (narration events positioned at reel_start)
+    clip_audio_dur = _get_video_duration_seconds(str(clip_audio_output))
+    print(f"[INFO] Group {group_idx}: clip audio output duration (padded): {clip_audio_dur:.1f}s")
+    if abs(clip_audio_dur - target_duration) > 1.0:
+        print(f"[WARN] Group {group_idx}: clip audio duration {clip_audio_dur:.1f}s deviates from target {target_duration:.1f}s by {abs(clip_audio_dur - target_duration):.1f}s!")
+
+    # 3. Build narration audio track (padded to target_duration)
     if narration_audio:
         if progress_cb:
             progress_cb(f"Group {group_idx+1}: Building narration audio track...", 55)
 
         narration_filter_parts = []
         for i, nar in enumerate(narration_audio):
-            path = nar["path"]
             reel_start = nar["reel_start"]
             delay_ms = int(reel_start * 1000)
             narration_filter_parts.append(
@@ -264,12 +290,15 @@ def compose_group(
             )
 
         narration_inputs = "".join(f"[nar{i}]" for i in range(len(narration_audio)))
-        narration_filter_parts.append(f"{narration_inputs}amix=inputs={len(narration_audio)}:duration=longest:dropout_transition=0.1[narration_mix]")
+        narration_filter_parts.append(
+            f"{narration_inputs}amix=inputs={len(narration_audio)}:duration=longest:dropout_transition=0.1:normalize=0[raw_narration_mix];"
+            f"[raw_narration_mix]apad=whole_dur={target_duration:.2f},atrim=end={target_duration:.2f}[narration_mix]"
+        )
 
         narration_audio_output = working_dir / f"group_{group_idx}_narration.wav"
         ffmpeg_narration = [
             FFMPEG_PATH, "-loglevel", "error",
-            "-i", clip_audio_output,
+            "-i", str(clip_audio_output),  # Input 0 placeholder for sample rate matching
         ]
         for nar in narration_audio:
             ffmpeg_narration.extend(["-i", nar["path"]])
@@ -280,6 +309,9 @@ def compose_group(
             "-y", str(narration_audio_output)
         ])
         _run_ffmpeg(ffmpeg_narration, f"Group {group_idx} narration audio")
+
+        narr_dur = _get_video_duration_seconds(str(narration_audio_output))
+        print(f"[INFO] Group {group_idx}: narration audio output duration: {narr_dur:.1f}s")
 
         # 4. Apply ducking to clip audio and mix with narration
         if progress_cb:
@@ -293,16 +325,19 @@ def compose_group(
             "-i", str(clip_audio_output),
             "-i", str(narration_audio_output),
             "-filter_complex",
-            # ducked = source audio with volume reduced during narration windows
-            # narration at full volume (1.0) mixed on top
             f"{duck_chain};"
             f"[1:a]volume=1.0[narr];"
-            f"[ducked][narr]amix=inputs=2:duration=first:dropout_transition=0.1[mixed]",
+            f"[ducked][narr]amix=inputs=2:duration=first:dropout_transition=0.1:normalize=0,atrim=end={target_duration:.2f}[mixed]",
             "-map", "[mixed]",
             "-c:a", "pcm_s16le", "-ar", "44100", "-ac", "2",
             "-y", str(mixed_audio_output)
         ]
         _run_ffmpeg(ffmpeg_mix, f"Group {group_idx} audio mix")
+
+        mix_dur = _get_video_duration_seconds(str(mixed_audio_output))
+        print(f"[INFO] Group {group_idx}: mixed audio output duration: {mix_dur:.1f}s")
+        if abs(mix_dur - target_duration) > 1.0:
+            print(f"[WARN] Group {group_idx}: mixed audio duration {mix_dur:.1f}s deviates from target {target_duration:.1f}s by {abs(mix_dur - target_duration):.1f}s!")
     else:
         mixed_audio_output = clip_audio_output
 
@@ -319,6 +354,7 @@ def compose_group(
         "-i", str(mixed_audio_output),
         "-map", "0:v", "-map", "1:a",
         "-c:v", "copy", "-c:a", "aac", "-ar", "44100", "-ac", "2",
+        "-shortest",
         "-y", str(output_path)
     ]
     try:
@@ -326,15 +362,11 @@ def compose_group(
     except subprocess.CalledProcessError as e:
         raise RuntimeError(f"Final mux failed: {e.stderr.decode() if e.stderr else 'unknown'}") from e
 
-    # Check duration
-    probe = subprocess.run(
-        [FFPROBE_PATH, "-v", "error", "-show_entries", "format=duration",
-         "-of", "default=noprint_wrappers=1:nokey=1", output_path],
-        capture_output=True, text=True
-    )
-    actual_duration = float(probe.stdout.strip()) if probe.returncode == 0 else 0.0
+    actual_duration = _get_video_duration_seconds(str(output_path))
     if progress_cb:
         progress_cb(f"Group {group_idx+1}: Done ({actual_duration:.1f}s)", 100)
-    print(f"[INFO] Group {group_idx} output: {output_path.name} ({actual_duration:.1f}s)")
+    print(f"[INFO] Group {group_idx} output: {output_path.name} (final video duration: {actual_duration:.1f}s)")
+    if abs(actual_duration - target_duration) > 2.0:
+        print(f"[WARN] Group {group_idx}: FINAL OUTPUT duration {actual_duration:.1f}s deviates from target {target_duration:.1f}s by {abs(actual_duration - target_duration):.1f}s — check audio/video alignment!")
 
     return str(output_path)

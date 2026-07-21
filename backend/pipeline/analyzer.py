@@ -197,23 +197,46 @@ def _call_llm(messages: list, progress_cb: Optional[Callable[[str, float], None]
             "NVIDIA_API_KEY is not set. Skipping LLM analysis and using local fallback."
         )
 
-    print(f"[DEBUG] Resolved models_to_try at runtime: {[NVIDIA_MODEL, NVIDIA_MODEL_FALLBACK]}")
+    models_to_try = [NVIDIA_MODEL]
+    if NVIDIA_MODEL_FALLBACK and NVIDIA_MODEL_FALLBACK != NVIDIA_MODEL:
+        models_to_try.append(NVIDIA_MODEL_FALLBACK)
 
-    try:
-        raw_content = call_llm_sync(
-            messages=messages,
-            model=NVIDIA_MODEL,
-            api_key=NVIDIA_API_KEY,
-            base_url=NVIDIA_BASE_URL,
-            temperature=0.1,
-            max_tokens=131072,
-            timeout=480.0,
-        )
-        truncated = raw_content[:300] + "..." if len(raw_content) > 300 else raw_content
-        print(f"[DEBUG] LLM response preview: {truncated}")
-        return raw_content.strip()
-    except Exception as e:
-        raise RuntimeError(f"All NVIDIA models failed after retries. Last error: {e}") from e
+    print(f"[DEBUG] Resolved models_to_try at runtime: {models_to_try}")
+
+    last_error = None
+    for attempt, model in enumerate(models_to_try):
+        try:
+            print(f"[INFO] Calling LLM with model: {model}")
+            raw_content = call_llm_sync(
+                messages=messages,
+                model=model,
+                api_key=NVIDIA_API_KEY,
+                base_url=NVIDIA_BASE_URL,
+                temperature=0.1,
+                max_tokens=131072,
+                timeout=480.0,
+            )
+            truncated = raw_content[:300] + "..." if len(raw_content) > 300 else raw_content
+            print(f"[DEBUG] LLM response preview (model {model}): {truncated}")
+            
+            # Log full raw content to a debug file
+            try:
+                import time
+                from backend.config import WORKING_DIR
+                debug_path = WORKING_DIR / f"llm_debug_{int(time.time())}.txt"
+                debug_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(debug_path, "w", encoding="utf-8") as f:
+                    f.write(raw_content)
+                print(f"[DEBUG] Full LLM raw output saved to {debug_path}")
+            except Exception as log_e:
+                print(f"[WARN] Failed to write LLM debug log: {log_e}")
+                
+            return raw_content.strip()
+        except Exception as e:
+            print(f"[WARN] LLM call failed with model {model}: {e}")
+            last_error = e
+            
+    raise RuntimeError(f"All NVIDIA models failed after retries. Last error: {last_error}") from last_error
 
 
 def _try_repair_truncated_json(text: str) -> str:
@@ -745,9 +768,20 @@ def select_reel_plan(
         if group.get("estimated_duration_seconds", 0) > 130:
             print(f"[WARN] Group {i} estimated duration {group['estimated_duration_seconds']}s exceeds 130s cap")
 
-        for event in group["narration_events"]:
-            if event.get("event_type") == "hook" and event.get("reel_start", 1) != 0.0:
-                print(f"[WARN] Group {i} hook must start at reel_start=0.0, got {event.get('reel_start')}")
+        print(f"\n[INFO] Group {i} Narration Events:")
+        for j, event in enumerate(group["narration_events"]):
+            ev_type = event.get("event_type", "unknown")
+            text = event.get("text", "")
+            r_start = event.get("reel_start", 0.0)
+            r_end = event.get("reel_end", 0.0)
+            print(f"  {j+1}. [{ev_type.upper()}] {r_start:.1f}s - {r_end:.1f}s: \"{text[:60]}...\"")
+            
+            if ev_type == "hook" and r_start != 0.0:
+                print(f"[WARN] Group {i} hook must start at reel_start=0.0, got {r_start}")
+                event["reel_start"] = 0.0
+                
+            if r_end > group.get("estimated_duration_seconds", 130):
+                print(f"[WARN] Group {i} event ends at {r_end}s, which exceeds estimated duration {group.get('estimated_duration_seconds')}s")
 
     if progress_cb:
         progress_cb(f"Built reel plan with {len(groups)} group(s)", 100)

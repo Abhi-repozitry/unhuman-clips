@@ -38,6 +38,144 @@ def format_eta(seconds):
     return f"{int(seconds)}s"
 
 
+def validate_and_adjust_narration_timings(
+    group_narration_audio: List[dict],
+    source_clips: list,
+    transcript: list,
+    target_duration: float,
+    reporter,
+    group_idx: int,
+):
+    """
+    Map reel timestamps to source transcript speech intervals across source_clips.
+    Detect commentary narration events that collide with active speech (>30% overlap)
+    and automatically shift their reel_start to nearby speech gaps or the post-clip area.
+    Ensures non-overlapping narration windows and caps all narrations within target_duration.
+    """
+    if not group_narration_audio:
+        return
+
+    # 1. Map transcript speech segments to reel-relative timeline
+    reel_speech_intervals = []
+    cumulative_offset = 0.0
+    for clip in source_clips:
+        c_start = clip.source_start if hasattr(clip, "source_start") else clip["source_start"]
+        c_end = clip.source_end if hasattr(clip, "source_end") else clip["source_end"]
+        clip_dur = c_end - c_start
+        for seg in transcript:
+            s_start = seg["start"]
+            s_end = seg["end"]
+            ov_s = max(c_start, s_start)
+            ov_e = min(c_end, s_end)
+            if ov_s < ov_e - 0.1:  # meaningful speech duration
+                reel_s = cumulative_offset + (ov_s - c_start)
+                reel_e = cumulative_offset + (ov_e - c_start)
+                reel_speech_intervals.append((reel_s, reel_e, seg.get("text", "")))
+        cumulative_offset += clip_dur
+
+    def get_speech_overlap(r_start: float, r_end: float) -> tuple:
+        total_overlap = 0.0
+        texts = []
+        for s_start, s_end, text in reel_speech_intervals:
+            ov_s = max(r_start, s_start)
+            ov_e = min(r_end, s_end)
+            if ov_s < ov_e:
+                total_overlap += (ov_e - ov_s)
+                if text:
+                    texts.append(text)
+        return total_overlap, texts
+
+    def find_speech_gap(duration: float, search_start: float) -> float:
+        candidate = search_start
+        max_search = max(target_duration, cumulative_offset + 30.0)
+        while candidate + duration <= max_search:
+            overlap, _ = get_speech_overlap(candidate, candidate + duration)
+            if overlap <= 0.1:
+                return candidate
+            next_step = candidate + 0.5
+            for s_start, s_end, _ in reel_speech_intervals:
+                if s_start <= candidate < s_end:
+                    next_step = max(next_step, s_end + 0.1)
+            candidate = next_step
+        return search_start
+
+    # 2. Inspect and shift commentary narrations that collide with active dialogue
+    for nar in group_narration_audio:
+        event_type = nar.get("event_type", "commentary")
+        duration = nar.get("duration", 0.0)
+        if duration <= 0.1:
+            continue
+
+        reel_s = nar["reel_start"]
+        reel_e = nar["reel_start"] + duration
+        overlap, texts = get_speech_overlap(reel_s, reel_e)
+        overlap_ratio = overlap / duration if duration > 0 else 0.0
+
+        if event_type in ("commentary", "hook") and overlap_ratio > 0.3:
+            sample_text = texts[0][:60] + "..." if texts else ""
+            reporter.log_info(
+                f"[WARN] Group {group_idx+1}: {event_type.capitalize()} narration '{nar['text'][:40]}...' "
+                f"at reel [{reel_s:.1f}s-{reel_e:.1f}s] overlaps {overlap_ratio*100:.0f}% with transcript speech "
+                f"(\"{sample_text}\"). Attempting timing auto-shift..."
+            )
+            new_s = find_speech_gap(duration, reel_s)
+            if new_s != reel_s and new_s + duration <= target_duration:
+                nar["reel_start"] = round(new_s, 2)
+                nar["reel_end"] = round(new_s + duration, 2)
+                reporter.log_info(
+                    f"[INFO] Group {group_idx+1}: Auto-shifted commentary timing to "
+                    f"[{nar['reel_start']:.1f}s-{nar['reel_end']:.1f}s]"
+                )
+
+    # 3. Ensure narrations do not overlap with each other
+    group_narration_audio.sort(key=lambda x: x["reel_start"])
+    for i in range(1, len(group_narration_audio)):
+        prev_end = group_narration_audio[i-1]["reel_end"]
+        curr_start = group_narration_audio[i]["reel_start"]
+        curr_dur = group_narration_audio[i]["duration"]
+        if curr_start < prev_end + 0.2:
+            new_start = prev_end + 0.2
+            # Re-check speech overlap in case shifting caused a new collision
+            new_start = find_speech_gap(curr_dur, new_start)
+            
+            if new_start + curr_dur <= target_duration:
+                group_narration_audio[i]["reel_start"] = round(new_start, 2)
+                group_narration_audio[i]["reel_end"] = round(new_start + curr_dur, 2)
+                reporter.log_info(
+                    f"[INFO] Group {group_idx+1}: Shifted narration '{group_narration_audio[i]['text'][:30]}...' "
+                    f"to [{group_narration_audio[i]['reel_start']:.1f}s-{group_narration_audio[i]['reel_end']:.1f}s] "
+                    f"to avoid overlap with prior narration and speech."
+                )
+
+    # 4. Cap narrations at target_duration
+    for nar in group_narration_audio:
+        original_dur = nar.get("duration", 0.0)
+        if nar["reel_end"] > target_duration:
+            if nar["reel_start"] < target_duration - 0.5:
+                nar["reel_end"] = target_duration
+                nar["duration"] = nar["reel_end"] - nar["reel_start"]
+            else:
+                nar["reel_start"] = max(0.0, target_duration - 0.5)
+                nar["reel_end"] = target_duration
+                nar["duration"] = 0.5
+                
+            if nar["duration"] < original_dur:
+                try:
+                    import subprocess, os
+                    from backend.config import FFMPEG_PATH
+                    tmp_path = nar["path"] + ".tmp.wav"
+                    subprocess.run([
+                        FFMPEG_PATH, "-loglevel", "error", "-y",
+                        "-i", nar["path"],
+                        "-t", str(nar["duration"]),
+                        "-c", "copy", tmp_path
+                    ], check=True)
+                    os.replace(tmp_path, nar["path"])
+                    reporter.log_info(f"[INFO] Group {group_idx+1}: Trimmed narration audio file to {nar['duration']:.2f}s to fit target duration.")
+                except Exception as e:
+                    reporter.log_info(f"[WARN] Failed to trim narration audio: {e}")
+
+
 class QueueManager:
     def __init__(self, loop):
         self.queue: asyncio.Queue = asyncio.Queue()
@@ -314,73 +452,21 @@ class QueueManager:
             job.stage_data = {"status": "done", "group_index": group_idx, "files_generated": len(group_narration_audio)}
             reporter.log_info(f"Group {group_idx+1}: Generated {len(group_narration_audio)} narration audio files")
 
-            # --- Narration-overlap validation: check if narration lands on existing dialogue ---
-            # Build cumulative source-clip offsets (reel → source time mapping)
-            cumulative_durations = []
-            reel_offset = 0.0
-            for clip in group.source_clips:
-                clip_dur = clip.source_end - clip.source_start
-                cumulative_durations.append(reel_offset)
-                reel_offset += clip_dur
+            # --- Narration timing validation & auto-adjustment ---
+            from backend.config import MAX_OUTPUT_DURATION, MIN_OUTPUT_DURATION
+            total_clip_dur = sum((c.source_end - c.source_start) for c in group.source_clips)
+            max_nar_end = max((nar.get("reel_end", 0) for nar in group_narration_audio), default=0.0)
+            target_dur = max(total_clip_dur, max_nar_end, group.estimated_duration_seconds, float(MIN_OUTPUT_DURATION))
+            target_dur = min(target_dur, float(MAX_OUTPUT_DURATION))
 
-            def reel_to_source_time(reel_time: float) -> float:
-                """Convert reel-relative time to source-video timestamp."""
-                for i, clip in enumerate(group.source_clips):
-                    clip_dur = clip.source_end - clip.source_start
-                    if i < len(cumulative_durations) - 1 and reel_time >= cumulative_durations[i + 1]:
-                        continue
-                    if reel_time < cumulative_durations[i]:
-                        return clip.source_start  # before this clip edge
-                    offset_in_clip = reel_time - cumulative_durations[i]
-                    return clip.source_start + min(offset_in_clip, clip_dur)
-                # Past the last clip: map to end of last clip
-                return group.source_clips[-1].source_end if group.source_clips else 0.0
-
-            for nar in group_narration_audio:
-                src_start = reel_to_source_time(nar["reel_start"])
-                src_end = reel_to_source_time(nar["reel_end"])
-                # Guard: if the reel range is degenerate, skip
-                if src_end <= src_start:
-                    continue
-                # Scan transcript for overlapping segments
-                overlap_total = 0.0
-                overlap_texts = []
-                for seg in job.transcript:
-                    seg_start = seg["start"]
-                    seg_end = seg["end"]
-                    # Calculate overlap between [src_start, src_end] and [seg_start, seg_end]
-                    ov_start = max(src_start, seg_start)
-                    ov_end = min(src_end, seg_end)
-                    if ov_start < ov_end:
-                        overlap_dur = ov_end - ov_start
-                        overlap_total += overlap_dur
-                        overlap_texts.append(seg["text"])
-                nar_duration = src_end - src_start
-                if nar_duration > 0 and (overlap_total / nar_duration) > 0.5:
-                    sample_text = overlap_texts[0][:80] + "..." if overlap_texts and len(overlap_texts[0]) > 80 else (overlap_texts[0] if overlap_texts else "")
-                    reporter.log_info(
-                        f"[WARN] Group {group_idx+1}: Narration {nar['event_type']} at "
-                        f"reel_start={nar['reel_start']:.1f}s, reel_end={nar['reel_end']:.1f}s "
-                        f"overlaps {(overlap_total/nar_duration)*100:.0f}% with transcript segment "
-                        f"at source [{src_start:.1f}s-{src_end:.1f}s]: "
-                        f"\"{sample_text}\""
-                    )
-
-            # Guard: check if TTS narration extends beyond estimated_duration, then cap
-            est_duration = group.estimated_duration_seconds
-            if est_duration > 0:
-                raw_max_nar_end = max((nar.get("reel_end", 0) for nar in group_narration_audio), default=0.0)
-                if raw_max_nar_end > est_duration:
-                    reporter.log_info(f"[WARN] Group {group_idx+1}: TTS narration extends to {raw_max_nar_end:.1f}s, exceeding estimated {est_duration:.1f}s — capping at estimated duration")
-                for nar in group_narration_audio:
-                    if nar["reel_end"] > est_duration:
-                        if nar["reel_start"] < est_duration:
-                            nar["reel_end"] = est_duration
-                            nar["duration"] = nar["reel_end"] - nar["reel_start"]
-                        else:
-                            nar["reel_start"] = est_duration
-                            nar["reel_end"] = est_duration
-                            nar["duration"] = 0.0
+            validate_and_adjust_narration_timings(
+                group_narration_audio=group_narration_audio,
+                source_clips=group.source_clips,
+                transcript=job.transcript,
+                target_duration=target_dur,
+                reporter=reporter,
+                group_idx=group_idx,
+            )
 
             # --- CAPTIONING for this group ---
             job.stage_index = 6

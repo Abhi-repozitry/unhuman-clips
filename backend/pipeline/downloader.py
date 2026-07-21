@@ -1,14 +1,18 @@
 import yt_dlp
 import time
+import os
 from pathlib import Path
 import shutil
-from backend.config import DOWNLOAD_MAX_HEIGHT
+from backend.config import DOWNLOAD_MAX_HEIGHT, FFMPEG_PATH
 
 
-def download_video(url: str, out_dir: str, progress_hook) -> dict:
+def download_video(url: str, out_dir: str, progress_hook, max_retries: int = 4) -> dict:
     """
     Download a video into a job-specific directory to avoid reusing stale files.
     Returns yt-dlp's extract_info result plus a `source_path` field pointing to the downloaded media.
+
+    Retries up to max_retries times with exponential backoff for transient network errors
+    (timeouts, connection resets, HTTP 5xx, rate limiting).
     """
     out_dir_path = Path(out_dir)
     out_dir_path.mkdir(parents=True, exist_ok=True)
@@ -53,7 +57,8 @@ def download_video(url: str, out_dir: str, progress_hook) -> dict:
                 "eta": eta,
             })
 
-    ffmpeg_available = shutil.which("ffmpeg") is not None
+    # Check ffmpeg availability — prefer config path, then system PATH
+    ffmpeg_available = os.path.isfile(FFMPEG_PATH) or shutil.which("ffmpeg") is not None
 
     # IMPORTANT:
     # If ffmpeg isn't available, yt-dlp cannot mux separate video+audio streams.
@@ -83,7 +88,18 @@ def download_video(url: str, out_dir: str, progress_hook) -> dict:
         "overwrites": True,
         # Force extracting full info so we get title, description, etc.
         "extract_flat": False,
+        # Network robustness: socket timeout and retry settings
+        "socket_timeout": 30,
+        "retries": 5,
+        "fragment_retries": 5,
+        "file_access_retries": 3,
+        "extractor_retries": 3,
     }
+
+    # Point yt-dlp to our bundled ffmpeg if available
+    if os.path.isfile(FFMPEG_PATH):
+        ffmpeg_dir = str(Path(FFMPEG_PATH).parent)
+        ydl_opts["ffmpeg_location"] = ffmpeg_dir
 
     if cookie_file.exists():
         ydl_opts["cookiefile"] = str(cookie_file)
@@ -91,11 +107,44 @@ def download_video(url: str, out_dir: str, progress_hook) -> dict:
     if postprocessors is not None:
         ydl_opts["postprocessors"] = postprocessors
 
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            result = ydl.extract_info(url, download=True)
-    except Exception as e:
-        raise RuntimeError(str(e)) from e
+    # Retry loop with exponential backoff for transient network errors
+    last_error = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            print(f"[INFO] Download attempt {attempt}/{max_retries} for {url}")
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                result = ydl.extract_info(url, download=True)
+            last_error = None
+            break  # success
+        except Exception as e:
+            last_error = e
+            err_str = str(e).lower()
+            # Classify as retryable or fatal
+            retryable_keywords = [
+                "timed out", "timeout", "connection reset",
+                "connection refused", "connection aborted",
+                "temporary failure", "429", "too many requests",
+                "503", "502", "500", "server error",
+                "network", "urlopen error", "httpsconnectionpool",
+                "read timed out", "incompleteread",
+            ]
+            is_retryable = any(kw in err_str for kw in retryable_keywords)
+
+            if is_retryable and attempt < max_retries:
+                wait = min(2 ** attempt, 30)  # 2, 4, 8, 16, max 30s
+                print(f"[WARN] Download attempt {attempt} failed (retryable): {str(e)[:200]}")
+                print(f"[INFO] Retrying in {wait}s...")
+                time.sleep(wait)
+            else:
+                error_type = "retryable" if is_retryable else "fatal"
+                print(f"[ERROR] Download attempt {attempt} failed ({error_type}): {str(e)[:300]}")
+                if not is_retryable:
+                    break  # non-retryable error, don't keep trying
+
+    if last_error is not None:
+        raise RuntimeError(
+            f"Download failed after {max_retries} attempts. Last error: {last_error}"
+        ) from last_error
 
     if not result:
         raise RuntimeError("yt-dlp returned no result")
@@ -133,5 +182,6 @@ def download_video(url: str, out_dir: str, progress_hook) -> dict:
             "so yt-dlp can download a progressive MP4."
         )
 
+    print(f"[INFO] Download complete: {source_path}")
     result["source_path"] = source_path
     return result
