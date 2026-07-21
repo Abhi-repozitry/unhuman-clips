@@ -1,6 +1,6 @@
 providers:
   nvidia_nim:
-    primary: openai/gpt-oss-20b
+    primary: poolside/laguna-xs-2.1
     fallback: openai/gpt-oss-120b
     base_url: https://integrate.api.nvidia.com/v1
     api_key_env: NVIDIA_API_KEY

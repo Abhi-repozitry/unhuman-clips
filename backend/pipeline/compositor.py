@@ -77,18 +77,26 @@ def _ass_filter(path: str) -> str:
 def _build_ducking_filter_chain(narration_events, input_label="0:a", output_label="ducked"):
     """
     Build a robust single-filter ducking expression.
-    Ducks audio to ~0.05 during narration events — original audio is near-silent, avoiding voice overlap.
-    Uses smooth ramps (0.15s) for natural transitions.
+    Ducks audio to ~0.03 during narration events — original audio is near-silent, avoiding voice overlap.
+    Uses pre-duck buffer (0.3s before) and post-duck buffer (0.2s after) to prevent bleed.
+    Uses fast ramps (0.08s) for snappy transitions.
     """
     valid_events = [ev for ev in narration_events if ev.get("reel_end", 0) - ev.get("reel_start", 0) >= 0.3]
     if not valid_events:
         return f"[{input_label}]anull[{output_label}]"
 
+    print(f"[INFO] Audio ducking: {len(valid_events)} narration windows to duck")
     duck_terms = []
-    for ev in valid_events:
-        s, e = ev["reel_start"], ev["reel_end"]
-        ramp_in = f"min(1,max(0,(t-{s:.3f})/0.15))"
-        ramp_out = f"min(1,max(0,(t-({e:.3f}-0.15))/0.15))"
+    for i, ev in enumerate(valid_events):
+        # Apply pre-duck buffer (0.3s before) and post-duck buffer (0.2s after)
+        s = max(0.0, ev["reel_start"] - 0.3)
+        e = ev["reel_end"] + 0.2
+        print(f"[INFO]   Duck window {i+1}: [{s:.3f}s - {e:.3f}s] "
+              f"(narration [{ev['reel_start']:.3f}s - {ev['reel_end']:.3f}s], "
+              f"pre-buf=0.3s, post-buf=0.2s)")
+        # Fast 0.08s ramps for snappy ducking transitions
+        ramp_in = f"min(1,max(0,(t-{s:.3f})/0.08))"
+        ramp_out = f"min(1,max(0,(t-({e:.3f}-0.08))/0.08))"
         duck_terms.append(f"if(between(t,{s:.3f},{e:.3f}),({ramp_in})*(1-({ramp_out})),0)")
 
     if len(duck_terms) == 1:
@@ -96,7 +104,9 @@ def _build_ducking_filter_chain(narration_events, input_label="0:a", output_labe
     else:
         duck_expr = f"min(1.0,{'+'.join(duck_terms)})"
 
-    vol_expr = f"1.0-({duck_expr}*0.95)"
+    # Ducking factor 0.97 -> original audio drops to 0.03 (3%) during narration
+    vol_expr = f"1.0-({duck_expr}*0.97)"
+    print(f"[INFO] Audio ducking depth: 0.97 (original audio -> 3% volume during narration)")
     return f"[{input_label}]volume='{vol_expr}':eval=frame[{output_label}]"
 
 
@@ -326,8 +336,9 @@ def compose_group(
             "-i", str(narration_audio_output),
             "-filter_complex",
             f"{duck_chain};"
-            f"[1:a]volume=1.0[narr];"
-            f"[ducked][narr]amix=inputs=2:duration=first:dropout_transition=0.1:normalize=0,atrim=end={target_duration:.2f}[mixed]",
+            f"[1:a]volume=1.15[narr];"
+            f"[ducked][narr]amix=inputs=2:duration=first:dropout_transition=0.1:normalize=0,"
+            f"apad=whole_dur={target_duration:.2f},atrim=end={target_duration:.2f}[mixed]",
             "-map", "[mixed]",
             "-c:a", "pcm_s16le", "-ar", "44100", "-ac", "2",
             "-y", str(mixed_audio_output)
@@ -335,9 +346,23 @@ def compose_group(
         _run_ffmpeg(ffmpeg_mix, f"Group {group_idx} audio mix")
 
         mix_dur = _get_video_duration_seconds(str(mixed_audio_output))
-        print(f"[INFO] Group {group_idx}: mixed audio output duration: {mix_dur:.1f}s")
-        if abs(mix_dur - target_duration) > 1.0:
-            print(f"[WARN] Group {group_idx}: mixed audio duration {mix_dur:.1f}s deviates from target {target_duration:.1f}s by {abs(mix_dur - target_duration):.1f}s!")
+        print(f"[INFO] Group {group_idx}: mixed audio output duration: {mix_dur:.1f}s (target: {target_duration:.1f}s)")
+        if abs(mix_dur - target_duration) > 0.5:
+            print(f"[WARN] Group {group_idx}: mixed audio duration {mix_dur:.1f}s deviates from target {target_duration:.1f}s by {abs(mix_dur - target_duration):.1f}s — re-padding...")
+            # Re-pad mixed audio to exactly match target_duration
+            repadded_output = working_dir / f"group_{group_idx}_mixed_audio_repadded.wav"
+            ffmpeg_repad = [
+                FFMPEG_PATH, "-loglevel", "error",
+                "-i", str(mixed_audio_output),
+                "-af", f"apad=whole_dur={target_duration:.2f},atrim=end={target_duration:.2f}",
+                "-c:a", "pcm_s16le", "-ar", "44100", "-ac", "2",
+                "-y", str(repadded_output)
+            ]
+            _run_ffmpeg(ffmpeg_repad, f"Group {group_idx} audio re-pad")
+            import shutil
+            shutil.move(str(repadded_output), str(mixed_audio_output))
+            repad_dur = _get_video_duration_seconds(str(mixed_audio_output))
+            print(f"[INFO] Group {group_idx}: re-padded mixed audio duration: {repad_dur:.1f}s")
     else:
         mixed_audio_output = clip_audio_output
 

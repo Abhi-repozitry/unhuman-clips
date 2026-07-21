@@ -86,16 +86,30 @@ def validate_and_adjust_narration_timings(
         return total_overlap, texts
 
     def find_speech_gap(duration: float, search_start: float) -> float:
+        """Find a gap of at least `duration` seconds with minimal speech overlap.
+        Enforces 0.4s minimum distance from any speech boundary."""
         candidate = search_start
         max_search = max(target_duration, cumulative_offset + 30.0)
         while candidate + duration <= max_search:
             overlap, _ = get_speech_overlap(candidate, candidate + duration)
-            if overlap <= 0.1:
-                return candidate
-            next_step = candidate + 0.5
+            if overlap <= 0.05:  # Tighter: near-zero overlap required
+                # Verify 0.4s gap from nearest speech boundaries
+                gap_ok = True
+                for s_start, s_end, _ in reel_speech_intervals:
+                    # Check narration start isn't too close to speech end
+                    if abs(candidate - s_end) < 0.4 and candidate >= s_end - 0.1:
+                        gap_ok = False
+                        break
+                    # Check narration end isn't too close to speech start
+                    if abs((candidate + duration) - s_start) < 0.4 and (candidate + duration) <= s_start + 0.1:
+                        gap_ok = False
+                        break
+                if gap_ok:
+                    return candidate
+            next_step = candidate + 0.3  # Finer search granularity
             for s_start, s_end, _ in reel_speech_intervals:
                 if s_start <= candidate < s_end:
-                    next_step = max(next_step, s_end + 0.1)
+                    next_step = max(next_step, s_end + 0.4)  # 0.4s gap after speech
             candidate = next_step
         return search_start
 
@@ -111,20 +125,26 @@ def validate_and_adjust_narration_timings(
         overlap, texts = get_speech_overlap(reel_s, reel_e)
         overlap_ratio = overlap / duration if duration > 0 else 0.0
 
-        if event_type in ("commentary", "hook") and overlap_ratio > 0.3:
+        if event_type in ("commentary", "hook") and overlap_ratio > 0.15:  # Stricter: 15% threshold
             sample_text = texts[0][:60] + "..." if texts else ""
             reporter.log_info(
                 f"[WARN] Group {group_idx+1}: {event_type.capitalize()} narration '{nar['text'][:40]}...' "
-                f"at reel [{reel_s:.1f}s-{reel_e:.1f}s] overlaps {overlap_ratio*100:.0f}% with transcript speech "
-                f"(\"{sample_text}\"). Attempting timing auto-shift..."
+                f"at reel [{reel_s:.2f}s-{reel_e:.2f}s] overlaps {overlap_ratio*100:.0f}% with transcript speech "
+                f"(\"{sample_text}\"). Auto-shifting to nearest silent gap..."
             )
             new_s = find_speech_gap(duration, reel_s)
             if new_s != reel_s and new_s + duration <= target_duration:
+                old_start = nar['reel_start']
                 nar["reel_start"] = round(new_s, 2)
                 nar["reel_end"] = round(new_s + duration, 2)
                 reporter.log_info(
-                    f"[INFO] Group {group_idx+1}: Auto-shifted commentary timing to "
-                    f"[{nar['reel_start']:.1f}s-{nar['reel_end']:.1f}s]"
+                    f"[INFO] Group {group_idx+1}: Auto-shifted {event_type} from "
+                    f"[{old_start:.2f}s] -> [{nar['reel_start']:.2f}s-{nar['reel_end']:.2f}s] (gap verified)"
+                )
+            elif overlap_ratio > 0.5:  # Severe overlap and no gap found
+                reporter.log_info(
+                    f"[WARN] Group {group_idx+1}: Could not find gap for '{nar['text'][:30]}...' "
+                    f"({overlap_ratio*100:.0f}% overlap). Consider removing this narration."
                 )
 
     # 3. Ensure narrations do not overlap with each other
@@ -133,18 +153,20 @@ def validate_and_adjust_narration_timings(
         prev_end = group_narration_audio[i-1]["reel_end"]
         curr_start = group_narration_audio[i]["reel_start"]
         curr_dur = group_narration_audio[i]["duration"]
-        if curr_start < prev_end + 0.2:
-            new_start = prev_end + 0.2
+        min_gap = 0.4  # Increased from 0.2s to 0.4s for cleaner separation
+        if curr_start < prev_end + min_gap:
+            new_start = prev_end + min_gap
             # Re-check speech overlap in case shifting caused a new collision
             new_start = find_speech_gap(curr_dur, new_start)
             
             if new_start + curr_dur <= target_duration:
+                old_start = group_narration_audio[i]["reel_start"]
                 group_narration_audio[i]["reel_start"] = round(new_start, 2)
                 group_narration_audio[i]["reel_end"] = round(new_start + curr_dur, 2)
                 reporter.log_info(
                     f"[INFO] Group {group_idx+1}: Shifted narration '{group_narration_audio[i]['text'][:30]}...' "
-                    f"to [{group_narration_audio[i]['reel_start']:.1f}s-{group_narration_audio[i]['reel_end']:.1f}s] "
-                    f"to avoid overlap with prior narration and speech."
+                    f"from [{old_start:.2f}s] -> [{group_narration_audio[i]['reel_start']:.2f}s-{group_narration_audio[i]['reel_end']:.2f}s] "
+                    f"(min gap {min_gap}s from prior narration, speech-gap verified)"
                 )
 
     # 4. Cap narrations at target_duration
@@ -424,6 +446,22 @@ class QueueManager:
                     f"Group {group_idx+1}: TTS for {event.event_type} ({i+1}/{total_narration})",
                     (i / total_narration) * 100 if total_narration > 0 else 100,
                 )
+                # Clean TTS text: remove all special characters that break captions/TTS
+                import re as _re
+                clean_text = event.text
+                # Remove all banned characters
+                for ch in ['/', '\\', '|', '*', '#', '_', '<', '>', '[', ']', '{', '}']:
+                    clean_text = clean_text.replace(ch, ' ')
+                # Normalize dashes to commas for natural TTS pauses
+                clean_text = clean_text.replace('--', ',').replace('\u2014', ',')
+                # Collapse multiple spaces and normalize whitespace
+                clean_text = _re.sub(r'\s+', ' ', clean_text).strip()
+                # Collapse repeated punctuation (e.g., "..." stays, but ",," becomes ",")
+                clean_text = _re.sub(r'([,!?;:]){2,}', r'\1', clean_text)
+                # Strip leading/trailing punctuation artifacts (but keep sentence-final punctuation)
+                clean_text = clean_text.strip(' ,-;:')
+                event.text = clean_text
+
                 job.stage_data = {
                     "status": "voicing",
                     "group_index": group_idx,

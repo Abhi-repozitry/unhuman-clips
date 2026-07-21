@@ -317,102 +317,192 @@ def _try_repair_truncated_json(text: str) -> str:
 
 
 def _build_reel_plan_prompt(video_title: str, video_description: str, transcript_text: str) -> str:
-    """Build the full LLM prompt for reel_plan generation with enhanced persona and instructions."""
-    return f"""You are a world-class short-form content strategist who creates viral YouTube Shorts and Instagram Reels. Your reels consistently achieve high retention because you understand narrative structure, emotional pacing, and scroll-stopping hooks.
+    """Build the full LLM prompt for reel_plan generation.
 
+    Ultra-detailed prompt engineered for:
+    - Scroll-stopping psychological hooks in 0-3 seconds
+    - Ruthless clip selection prioritizing action, emotion, and contrast
+    - Structured storytelling: Setup → Rising Tension → Emotional Payoff
+    - Very short, punchy narration (max 8-12 words per event)
+    - Zero voice overlap: narration ONLY in verified silent gaps
+    - Clean text output: no special characters that break TTS/subtitles
+    """
+    return f"""You are an elite short-form content strategist and behavioral psychologist who creates viral YouTube Shorts and TikToks. You have a 95% viral hit rate because you weaponize curiosity gaps, emotional escalation, and information asymmetry. Every frame you select has a purpose. Every word of narration is surgical. You never waste a single second.
+
+===== SOURCE MATERIAL =====
 TITLE: {video_title}
 DESC: {video_description[:500]}
-TRANSCRIPT:
+
+TRANSCRIPT (segment index [start-end timestamps]):
 {transcript_text}
 
-CRITICAL INSTRUCTION:
-Create distinct, high-impact reel_groups from the video. Number of groups depends on video length and content richness (3-8 groups typical). Each group MUST use 5-8 source clips to tell a complete, self-contained story. Each reel MUST be 90-180 seconds (120-150 seconds ideal).
+===== YOUR MISSION =====
+Create distinct, high-impact reel_groups from this video. Each group is a self-contained viral short (90-180 seconds, ideal 120-150s) that tells a COMPLETE story with emotional payoff. Number of groups depends on content richness (typically 3-8).
 
-CLIP SELECTION — CHOOSE FOR CURIOSITY GAP:
-- Pick clips that create strong curiosity gaps — moments where the viewer NEEDS to know what happens next
-- Examples: setup of a challenge before we see the result, a surprising statement before the explanation, a tense moment before the resolution
-- Choose clips that naturally build on each other: setup clip → tension clip → payoff clip
-- Avoid picking clips that are just talking heads or filler explanations without narrative tension
+===== SECTION 1: VIRAL HOOK (first 0-3 seconds) =====
+The hook is EVERYTHING. 70% of viewers leave in the first 2 seconds. Your hook must:
 
-VIRAL HOOK PSYCHOLOGY & CURIOSITY GAP:
+REQUIRED FORMULA: [Specific unexpected claim or visual] + [Why the stakes are massive]
 
-1. VIRAL HOOK (first 0-3 seconds of each reel):
-   - Must create a strong INFORMATION GAP that makes viewers NEED to watch
-   - Formula: [specific unexpected observation] + [what's at stake / why it matters]
-   - Trigger: FOMO, surprise, emotional investment, or "how is this possible?"
-   
-   GOOD examples:
-   ✓ "What happened when the world's strongest man faced a 50x stronger robot — the answer wasn't what engineers predicted."
-   ✓ "A self-driving car hit 220kph on a turn the human driver was too scared to take. That's when the race got interesting."
-   ✓ "The robot literally shut itself down in anger after losing — watch the exact moment it rage quit."
+HOOK RULES:
+- MAXIMUM 10 WORDS. Shorter = more powerful. Aim for 6-8 words.
+- Must create an INFORMATION GAP that the viewer NEEDS closed.
+- Must reference something SPECIFIC from the actual content — never generic.
+- Must imply STAKES: what will be gained, lost, or revealed.
+- The hook plays OVER the opening visual — pick the most visually intense opening frame.
 
-   BAD examples:
-   ✗ "This is crazy!" (generic, no curiosity gap)
-   ✗ "You won't believe this!" (tired clickbait, no specific hook)
-   ✗ "Let's talk about robots." (no tension, no stakes)
+BANNED HOOK PATTERNS (never use these):
+- "Watch what happens..." / "You won't believe..." / "This is insane..."
+- "Let me show you..." / "Check this out..." / "Wait for it..."
+- Any hook that could apply to ANY video. It must be specific to THIS content.
 
-2. NARRATIVE ARC - Each reel must have a clear story structure:
-   - SETUP (context): Establishes who, what, where, why this matters (1-2 clips)
-   - RISING TENSION: Builds stakes, reveals complications, creates doubt (2-3 clips)
-   - SATISFYING PAYOFF: The resolution, reveal, or key insight. Let powerful visual/audio moments play on original sound WITHOUT narration overlay (1-2 clips)
+GOOD HOOK EXAMPLES:
+- "His technique broke every rule. Then this happened."
+- "Three seconds separated genius from disaster."
+- "The part nobody noticed changes everything."
+- "Engineers said impossible. He proved them wrong."
 
-3. COMMENTARY (narration_events):
-   - Use SPARINGLY — only when it adds real insight or explains "why this matters"
-   - Let powerful original audio moments speak for themselves
-   - Minimum 2-3 narration events per group (hook + 1-2 commentaries)
-   - Maximum 5-8 events for 90-180s reels
-   - Each commentary should reveal something the viewer can't see or wouldn't notice
-   
-   GOOD examples:
-   ✓ "Notice his hands are shaking — that's years of muscle memory fighting with a new technique he's never tried in competition."
-   ✓ "Most people miss the critical detail here: the instrument cluster shows the car was still in second gear. He never shifted."
+PSYCHOLOGICAL TRIGGERS TO USE IN HOOKS:
+- CURIOSITY GAP: Hint at a secret, reversal, or hidden truth
+- STAKES: Imply danger, failure, or a massive reward
+- CONTRAST: Set up a before/after or expectation/reality clash
+- AUTHORITY CHALLENGE: Someone defies experts or conventional wisdom
+- FOMO: "The part most people miss..." / "What nobody talks about..."
 
-   BAD examples:
-   ✗ "This is amazing!" (hype without insight — tell us WHY)
-   ✗ "He's driving really fast." (describes what we can already see)
-   ✗ "This shows teamwork." (generic label, not specific insight)
+===== SECTION 2: RUTHLESS CLIP SELECTION =====
+You are selecting 5-8 source clips per group (6-15 seconds each, ~70-120s total raw footage).
 
-4. SOURCE CLIPS (source_clips array):
-   - Use 5-8 source clips per group to build a complete story
-   - Each clip should serve a specific narrative purpose: establish context, add tension, or deliver payoff
-   - Choose substantial clips (6-15 seconds each) — enough to feel the moment but not drag
-   - The total raw source duration should be ~70-120s per group (narration fills the rest)
+CLIP PRIORITY HIERARCHY (select in this order):
+1. HIGH-ACTION MOMENTS: Physical movement, demonstrations, transformations, reveals
+2. EMOTIONAL FACES: Shock, awe, concentration, frustration, triumph — close-ups preferred
+3. BEFORE/AFTER CONTRAST: Clear visual difference showing change or result
+4. HIGH-STAKES DIALOGUE: Moments where someone makes a bold claim, asks a pivotal question, or delivers a verdict
+5. SKILL DEMONSTRATIONS: Someone performing, building, explaining with visible results
+6. TURNING POINTS: The exact moment where the situation shifts
 
-5. OUTPUT RULES:
-   - Each reel_group MUST have estimated_duration_seconds between 90 and 180 seconds
-   - Number of groups as appropriate for the video length (3-8 groups typical) with 5-8 clips each
-   - The complete JSON must parse correctly — do NOT truncate or omit any fields
-   - Do NOT output incomplete JSON. Always produce the full reel_groups array.
-   - Use precise source timestamps that align with actual transcript segments
+CLIPS TO REJECT (never select these):
+- Static talking heads with no conflict, question, or revelation
+- Repeated angles showing the same thing twice
+- Filler transitions, establishing shots with no content
+- Segments where the speaker is rambling, hesitating, or repeating themselves
+- Any moment that does not advance the story or escalate tension
 
-PRIORITIZATION (in order):
-   emotional impact > surprise > skill demonstration > stakes > spectacle > interesting fact
+EACH CLIP MUST PASS THIS TEST:
+"If I removed this clip, would the story lose tension, context, or payoff?" If NO → cut it.
 
-Exclude: filler content, rambling, off-topic tangents, repetitive statements.
+===== SECTION 3: STORY STRUCTURE PER GROUP =====
+Every group MUST follow this dramatic arc:
 
-OUTPUT ONLY VALID JSON — no explanations, no thinking, no text before or after:
+ACT 1 — SETUP (1-2 clips, ~15-25s):
+- Establish WHO, WHAT, and WHY the viewer should care
+- Introduce the central question, challenge, or conflict
+- The hook narration plays over the first clip
+
+ACT 2 — RISING TENSION (2-3 clips, ~30-50s):
+- Complicate the situation. Introduce obstacles, doubts, or surprising information.
+- Each clip must ESCALATE — never plateau. The tension curve goes UP.
+- This is where you build emotional investment.
+
+ACT 3 — PAYOFF (1-2 clips, ~20-30s):
+- The emotional release: the answer, the result, the transformation, the surprise.
+- This should feel EARNED — the viewer stayed for this moment.
+- End on the strongest possible note. Do NOT let it fizzle.
+
+===== SECTION 4: NARRATION / COMMENTARY — CRITICAL RULES =====
+Your narration is the secret weapon. It adds context the viewer CANNOT get from the footage alone.
+
+WORD COUNT RULE (NON-NEGOTIABLE):
+- MAXIMUM 8-12 WORDS per narration event. Aim for 8.
+- MAXIMUM 5 narration events per group (including the hook).
+- Fewer narrations = more powerful. Quality over quantity.
+
+CONTENT RULES:
+- "SHOW, DON'T TELL": Never describe what the viewer can already see.
+- Each narration must do ONE of these:
+  (a) Reveal a HIDDEN DETAIL the viewer would miss
+  (b) Add STAKES or CONSEQUENCES ("This is where everything changes")
+  (c) Create a MICRO-CURIOSITY-GAP for the next clip ("But watch what happens next")
+  (d) Provide EXPERT CONTEXT that elevates the moment ("Most people get this wrong")
+- Use present tense, active voice, punchy rhythm.
+- Sound like a confident insider, not a narrator reading a script.
+
+BANNED NARRATION PATTERNS:
+- "As you can see..." / "Here we can observe..." / "Notice how..."
+- "This is really interesting because..." (too wordy, too weak)
+- Any sentence over 12 words
+- Any narration that just summarizes what the speaker already said
+
+GOOD NARRATION EXAMPLES:
+- "Right here. Watch his left hand."
+- "This is the moment everything shifts."
+- "Nobody expected what comes next."
+- "That hesitation cost him everything."
+- "The real technique is invisible."
+
+===== SECTION 5: NARRATION TIMING — ZERO OVERLAP GUARANTEE =====
+Voice overlap DESTROYS viewer experience. These rules are ABSOLUTE:
+
+TIMING RULES (NON-NEGOTIABLE):
+1. Narration ONLY during SILENT GAPS in the transcript — when nobody is speaking.
+2. MINIMUM 0.4 SECONDS gap between any transcript speech ending and narration starting.
+3. MINIMUM 0.4 SECONDS gap between narration ending and next transcript speech starting.
+4. Check the transcript timestamps: if a segment has speech from time X to Y, your narration CANNOT start before Y + 0.4s.
+5. Hook narration (event_type "hook") starts at reel_start=0.0 — this is the ONLY exception because it plays before clip dialogue begins.
+6. If there is no clean silent gap available, DO NOT add narration for that moment. Silence is better than overlap.
+
+TIMING PLACEMENT STRATEGY:
+- Scan the transcript for gaps of 2+ seconds where no speech occurs.
+- Place narration in the CENTER of these gaps, leaving padding on both sides.
+- Between clips is often a natural gap — use these transitions.
+- After a speaker makes a key point and pauses — that pause is your window.
+
+===== SECTION 6: CLEAN TEXT RULES =====
+All narration text must be clean for TTS synthesis and subtitle rendering.
+
+BANNED CHARACTERS (never use in narration text):
+- Forward slash: /
+- Backslash: \\
+- Pipe: |
+- Asterisk: *
+- Hash: #
+- Underscore: _
+- Angle brackets: < >
+- Square brackets: [ ]
+- Curly braces: {{ }}
+- HTML tags or markdown formatting
+
+ALLOWED: Letters, numbers, periods, commas, exclamation marks, question marks, apostrophes, hyphens, em-dashes, quotation marks, colons, semicolons.
+
+Write narration as natural spoken English. Use contractions ("don't" not "do not"). Be conversational.
+
+===== OUTPUT FORMAT (STRICT JSON) =====
+Output ONLY valid JSON. No explanations, no thinking, no text before or after the JSON.
+Do NOT truncate. Always produce the COMPLETE reel_groups array.
+
 {{
   "reel_groups": [
     {{
       "group_index": 0,
-      "group_reasoning": "Why this is a distinct compelling story unit",
+      "group_reasoning": "One sentence explaining why these clips form a compelling story unit with clear arc",
       "estimated_duration_seconds": 125.0,
       "reel_summary": {{
-        "title": "Scroll-stopping title with curiosity gap",
-        "short_description": "One sentence hook description for social media posting (max 150 chars)",
-        "source_understanding": "What the video is about",
-        "narrative_angle": "Unique framing for this reel",
-        "key_moment": "The payoff moment that resolves the tension"
+        "title": "Scroll-stopping title with specific curiosity gap (max 60 chars)",
+        "short_description": "One sentence social media hook (max 150 chars)",
+        "source_understanding": "What this section of the video covers",
+        "narrative_angle": "The unique emotional or intellectual framing for this reel",
+        "key_moment": "The specific payoff moment that resolves the tension"
       }},
       "source_clips": [
-        {{"source_start": 12.3, "source_end": 18.7, "reason": "Why this clip is essential — what it establishes"}},
-        {{"source_start": 35.1, "source_end": 42.0, "reason": "What tension this adds"}},
-        {{"source_start": 55.0, "source_end": 65.0, "reason": "How the story escalates"}},
-        {{"source_start": 80.0, "source_end": 85.5, "reason": "The payoff moment"}}
+        {{"source_start": 12.3, "source_end": 18.7, "reason": "SETUP: Establishes the central challenge and why it matters"}},
+        {{"source_start": 35.1, "source_end": 42.0, "reason": "TENSION: Introduces the complication that raises stakes"}},
+        {{"source_start": 55.0, "source_end": 65.0, "reason": "ESCALATION: The situation intensifies beyond expectations"}},
+        {{"source_start": 80.0, "source_end": 88.5, "reason": "CLIMAX: The turning point where everything changes"}},
+        {{"source_start": 95.0, "source_end": 102.0, "reason": "PAYOFF: The satisfying resolution or reveal"}}
       ],
       "narration_events": [
-        {{"event_type": "hook", "reel_start": 0.0, "reel_end": 3.0, "text": "Scroll-stopping hook anchored to real moment", "voice_id": null}},
-        {{"event_type": "commentary", "reel_start": 8.7, "reel_end": 11.2, "text": "Insider observation explaining why this matters", "voice_id": null}}
+        {{"event_type": "hook", "reel_start": 0.0, "reel_end": 2.5, "text": "His technique broke every known rule.", "voice_id": null}},
+        {{"event_type": "commentary", "reel_start": 19.5, "reel_end": 22.0, "text": "Watch what happens to his left hand.", "voice_id": null}},
+        {{"event_type": "commentary", "reel_start": 45.0, "reel_end": 47.5, "text": "This changes everything.", "voice_id": null}}
       ]
     }}
   ]
