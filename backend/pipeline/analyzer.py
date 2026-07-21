@@ -1,5 +1,4 @@
 import json
-import openai
 import re
 import time
 from backend.config import (
@@ -13,13 +12,12 @@ from backend.config import (
     CLIP_DURATION_SOFT_MAX,
     HOOK_SECONDS,
     INSIGHT_SECONDS_MAX,
+    MIN_OUTPUT_DURATION,
     MAX_OUTPUT_DURATION,
 )
 from backend.models import ReelPlan
+from backend.providers.llm import call_llm_sync
 from typing import Callable, Optional
-
-
-MIN_COMMENTARY_WINDOW_SECONDS = 2.5
 
 
 def _summarize_transcript_for_llm(transcript: list, max_total_chars: int = 30000) -> str:
@@ -199,69 +197,23 @@ def _call_llm(messages: list, progress_cb: Optional[Callable[[str, float], None]
             "NVIDIA_API_KEY is not set. Skipping LLM analysis and using local fallback."
         )
 
-    client = openai.OpenAI(base_url=NVIDIA_BASE_URL, api_key=NVIDIA_API_KEY, max_retries=0)
-    models_to_try = [NVIDIA_MODEL]
-    if NVIDIA_MODEL_FALLBACK:
-        models_to_try.append(NVIDIA_MODEL_FALLBACK)
-    print(f"[DEBUG] Resolved models_to_try at runtime: {models_to_try}")
+    print(f"[DEBUG] Resolved models_to_try at runtime: {[NVIDIA_MODEL, NVIDIA_MODEL_FALLBACK]}")
 
-    last_error = None
-    backoff_delays = [3, 8, 15]
-
-    for model in models_to_try:
-        for attempt in range(2):
-            try:
-                kwargs = {
-                    "model": model,
-                    "messages": messages,
-                    "temperature": 0.1,
-                    "max_tokens": 131072,
-                    "timeout": 480.0,
-                }
-                try:
-                    kwargs["response_format"] = {"type": "json_object"}
-                except Exception:
-                    pass
-                response = client.chat.completions.create(**kwargs)
-                raw_content = response.choices[0].message.content
-                if raw_content is None:
-                    finish_reason = response.choices[0].finish_reason
-                    refusal = getattr(response.choices[0].message, 'refusal', None)
-                    raise RuntimeError(
-                        f"NVIDIA API returned empty content. "
-                        f"Finish reason: {finish_reason}. Refusal: {refusal}."
-                    )
-                finish_reason = response.choices[0].finish_reason
-                print(f"[DEBUG] LLM finish_reason: {finish_reason}")
-                truncated = raw_content[:300] + "..." if len(raw_content) > 300 else raw_content
-                print(f"[DEBUG] LLM response preview: {truncated}")
-
-                # If truncated by length, try to close the JSON
-                if finish_reason == "length":
-                    print(f"[WARN] LLM response was truncated (finish_reason=length, {len(raw_content)} chars)")
-                    # Try to find a valid JSON prefix by balancing braces
-                    raw_content = _try_repair_truncated_json(raw_content)
-                    if raw_content:
-                        print(f"[INFO] Repaired truncated JSON ({len(raw_content)} chars)")
-                        return raw_content
-
-                return raw_content.strip()
-            except Exception as e:
-                last_error = e
-                delay = backoff_delays[min(attempt, len(backoff_delays) - 1)]
-                print(f"[WARN] LLM call failed with model {model} (attempt {attempt+1}/2): {e}")
-                if attempt == 0:
-                    if progress_cb:
-                        progress_cb(f"Model {model} failed, retrying in {delay}s...", 30)
-                    print(f"[INFO] Waiting {delay}s before retry...")
-                    time.sleep(delay)
-                    continue
-                else:
-                    if progress_cb:
-                        progress_cb(f"Model {model} failed twice, trying next model...", 30)
-                    break
-
-    raise RuntimeError(f"All NVIDIA models failed after retries. Last error: {last_error}")
+    try:
+        raw_content = call_llm_sync(
+            messages=messages,
+            model=NVIDIA_MODEL,
+            api_key=NVIDIA_API_KEY,
+            base_url=NVIDIA_BASE_URL,
+            temperature=0.1,
+            max_tokens=131072,
+            timeout=480.0,
+        )
+        truncated = raw_content[:300] + "..." if len(raw_content) > 300 else raw_content
+        print(f"[DEBUG] LLM response preview: {truncated}")
+        return raw_content.strip()
+    except Exception as e:
+        raise RuntimeError(f"All NVIDIA models failed after retries. Last error: {e}") from e
 
 
 def _try_repair_truncated_json(text: str) -> str:
@@ -351,7 +303,7 @@ TRANSCRIPT:
 {transcript_text}
 
 CRITICAL INSTRUCTION:
-Create 5 to 6 distinct, high-impact reel_groups from the video. Each group MUST use 5-8 source clips to tell a complete, self-contained story. Do NOT create fewer than 5 groups. Each reel MUST be 120-130 seconds (125+ seconds ideal).
+Create distinct, high-impact reel_groups from the video. Number of groups depends on video length and content richness (3-8 groups typical). Each group MUST use 5-8 source clips to tell a complete, self-contained story. Each reel MUST be 90-180 seconds (120-150 seconds ideal).
 
 CLIP SELECTION — CHOOSE FOR CURIOSITY GAP:
 - Pick clips that create strong curiosity gaps — moments where the viewer NEEDS to know what happens next
@@ -385,7 +337,7 @@ VIRAL HOOK PSYCHOLOGY & CURIOSITY GAP:
    - Use SPARINGLY — only when it adds real insight or explains "why this matters"
    - Let powerful original audio moments speak for themselves
    - Minimum 2-3 narration events per group (hook + 1-2 commentaries)
-   - Maximum 5-8 events for 120-130s reels
+   - Maximum 5-8 events for 90-180s reels
    - Each commentary should reveal something the viewer can't see or wouldn't notice
    
    GOOD examples:
@@ -401,11 +353,11 @@ VIRAL HOOK PSYCHOLOGY & CURIOSITY GAP:
    - Use 5-8 source clips per group to build a complete story
    - Each clip should serve a specific narrative purpose: establish context, add tension, or deliver payoff
    - Choose substantial clips (6-15 seconds each) — enough to feel the moment but not drag
-   - The total raw source duration should be ~60-80s per group (narration fills the rest)
+   - The total raw source duration should be ~70-120s per group (narration fills the rest)
 
 5. OUTPUT RULES:
-   - Each reel_group MUST have estimated_duration_seconds between 120 and 130 seconds
-   - 5-6 groups total with 5-8 clips each
+   - Each reel_group MUST have estimated_duration_seconds between 90 and 180 seconds
+   - Number of groups as appropriate for the video length (3-8 groups typical) with 5-8 clips each
    - The complete JSON must parse correctly — do NOT truncate or omit any fields
    - Do NOT output incomplete JSON. Always produce the full reel_groups array.
    - Use precise source timestamps that align with actual transcript segments
@@ -421,10 +373,10 @@ OUTPUT ONLY VALID JSON — no explanations, no thinking, no text before or after
     {{
       "group_index": 0,
       "group_reasoning": "Why this is a distinct compelling story unit",
-      "estimated_duration_seconds": 75.0,
+      "estimated_duration_seconds": 125.0,
       "reel_summary": {{
         "title": "Scroll-stopping title with curiosity gap",
-        "short_description": "One sentence hook description for social media posting (max 120 chars)",
+        "short_description": "One sentence hook description for social media posting (max 150 chars)",
         "source_understanding": "What the video is about",
         "narrative_angle": "Unique framing for this reel",
         "key_moment": "The payoff moment that resolves the tension"
@@ -485,7 +437,7 @@ def _fallback_reel_plan(transcript: list, video_title: str) -> dict:
     total_duration = transcript[-1]["end"] - transcript[0]["start"]
     groups = []
     clips_per_group = 5  # Increased from 4 to 5 for richer groups
-    num_groups = min(6, max(4, len(transcript) // 12))  # Min 4, max 6 groups
+    num_groups = min(8, max(2, len(transcript) // 15))  # Min 2, max 8 groups
 
     for g in range(num_groups):
         group_clips = []
@@ -551,7 +503,7 @@ def _fallback_reel_plan(transcript: list, video_title: str) -> dict:
             continue
 
         hook_duration = 3.0
-        commentary_count = min(len(group_clips), 4)
+        commentary_count = min(len(group_clips), 8)
         commentary_duration = commentary_count * 3.0
         estimated = group_duration + hook_duration + commentary_duration
 
@@ -560,7 +512,7 @@ def _fallback_reel_plan(transcript: list, video_title: str) -> dict:
         groups.append({
             "group_index": g,
             "group_reasoning": f"Fallback group {g+1}: {len(group_clips)} clips from video segment (approx {group_duration:.0f}s of source footage)",
-            "estimated_duration_seconds": min(max(estimated, 60.0), 90.0),  # Floor at 60s
+            "estimated_duration_seconds": min(max(estimated, float(MIN_OUTPUT_DURATION)), float(MAX_OUTPUT_DURATION)),
             "reel_summary": {
                 "title": group_title,
                 "short_description": f"Key moments from {video_title[:60] if video_title else 'the video'} - Part {g+1}",
@@ -611,7 +563,7 @@ def _fallback_reel_plan(transcript: list, video_title: str) -> dict:
         groups.append({
             "group_index": 0,
             "group_reasoning": "Fallback: opening segments",
-            "estimated_duration_seconds": min(max(total_dur + 10.0, 60.0), 90.0),
+            "estimated_duration_seconds": min(max(total_dur + 10.0, float(MIN_OUTPUT_DURATION)), float(MAX_OUTPUT_DURATION)),
             "reel_summary": {
                 "title": video_title[:80] if video_title else "Untitled",
                 "short_description": f"Key moments from {video_title[:60] if video_title else 'the video'}",
@@ -664,8 +616,8 @@ def select_reel_plan(
     if not transcript:
         raise RuntimeError("Transcript is empty; cannot build reel plan.")
 
-    # Smart transcript summarization targeting ~30000 chars
-    transcript_text = _summarize_transcript_for_llm(transcript, max_total_chars=30000)
+    # Smart transcript summarization targeting ~20000 chars
+    transcript_text = _summarize_transcript_for_llm(transcript, max_total_chars=20000)
 
     description = (video_description or "")[:500]
 

@@ -124,6 +124,7 @@ def compose_group(
     narration_caption_paths: List[str],
     source_path: str,
     working_dir: Path,
+    estimated_duration_seconds: float = 0.0,
     progress_cb: Optional[Callable[[str, float], None]] = None
 ) -> str:
     """
@@ -134,7 +135,7 @@ def compose_group(
     - Narration captions at TOP (alignment=8, margin_v=60)
     - Audio: clip audio ducked during narration windows + narration audio mixed
     """
-    from backend.config import MAX_OUTPUT_DURATION
+    from backend.config import MAX_OUTPUT_DURATION, MIN_OUTPUT_DURATION
     working_dir = Path(working_dir)
     working_dir.mkdir(parents=True, exist_ok=True)
 
@@ -149,25 +150,18 @@ def compose_group(
     if progress_cb:
         progress_cb(f"Group {group_idx+1}: Building continuous video from {n_clips} clips...", 5)
 
-    # Calculate total raw clip duration
     total_clip_duration = sum(clip["source_end"] - clip["source_start"] for clip in source_clips)
     
-    # Determine target duration: the last narration event's reel_end plus padding
     max_narration_end = 0.0
     if narration_audio:
-        max_narration_end = max(nar["reel_start"] + nar["duration"] for nar in narration_audio if "duration" in nar)
-        # Also check reel_end from the events
-        for nar in narration_audio:
-            end = nar.get("reel_end", nar.get("reel_start", 0) + nar.get("duration", 0))
-            if end > max_narration_end:
-                max_narration_end = end
+        max_narration_end = max(nar.get("reel_end", 0) for nar in narration_audio)
     
-    target_duration = max(total_clip_duration, max_narration_end, 60.0)  # At least 60s
+    target_duration = max(total_clip_duration, max_narration_end, estimated_duration_seconds, float(MIN_OUTPUT_DURATION))
     target_duration = min(target_duration, float(MAX_OUTPUT_DURATION))
     pad_duration = target_duration - total_clip_duration
     
     print(f"[INFO] Group {group_idx}: total_clip_duration={total_clip_duration:.1f}s, "
-          f"max_narration_end={max_narration_end:.1f}s, target={target_duration:.1f}s, pad={pad_duration:.1f}s")
+          f"max_narration_end={max_narration_end:.1f}s, est={estimated_duration_seconds:.1f}s, target={target_duration:.1f}s, pad={pad_duration:.1f}s")
 
     # Build filter_complex for video: trim each clip, concat, freeze-last-frame pad, overlay captions
     video_filter_parts = []

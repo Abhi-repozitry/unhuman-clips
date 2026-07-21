@@ -1,7 +1,7 @@
 import json
-import openai
 import re
-from backend.config import NVIDIA_API_KEY, NVIDIA_BASE_URL, NVIDIA_MODEL, NVIDIA_MODEL_FALLBACK
+from backend.config import NVIDIA_API_KEY, NVIDIA_BASE_URL, NVIDIA_MODEL
+from backend.providers.llm import call_llm_sync
 from typing import Callable, Optional
 
 
@@ -12,38 +12,17 @@ def _call_llm(messages: list, progress_cb: Optional[Callable[[str, float], None]
             "NVIDIA_API_KEY is not set. Skipping LLM commentary and using local fallback."
         )
 
-    client = openai.OpenAI(base_url=NVIDIA_BASE_URL, api_key=NVIDIA_API_KEY)
-    models_to_try = [NVIDIA_MODEL]
-    if NVIDIA_MODEL_FALLBACK:
-        models_to_try.append(NVIDIA_MODEL_FALLBACK)
-
-    last_error = None
-    for model in models_to_try:
-        try:
-            response = client.chat.completions.create(
-                model=model,
-                messages=messages,
-                temperature=0.1,
-                max_tokens=800,
-            )
-            raw_content = response.choices[0].message.content
-            if raw_content is None:
-                finish_reason = response.choices[0].finish_reason
-                refusal = getattr(response.choices[0].message, 'refusal', None)
-                raise RuntimeError(
-                    f"NVIDIA API returned empty content. "
-                    f"Finish reason: {finish_reason}. "
-                    f"Refusal: {refusal}"
-                )
-            return raw_content.strip()
-        except Exception as e:
-            last_error = e
-            if progress_cb:
-                progress_cb(f"Model {model} failed, trying fallback...", 40)
-            print(f"[WARN] LLM call failed with model {model}: {e}")
-            continue
-
-    raise RuntimeError(f"All NVIDIA models failed. Last error: {last_error}")
+    try:
+        return call_llm_sync(
+            messages=messages,
+            model=NVIDIA_MODEL,
+            api_key=NVIDIA_API_KEY,
+            base_url=NVIDIA_BASE_URL,
+            temperature=0.1,
+            max_tokens=4000,
+        )
+    except Exception as e:
+        raise RuntimeError(f"All NVIDIA models failed. Last error: {e}") from e
 
 
 def _clip_transcript_text(transcript: list, clip: dict) -> str:

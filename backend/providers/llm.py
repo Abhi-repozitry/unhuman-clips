@@ -12,6 +12,63 @@ import openai
 from backend.providers.cache import get_cache, ContentCache
 
 
+def call_llm_sync(
+    messages: List[Dict[str, Any]],
+    model: str,
+    api_key: str,
+    base_url: str = "https://integrate.api.nvidia.com/v1",
+    temperature: float = 0.1,
+    max_tokens: int = 1200,
+    timeout: float = 480.0,
+) -> str:
+    """Synchronous LLM call with retry on failure and exponential backoff.
+    Falls back to NVIDIA_MODEL_FALLBACK if primary model fails.
+    """
+    from backend.config import NVIDIA_MODEL_FALLBACK
+
+    models_to_try = [model]
+    if NVIDIA_MODEL_FALLBACK and NVIDIA_MODEL_FALLBACK != model:
+        models_to_try.append(NVIDIA_MODEL_FALLBACK)
+
+    backoff_delays = [3, 8, 15]
+    last_error = None
+
+    for m in models_to_try:
+        for attempt in range(2):
+            try:
+                client = openai.OpenAI(base_url=base_url, api_key=api_key, max_retries=0)
+                kwargs = {
+                    "model": m,
+                    "messages": messages,
+                    "temperature": temperature,
+                    "max_tokens": max_tokens,
+                    "timeout": timeout,
+                }
+                try:
+                    kwargs["response_format"] = {"type": "json_object"}
+                except Exception:
+                    pass
+                response = client.chat.completions.create(**kwargs)
+                raw = response.choices[0].message.content
+                if raw is None:
+                    finish_reason = response.choices[0].finish_reason
+                    refusal = getattr(response.choices[0].message, 'refusal', None)
+                    raise RuntimeError(
+                        f"NVIDIA API returned empty content. "
+                        f"Finish reason: {finish_reason}. Refusal: {refusal}."
+                    )
+                return raw.strip()
+            except Exception as e:
+                last_error = e
+                if attempt == 0:
+                    delay = backoff_delays[min(attempt, len(backoff_delays) - 1)]
+                    time.sleep(delay)
+                    continue
+                else:
+                    break
+    raise RuntimeError(f"All NVIDIA models failed. Last error: {last_error}")
+
+
 @dataclass
 class ModelConfig:
     primary: str

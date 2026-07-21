@@ -1,7 +1,7 @@
 providers:
   nvidia_nim:
-    primary: nvidia/nemotron-3-ultra-550b-a55b
-    fallback: poolside/laguna-xs-2.1
+    primary: openai/gpt-oss-120b
+    fallback: openai/gpt-oss-20b
     base_url: https://integrate.api.nvidia.com/v1
     api_key_env: NVIDIA_API_KEY
 

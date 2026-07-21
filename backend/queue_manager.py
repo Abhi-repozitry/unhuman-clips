@@ -314,6 +314,22 @@ class QueueManager:
             job.stage_data = {"status": "done", "group_index": group_idx, "files_generated": len(group_narration_audio)}
             reporter.log_info(f"Group {group_idx+1}: Generated {len(group_narration_audio)} narration audio files")
 
+            # Guard: check if TTS narration extends beyond estimated_duration, then cap
+            est_duration = group.estimated_duration_seconds
+            if est_duration > 0:
+                raw_max_nar_end = max((nar.get("reel_end", 0) for nar in group_narration_audio), default=0.0)
+                if raw_max_nar_end > est_duration:
+                    reporter.log_info(f"[WARN] Group {group_idx+1}: TTS narration extends to {raw_max_nar_end:.1f}s, exceeding estimated {est_duration:.1f}s — capping at estimated duration")
+                for nar in group_narration_audio:
+                    if nar["reel_end"] > est_duration:
+                        if nar["reel_start"] < est_duration:
+                            nar["reel_end"] = est_duration
+                            nar["duration"] = nar["reel_end"] - nar["reel_start"]
+                        else:
+                            nar["reel_start"] = est_duration
+                            nar["reel_end"] = est_duration
+                            nar["duration"] = 0.0
+
             # --- CAPTIONING for this group ---
             job.stage_index = 6
             job.stage_data = {
@@ -421,6 +437,7 @@ class QueueManager:
                 [c["path"] for c in group_narration_captions],
                 job.source_path,
                 working_dir,
+                group.estimated_duration_seconds,
                 compositor_progress,
             )
 
@@ -457,8 +474,8 @@ class QueueManager:
         await self._broadcast(broadcast_fn, job)
 
     def _final_edit_group(self, input_path: str, group: ReelGroup, working_dir) -> str:
-        """Light final validation - probe duration, ensure under 90s."""
-        from backend.config import OUTPUTS_DIR
+        """Light final validation - probe duration, ensure within configured bounds."""
+        from backend.config import OUTPUTS_DIR, MAX_OUTPUT_DURATION
         import subprocess
 
         probe = subprocess.run(
@@ -468,11 +485,11 @@ class QueueManager:
         )
         duration = float(probe.stdout.strip()) if probe.returncode == 0 else 0.0
 
-        if duration > 90:
+        if duration > float(MAX_OUTPUT_DURATION):
             output_path = OUTPUTS_DIR / f"{group.group_index}_{group.reel_summary.title[:50]}.mp4"
             output_path.parent.mkdir(parents=True, exist_ok=True)
             subprocess.run(
-                [FFMPEG_PATH, "-loglevel", "error", "-i", input_path, "-t", "90", "-c", "copy", "-y", str(output_path)],
+                [FFMPEG_PATH, "-loglevel", "error", "-i", input_path, "-t", str(MAX_OUTPUT_DURATION), "-c", "copy", "-y", str(output_path)],
                 check=True
             )
             return str(output_path)
