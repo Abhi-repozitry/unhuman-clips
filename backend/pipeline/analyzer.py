@@ -729,8 +729,10 @@ def select_reel_plan(
     if not transcript:
         raise RuntimeError("Transcript is empty; cannot build reel plan.")
 
-    # Smart transcript summarization targeting ~20000 chars
-    transcript_text = _summarize_transcript_for_llm(transcript, max_total_chars=20000)
+    # Smart transcript summarization — pass full transcript up to 150k chars.
+    # step-3.7-flash has a 256k token context window; 150k chars is well within that.
+    # The summarization/scoring fallback only triggers for very long videos that exceed this.
+    transcript_text = _summarize_transcript_for_llm(transcript, max_total_chars=150000)
 
     description = (video_description or "")[:500]
 
