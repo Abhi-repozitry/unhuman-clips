@@ -179,7 +179,21 @@ def compose_group(
     target_duration = max(total_clip_duration, max_narration_end, estimated_duration_seconds, float(MIN_OUTPUT_DURATION))
     target_duration = min(target_duration, float(MAX_OUTPUT_DURATION))
     pad_duration = target_duration - total_clip_duration
-    
+
+    # Cap the tpad freeze: a freeze longer than 3 s is the video-freeze bug.
+    # This happens when the analyzer selects far fewer clips than MIN_OUTPUT_DURATION
+    # or estimated_duration_seconds requires.  We allow a tiny 3-second grace freeze
+    # (e.g. for a last-scene hold) but refuse to freeze for longer.
+    MAX_FREEZE_PAD = 3.0
+    if pad_duration > MAX_FREEZE_PAD:
+        print(f"[WARN] Group {group_idx}: clip content ({total_clip_duration:.1f}s) far short of "
+              f"target ({target_duration:.1f}s) — capping freeze pad to {MAX_FREEZE_PAD:.1f}s "
+              f"(was {pad_duration:.1f}s).  Audio will be padded with silence instead.")
+        pad_duration = MAX_FREEZE_PAD
+        # Recompute target_duration so audio padding (apad=whole_dur=...) uses the same
+        # corrected value, not the original inflated target.
+        target_duration = total_clip_duration + pad_duration
+
     print(f"[INFO] Group {group_idx}: total_clip_duration={total_clip_duration:.1f}s, "
           f"max_narration_end={max_narration_end:.1f}s, est={estimated_duration_seconds:.1f}s, target={target_duration:.1f}s, pad={pad_duration:.1f}s")
 

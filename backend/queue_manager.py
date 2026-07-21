@@ -427,7 +427,20 @@ class QueueManager:
             job.stage_data = {"status": "done", "group_index": group_idx, "clips_cut": len(group_clip_paths)}
             reporter.log_info(f"Group {group_idx+1}: Cut {len(group_clip_paths)} clips")
 
-            # --- VOICING for this group ---
+            # Check whether the analyzer under-selected clips relative to its own duration target.
+            # This is the upstream cause of the video-freeze bug (compositor pads with a frozen frame
+            # when clips are far shorter than estimated_duration_seconds or MIN_OUTPUT_DURATION).
+            actual_clip_dur = sum(c.source_end - c.source_start for c in group.source_clips)
+            if group.estimated_duration_seconds > 0 and actual_clip_dur < 0.7 * group.estimated_duration_seconds:
+                reporter.log_info(
+                    f"[WARN] Group {group_idx+1}: analyzer under-selected clips — "
+                    f"actual clip duration {actual_clip_dur:.1f}s is less than 70% of "
+                    f"estimated {group.estimated_duration_seconds:.1f}s "
+                    f"({actual_clip_dur / group.estimated_duration_seconds * 100:.0f}%). "
+                    f"This will trigger freeze-pad capping in the compositor."
+                )
+
+
             job.stage_index = 5
             group_narration_events = [e for e in group.narration_events if e.event_type in ("hook", "commentary")]
             total_narration = len(group_narration_events)
