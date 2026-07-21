@@ -212,7 +212,17 @@ def compose_group(
                     f"capped_limit={capped_limit:.2f}s, "
                     f"text={str(nar.get('text', nar.get('narration_text', '')))[:80]!r}"
                 )
-            narration_audio = [nar for nar in narration_audio if nar.get("reel_end", 0) <= capped_limit]
+            # narration_audio and narration_caption_paths are index-correlated (built in
+            # the same order in queue_manager).  Zip them together, apply the same
+            # reel_end <= capped_limit filter, then unzip so both lists stay in sync.
+            # This prevents an ASS subtitle file being baked into the video filter for
+            # an event whose audio track was just dropped.
+            paired = list(zip(narration_audio, narration_caption_paths))
+            paired = [(nar, cap) for nar, cap in paired if nar.get("reel_end", 0) <= capped_limit]
+            if paired:
+                narration_audio, narration_caption_paths = map(list, zip(*paired))
+            else:
+                narration_audio, narration_caption_paths = [], []
             # Recompute max_narration_end after dropping over-limit events.
             max_narration_end = max((nar.get("reel_end", 0) for nar in narration_audio), default=0.0)
 
