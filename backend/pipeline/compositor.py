@@ -182,14 +182,41 @@ def compose_group(
 
     # Cap the tpad freeze: a freeze longer than 3 s is the video-freeze bug.
     # This happens when the analyzer selects far fewer clips than MIN_OUTPUT_DURATION
-    # or estimated_duration_seconds requires.  We allow a tiny 3-second grace freeze
+    # or estimated_duration_seconds requires.  We allow up to 3-second grace freeze
     # (e.g. for a last-scene hold) but refuse to freeze for longer.
     MAX_FREEZE_PAD = 3.0
     if pad_duration > MAX_FREEZE_PAD:
+        # If narration extends past clip content, give it room — but still cap at 3 s.
+        # narration_tail is how far narration reaches past the last video frame.
+        narration_tail = max(0.0, max_narration_end - total_clip_duration)
+        allowed_pad = min(MAX_FREEZE_PAD, narration_tail) if narration_tail > 0 else MAX_FREEZE_PAD
+
         print(f"[WARN] Group {group_idx}: clip content ({total_clip_duration:.1f}s) far short of "
-              f"target ({target_duration:.1f}s) — capping freeze pad to {MAX_FREEZE_PAD:.1f}s "
-              f"(was {pad_duration:.1f}s).  Audio will be padded with silence instead.")
-        pad_duration = MAX_FREEZE_PAD
+              f"target ({target_duration:.1f}s) — capping freeze pad to {allowed_pad:.1f}s "
+              f"(was {pad_duration:.1f}s, narration_tail={narration_tail:.1f}s).  "
+              f"Audio will be padded with silence instead.")
+
+        # Identify narration events whose reel_end exceeds total_clip_duration + allowed_pad.
+        # These would be silently truncated; instead warn and drop them.
+        capped_limit = total_clip_duration + allowed_pad
+        truncated_events = [
+            nar for nar in narration_audio
+            if nar.get("reel_end", 0) > capped_limit
+        ]
+        if truncated_events:
+            for nar in truncated_events:
+                print(
+                    f"[WARN] Group {group_idx}: dropping narration event that would be truncated — "
+                    f"type={nar.get('event_type', '?')!r}, "
+                    f"reel=[{nar.get('reel_start', 0):.2f}s–{nar.get('reel_end', 0):.2f}s], "
+                    f"capped_limit={capped_limit:.2f}s, "
+                    f"text={str(nar.get('text', nar.get('narration_text', '')))[:80]!r}"
+                )
+            narration_audio = [nar for nar in narration_audio if nar.get("reel_end", 0) <= capped_limit]
+            # Recompute max_narration_end after dropping over-limit events.
+            max_narration_end = max((nar.get("reel_end", 0) for nar in narration_audio), default=0.0)
+
+        pad_duration = allowed_pad
         # Recompute target_duration so audio padding (apad=whole_dur=...) uses the same
         # corrected value, not the original inflated target.
         target_duration = total_clip_duration + pad_duration
