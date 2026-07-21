@@ -1,0 +1,8 @@
+feat: Increase reel duration and clip capacity to 130s/8clips
+
+- Update config: CLIP_COUNT_MAX 5→8, TARGET_TOTAL_SECONDS/MAX_OUTPUT_DURATION 90→130
+- Update analyzer fallback and queue_manager validation caps to 130s
+- Update NVIDIA primary model in config/models.yaml to stepfun-ai/step-3.7-flash
+- Rotate YouTube cookies
+- Remove stale test files (monitor_test.py, test_api.py)
+- Add backend/test_llm_only.py and tmp_test_reel_plan.py
