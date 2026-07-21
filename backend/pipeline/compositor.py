@@ -76,12 +76,11 @@ def _ass_filter(path: str) -> str:
 
 def _build_ducking_filter_chain(narration_events, input_label="0:a", output_label="ducked"):
     """
-    Chain of per-event volume filters instead of one nested max() expression.
+    Chain of per-event volume filters.
     Each stage evaluates to 1.0 (passthrough) outside its own event window.
     
-    AGGRESSIVE DUCKING: Duck to 0.25 (75% reduction) during narration.
-    Original audio stays dominant — TTS sits quietly underneath as a subtle guide.
-    Slow ramps (0.3s in/out) for natural, inaudible transitions.
+    MODERATE DUCKING: Duck to 0.35 during narration — original audio stays clear but narration is audible.
+    Smooth ramps for natural transitions.
     """
     valid_events = [ev for ev in narration_events if ev["reel_end"] - ev["reel_start"] >= 0.3]
     if not valid_events:
@@ -91,17 +90,28 @@ def _build_ducking_filter_chain(narration_events, input_label="0:a", output_labe
     current = input_label
     for i, ev in enumerate(valid_events):
         s, e = ev["reel_start"], ev["reel_end"]
-        # Aggressive ducking: reduce to 0.25 (25% volume = 75% reduction) 
-        # Slower ramps: 0.3s in, 0.3s out for completely smooth transitions
-        ramp_in = f"min(1,max(0,(t-{s})/0.3))"
-        ramp_out = f"min(1,max(0,(t-({e}-0.3))/0.3))"
+        ramp_in = f"min(1,max(0,(t-{s})/0.15))"
+        ramp_out = f"min(1,max(0,(t-({e}-0.15))/0.15))"
         duck = f"({ramp_in})*(1-{ramp_out})"
-        # Duck to 0.25 — original audio stays clearly dominant
-        vol_expr = f"1.0-({duck}*0.75)"
+        # Duck to 0.35 — original audio stays clear, narration is complementary
+        vol_expr = f"1.0-({duck}*0.65)"
         nxt = output_label if i == len(valid_events) - 1 else f"duckstage{i}"
         parts.append(f"[{current}]volume='{vol_expr}':eval=frame[{nxt}]")
         current = nxt
     return ";".join(parts)
+
+
+def _get_video_duration_seconds(video_path: str) -> float:
+    """Get duration of a video file using ffprobe."""
+    try:
+        result = subprocess.run(
+            [FFPROBE_PATH, "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", video_path],
+            capture_output=True, text=True, timeout=15
+        )
+        return float(result.stdout.strip())
+    except (subprocess.CalledProcessError, ValueError, OSError):
+        return 0.0
 
 
 def compose_group(
@@ -119,9 +129,10 @@ def compose_group(
     """
     Build a single group's output reel.
     - Continuous video from concatenated source_clips (trimmed from source video)
+    - Video is padded with last-frame freeze to fill estimated_duration_seconds
     - Clip captions at BOTTOM (alignment=2, margin_v=80)
     - Narration captions at TOP (alignment=8, margin_v=60)
-    - Audio: clip audio ducked during narration windows + narration audio mixed at full volume
+    - Audio: clip audio ducked during narration windows + narration audio mixed
     """
     from backend.config import MAX_OUTPUT_DURATION
     working_dir = Path(working_dir)
@@ -131,7 +142,6 @@ def compose_group(
     encoder_opts = _build_encoder_opts(encoder)
     print(f"[INFO] compose_group {group_idx}: Using video encoder: {encoder}")
 
-    # 1. Build continuous video from source_clips (trim from source video)
     n_clips = len(source_clips)
     if n_clips == 0:
         raise RuntimeError("No source clips in group")
@@ -139,31 +149,59 @@ def compose_group(
     if progress_cb:
         progress_cb(f"Group {group_idx+1}: Building continuous video from {n_clips} clips...", 5)
 
-    # Build filter_complex for video: trim each clip, concat, then overlay captions
+    # Calculate total raw clip duration
+    total_clip_duration = sum(clip["source_end"] - clip["source_start"] for clip in source_clips)
+    
+    # Determine target duration: the last narration event's reel_end plus padding
+    max_narration_end = 0.0
+    if narration_audio:
+        max_narration_end = max(nar["reel_start"] + nar["duration"] for nar in narration_audio if "duration" in nar)
+        # Also check reel_end from the events
+        for nar in narration_audio:
+            end = nar.get("reel_end", nar.get("reel_start", 0) + nar.get("duration", 0))
+            if end > max_narration_end:
+                max_narration_end = end
+    
+    target_duration = max(total_clip_duration, max_narration_end, 60.0)  # At least 60s
+    target_duration = min(target_duration, float(MAX_OUTPUT_DURATION))
+    pad_duration = target_duration - total_clip_duration
+    
+    print(f"[INFO] Group {group_idx}: total_clip_duration={total_clip_duration:.1f}s, "
+          f"max_narration_end={max_narration_end:.1f}s, target={target_duration:.1f}s, pad={pad_duration:.1f}s")
+
+    # Build filter_complex for video: trim each clip, concat, freeze-last-frame pad, overlay captions
     video_filter_parts = []
     for i, clip in enumerate(source_clips):
         start = clip["source_start"]
         end = clip["source_end"]
-        duration = end - start
         video_filter_parts.append(
             f"[0:v]trim=start={start}:end={end},setpts=PTS-STARTPTS[v{i}]"
         )
 
     concat_inputs = "".join(f"[v{i}]" for i in range(n_clips))
-    video_filter_parts.append(f"{concat_inputs}concat=n={n_clips}:v=1:a=0[v]")
+    video_filter_parts.append(f"{concat_inputs}concat=n={n_clips}:v=1:a=0[base_v]")
+
+    # Freeze last frame to pad video to target duration
+    if pad_duration > 0.5:
+        video_filter_parts.append(
+            f"[base_v]tpad=stop_mode=clone:stop_duration={pad_duration:.2f}[padded_v]"
+        )
+        last_video_label = "padded_v"
+    else:
+        last_video_label = "base_v"
 
     video_filter = ";".join(video_filter_parts)
 
     # Add clip captions (bottom)
     clip_caption_filters = []
-    last_v = "v"
+    last_v = last_video_label
     for i, cap_path in enumerate(clip_caption_paths):
         clip_caption_filters.append(f"[{last_v}]{_ass_filter(cap_path)}[v{i+1}]")
         last_v = f"v{i+1}"
     if clip_caption_filters:
         video_filter += ";" + ";".join(clip_caption_filters)
 
-    # Add narration captions (top) - overlay on top of clip captions
+    # Add narration captions (top)
     for i, cap_path in enumerate(narration_caption_paths):
         video_filter += f";[{last_v}]{_ass_filter(cap_path)}[v{i+len(clip_caption_filters)+1}]"
         last_v = f"v{i+len(clip_caption_filters)+1}"
@@ -177,11 +215,13 @@ def compose_group(
     ] + encoder_opts + [
         "-r", "30", "-y", str(video_output)
     ]
-    print(f"[DEBUG] video_filter = {video_filter}")
-    print(f"[DEBUG] ffmpeg cmd = {ffmpeg_video}")
     if progress_cb:
-        progress_cb(f"Group {group_idx+1}: Rendering video with captions...", 25)
+        progress_cb(f"Group {group_idx+1}: Rendering video ({total_clip_duration:.0f}s+{pad_duration:.0f}s pad)...", 25)
     _run_ffmpeg(ffmpeg_video, f"Group {group_idx} video", cwd=str(working_dir))
+
+    # Verify video duration
+    vid_dur = _get_video_duration_seconds(str(video_output))
+    print(f"[INFO] Group {group_idx}: video output duration: {vid_dur:.1f}s")
 
     # 2. Build continuous clip audio from source_clips
     if progress_cb:
@@ -255,7 +295,11 @@ def compose_group(
             "-i", str(clip_audio_output),
             "-i", str(narration_audio_output),
             "-filter_complex",
-            f"{duck_chain};[1:a]volume=0.9[narrsub];[ducked][narrsub]amix=inputs=2:duration=first:dropout_transition=0.1[mixed]",
+            # ducked = source audio with volume reduced during narration windows
+            # narration at full volume (1.0) mixed on top
+            f"{duck_chain};"
+            f"[1:a]volume=1.0[narr];"
+            f"[ducked][narr]amix=inputs=2:duration=first:dropout_transition=0.1[mixed]",
             "-map", "[mixed]",
             "-c:a", "pcm_s16le", "-ar", "44100", "-ac", "2",
             "-y", str(mixed_audio_output)
@@ -277,7 +321,6 @@ def compose_group(
         "-i", str(mixed_audio_output),
         "-map", "0:v", "-map", "1:a",
         "-c:v", "copy", "-c:a", "aac", "-ar", "44100", "-ac", "2",
-        "-shortest",
         "-y", str(output_path)
     ]
     try:
@@ -288,31 +331,12 @@ def compose_group(
     # Check duration
     probe = subprocess.run(
         [FFPROBE_PATH, "-v", "error", "-show_entries", "format=duration",
-         "-of", "default=noprint_wrappers=1:nokey=1", str(output_path)],
+         "-of", "default=noprint_wrappers=1:nokey=1", output_path],
         capture_output=True, text=True
     )
-    if probe.returncode == 0:
-        try:
-            actual_duration = float(probe.stdout.strip())
-            if actual_duration > 90:
-                print(f"[WARN] Group {group_idx} output {actual_duration:.1f}s exceeds 90s cap")
-        except ValueError:
-            pass
-
+    actual_duration = float(probe.stdout.strip()) if probe.returncode == 0 else 0.0
     if progress_cb:
-        progress_cb(f"Group {group_idx+1}: Complete!", 100)
+        progress_cb(f"Group {group_idx+1}: Done ({actual_duration:.1f}s)", 100)
+    print(f"[INFO] Group {group_idx} output: {output_path.name} ({actual_duration:.1f}s)")
 
     return str(output_path)
-
-
-# Legacy function kept for backward compatibility (not used in new pipeline)
-def build_final_video(
-    job_id: str,
-    clip_paths: list,
-    clip_windows: list,
-    commentary_audio: list,
-    caption_paths_commentary: list,
-    caption_paths_clips: list,
-    progress_cb: Optional[Callable[[str, float], None]] = None
-) -> str:
-    raise RuntimeError("build_final_video is deprecated. Use compose_group() per group.")
