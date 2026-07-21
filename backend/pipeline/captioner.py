@@ -172,7 +172,7 @@ def generate_clip_ass(transcript: list, clip_start: float, clip_end: float,
 def generate_commentary_ass(text: str, duration: float, out_path: str,
                             progress_cb: Optional[Callable[[str, float], None]] = None,
                             start_time: float = 0.0) -> str:
-    """Generate commentary (hook/insight) captions — bottom center, larger, with key word highlights."""
+    """Generate commentary (hook/insight) captions — top center (alignment=8, margin_v=60), larger, with key word highlights."""
     if progress_cb:
         progress_cb("Wrapping commentary text...", 30)
 
@@ -184,8 +184,8 @@ def generate_commentary_ass(text: str, duration: float, out_path: str,
 
     style_line = _make_style(
         "CommentaryCaption", CAPTION_FONT, COMMENTARY_CAPTION_SIZE,
-        alignment=2,     # bottom center
-        margin_v=100,    # 100px from bottom (more room)
+        alignment=8,     # top center
+        margin_v=60,     # 60px from top
         outline=4, shadow=3,
         bold=1,          # Bold for emphasis
         primary="&H00FFFFFF",
