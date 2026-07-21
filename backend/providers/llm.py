@@ -18,11 +18,13 @@ def call_llm_sync(
     api_key: str,
     base_url: str = "https://integrate.api.nvidia.com/v1",
     temperature: float = 0.1,
-    max_tokens: int = 1200,
+    max_tokens: int = 65536,
     timeout: float = 480.0,
 ) -> str:
     """Synchronous LLM call with retry on failure and exponential backoff.
     Falls back to NVIDIA_MODEL_FALLBACK if primary model fails.
+    Default max_tokens (65536) ensures both primary and fallback models
+    have ample room for deep reasoning and long-form output.
     """
     from backend.config import NVIDIA_MODEL_FALLBACK
 
@@ -219,7 +221,7 @@ class LLMProvider:
         job_id: Optional[str] = None,
         model: Optional[str] = None,
         temperature: float = 0.1,
-        max_tokens: int = 1200,
+        max_tokens: int = 65536,
         progress_cb: Optional[Callable[[str, float], None]] = None
     ) -> str:
         primary, fallback = self.get_model_config(stage)
@@ -318,7 +320,7 @@ class LLMProvider:
         fallback_fn: Optional[Callable[[], str]] = None,
         model: Optional[str] = None,
         temperature: float = 0.1,
-        max_tokens: int = 1200,
+        max_tokens: int = 65536,
         progress_cb: Optional[Callable[[str, float], None]] = None
     ) -> str:
         try:
