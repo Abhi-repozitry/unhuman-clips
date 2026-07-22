@@ -345,7 +345,7 @@ The hook is EVERYTHING. 70% of viewers leave in the first 2 seconds. Your hook m
 REQUIRED FORMULA: [Specific unexpected claim or visual] + [Why the stakes are massive]
 
 HOOK RULES:
-- MAXIMUM 10 WORDS. Shorter = more powerful. Aim for 6-8 words.
+- MAXIMUM 3 WORDS. Shorter = more powerful. Aim for 1-3 words.
 - Must create an INFORMATION GAP that the viewer NEEDS closed.
 - Must reference something SPECIFIC from the actual content — never generic.
 - Must imply STAKES: what will be gained, lost, or revealed.
@@ -370,7 +370,7 @@ PSYCHOLOGICAL TRIGGERS TO USE IN HOOKS:
 - FOMO: "The part most people miss..." / "What nobody talks about..."
 
 ===== SECTION 2: RUTHLESS CLIP SELECTION =====
-You are selecting 5-8 source clips per group (6-15 seconds each, ~70-120s total raw footage).
+You are selecting 4-8 source clips per group (6-30 seconds each, ~70-120s total raw footage).
 
 CLIP PRIORITY HIERARCHY (select in this order):
 1. HIGH-ACTION MOMENTS: Physical movement, demonstrations, transformations, reveals
