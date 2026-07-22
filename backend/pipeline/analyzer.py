@@ -299,7 +299,12 @@ Commentary (event_type: "commentary"):
 - BANNED: "As you can see", "Notice how"
 
 The video system ducks original audio to ~3% during narration — place narration anywhere, even over dialogue.
-Leave at least 0.4s between narration events.
+===== CRITICAL: NARRATION SPACING =====
+- Leave at least 0.8s clear gap between narration events. Do not stack them.
+- NEVER place narration over the group's key_moment (the main payoff/climax). The finale should have clean unducked audio for full impact.
+- The last 5-8 seconds of the reel should be FREE of narration — let the final footage and original audio land the payoff.
+- If your narration events are too dense, remove one or spread them further apart.
+- Total narration duration (sum of all reel_end - reel_start) should be no more than 30% of the total reel duration.
 
 ===== TEXT RULES =====
 Allowed characters: letters, numbers, . , ! ? ' - — " : ;

@@ -84,30 +84,57 @@ def _ass_filter(path: str) -> str:
     return f"ass=filename={filename}"
 
 
-def _build_ducking_filter_chain(narration_events, input_label="0:a", output_label="ducked"):
+def _build_ducking_filter_chain(narration_events, input_label="0:a", output_label="ducked",
+                                 target_duration: float = 0.0, key_moment_end: float = 0.0):
     """
     Build a robust single-filter ducking expression.
     Ducks audio to ~0.03 during narration events — original audio is near-silent, avoiding voice overlap.
-    Uses pre-duck buffer (0.3s before) and post-duck buffer (0.2s after) to prevent bleed.
-    Uses fast ramps (0.08s) for snappy transitions.
+    Uses tighter pre-duck buffer (0.4s before) and post-duck buffer (0.25s after) to prevent bleed.
+    Uses smooth 0.1s ramps for natural transitions.
+    SKIPS ducking during the final key moment (last 8s of the group) to let the payoff breathe.
     """
     valid_events = [ev for ev in narration_events if ev.get("reel_end", 0) - ev.get("reel_start", 0) >= 0.3]
     if not valid_events:
         return f"[{input_label}]anull[{output_label}]"
 
-    print(f"[INFO] Audio ducking: {len(valid_events)} narration windows to duck")
+    # Identify the payoff zone: the final key moment (last 8s of target duration or last narration window)
+    payoff_start = max(0.0, (key_moment_end if key_moment_end > 0 else target_duration) - 8.0)
+    
+    print(f"[INFO] Audio ducking: {len(valid_events)} narration windows (payoff silence zone starts at {payoff_start:.1f}s)")
     duck_terms = []
+    PRE_BUF = 0.4   # Tighter pre-buffer: 0.4s (was 0.3s)
+    POST_BUF = 0.25 # Tighter post-buffer: 0.25s (was 0.2s)
+    RAMP = 0.1      # Smoother ramp: 0.1s (was 0.08s)
+    
     for i, ev in enumerate(valid_events):
-        # Apply pre-duck buffer (0.3s before) and post-duck buffer (0.2s after)
-        s = max(0.0, ev["reel_start"] - 0.3)
-        e = ev["reel_end"] + 0.2
+        # Skip ducking if event falls entirely within the payoff zone
+        if ev["reel_start"] >= payoff_start:
+            print(f"[INFO]   Skipping duck window {i+1}: narration at [{ev['reel_start']:.3f}s-{ev['reel_end']:.3f}s] is in payoff zone (after {payoff_start:.1f}s)")
+            continue
+            
+        # Apply pre-duck buffer and post-duck buffer
+        s = max(0.0, ev["reel_start"] - PRE_BUF)
+        e = ev["reel_end"] + POST_BUF
+        
+        # If the duck window would extend into payoff zone, cap it there
+        if s < payoff_start < e:
+            e = payoff_start
+            print(f"[INFO]   Capped duck window {i+1} at payoff boundary: [{s:.3f}s - {e:.3f}s]")
+        
+        # Only add if we have a valid window after capping
+        if e - s < 0.2:
+            continue
+            
         print(f"[INFO]   Duck window {i+1}: [{s:.3f}s - {e:.3f}s] "
               f"(narration [{ev['reel_start']:.3f}s - {ev['reel_end']:.3f}s], "
-              f"pre-buf=0.3s, post-buf=0.2s)")
-        # Fast 0.08s ramps for snappy ducking transitions
-        ramp_in = f"min(1,max(0,(t-{s:.3f})/0.08))"
-        ramp_out = f"min(1,max(0,(t-({e:.3f}-0.08))/0.08))"
+              f"pre-buf={PRE_BUF}s, post-buf={POST_BUF}s, ramp={RAMP}s)")
+        ramp_in = f"min(1,max(0,(t-{s:.3f})/{RAMP}))"
+        ramp_out = f"min(1,max(0,(t-({e:.3f}-{RAMP}))/{RAMP}))"
         duck_terms.append(f"if(between(t,{s:.3f},{e:.3f}),({ramp_in})*(1-({ramp_out})),0)")
+
+    if not duck_terms:
+        # All events were in the payoff zone or too short — no ducking needed
+        return f"[{input_label}]anull[{output_label}]"
 
     if len(duck_terms) == 1:
         duck_expr = duck_terms[0]
@@ -116,7 +143,8 @@ def _build_ducking_filter_chain(narration_events, input_label="0:a", output_labe
 
     # Ducking factor 0.97 -> original audio drops to 0.03 (3%) during narration
     vol_expr = f"1.0-({duck_expr}*0.97)"
-    print(f"[INFO] Audio ducking depth: 0.97 (original audio -> 3% volume during narration)")
+    print(f"[INFO] Audio ducking depth: 0.97 (original audio -> 3% volume during narration). "
+          f"{len(duck_terms)} active duck windows, payoff zone protected after {payoff_start:.1f}s")
     return f"[{input_label}]volume='{vol_expr}':eval=frame[{output_label}]"
 
 
@@ -158,13 +186,54 @@ def compose_group(
     working_dir = Path(working_dir)
     working_dir.mkdir(parents=True, exist_ok=True)
 
+    # ===== STRICT GROUP ISOLATION VALIDATION =====
+    # Ensure this group only uses its own clips, narration, and captions.
+    # Cross-group contamination is a critical bug — verify every input is self-contained.
+    n_clips = len(source_clips)
+    if n_clips == 0:
+        raise RuntimeError(f"Group {group_idx}: No source clips in group — cannot render.")
+
+    # Validate clip paths match source_clips count
+    if group_clip_paths and len(group_clip_paths) != n_clips:
+        raise RuntimeError(
+            f"Group {group_idx}: GROUP ISOLATION VIOLATION — group_clip_paths count ({len(group_clip_paths)}) "
+            f"does not match source_clips count ({n_clips}). This indicates cross-group data contamination."
+        )
+
+    # Validate narration audio paths exist and belong to this group
+    for i, nar in enumerate(narration_audio):
+        nar_path = nar.get("path", "")
+        if not nar_path or not os.path.exists(nar_path):
+            raise RuntimeError(
+                f"Group {group_idx}: GROUP ISOLATION VIOLATION — narration audio {i} path missing or invalid: {nar_path}"
+            )
+        # Verify the path contains this group's identifier to prevent cross-group file usage
+        if f"group_{group_idx}_narration_" not in str(nar_path):
+            raise RuntimeError(
+                f"Group {group_idx}: GROUP ISOLATION VIOLATION — narration audio {i} path '{nar_path}' "
+                f"does not belong to this group (missing 'group_{group_idx}_narration_' prefix). "
+                f"This indicates cross-group data contamination."
+            )
+
+    # Validate caption paths belong to this group
+    for i, cap_path in enumerate(clip_caption_paths):
+        if f"group_{group_idx}_clip_caption_" not in str(cap_path):
+            raise RuntimeError(
+                f"Group {group_idx}: GROUP ISOLATION VIOLATION — clip caption {i} path '{cap_path}' "
+                f"does not belong to this group. Cross-group contamination detected."
+            )
+    for i, cap_path in enumerate(narration_caption_paths):
+        if f"group_{group_idx}_narr_caption_" not in str(cap_path):
+            raise RuntimeError(
+                f"Group {group_idx}: GROUP ISOLATION VIOLATION — narration caption {i} path '{cap_path}' "
+                f"does not belong to this group. Cross-group contamination detected."
+            )
+
+    print(f"[INFO] Rendering isolated Group {group_idx} with {n_clips} clips and {len(narration_audio)} narration events — all paths validated for group isolation.")
+
     encoder = _get_video_encoder()
     encoder_opts = _build_encoder_opts(encoder)
     print(f"[INFO] compose_group {group_idx}: Using video encoder: {encoder}")
-
-    n_clips = len(source_clips)
-    if n_clips == 0:
-        raise RuntimeError("No source clips in group")
 
     # Check whether to use pre-cut clip files from CLIPPING stage
     use_precut = bool(
@@ -399,11 +468,20 @@ def compose_group(
         narr_dur = _get_video_duration_seconds(str(narration_audio_output))
         print(f"[INFO] Group {group_idx}: narration audio output duration: {narr_dur:.1f}s")
 
-        # 4. Apply ducking to clip audio and mix with narration
+    # 4. Apply ducking to clip audio and mix with narration
         if progress_cb:
             progress_cb(f"Group {group_idx+1}: Applying audio ducking and mixing...", 70)
 
-        duck_chain = _build_ducking_filter_chain(narration_audio, input_label="0:a", output_label="ducked")
+        # Identify the payoff moment (last narration event's end) so ducking skips it
+        key_moment_end = 0.0
+        if narration_audio:
+            # Use the final narration event's reel_end as the key moment boundary
+            key_moment_end = max(nar.get("reel_end", 0) for nar in narration_audio)
+        
+        duck_chain = _build_ducking_filter_chain(
+            narration_audio, input_label="0:a", output_label="ducked",
+            target_duration=target_duration, key_moment_end=key_moment_end
+        )
 
         mixed_audio_output = working_dir / f"group_{group_idx}_mixed_audio.wav"
         ffmpeg_mix = [
