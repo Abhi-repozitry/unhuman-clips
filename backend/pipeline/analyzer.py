@@ -208,17 +208,16 @@ def _compute_group_count_target(source_duration_seconds: float) -> tuple[int, in
 
 def _build_reel_plan_prompt(video_title: str, video_description: str, transcript_text: str,
                            min_groups: int = 1, max_groups: int = 2,
-                           clips_per_group: str = "3-5",
-                           narration_per_group: str = "2-3",
-                           reel_duration_target: str = "30-60",
+                           clips_per_group: str = "5-10",
+                           narration_per_group: str = "3-6",
+                           reel_duration_target: str = "90-150",
                            source_duration: float = 0.0) -> str:
     """Build the full LLM prompt for reel_plan generation.
 
-    CRITICAL: Targets are NOW HARDCORE LOWER-BOUNDS, not ceilings.
-    Reels MUST be 90-150 seconds long with rich coverage.
-    The LLM is told these are MINIMUM requirements, not suggestions.
+    IMPROVED: Smart clip selection with quality hierarchy, VAD-aware narration placement,
+    and strict duration enforcement. The LLM must pick HIGH-IMPACT moments only.
 
-    Deterministic by design: temperature=0.0, seed=42, concrete specs.
+    Deterministic by design: temperature=0.0, concrete specs.
     """
     reuse_note = ""
     if source_duration <= 120:
@@ -234,95 +233,117 @@ def _build_reel_plan_prompt(video_title: str, video_description: str, transcript
     except (IndexError, ValueError):
         dur_min, dur_max = 90, 150
 
-    # Build a recommended clip count that ensures we hit the duration target
-    # Average clip = 12s, need 90s => 7-8 clips minimum; 150s => 12-13 clips
-    recommended_clip_count = max(5, round(dur_min / 12))
+    # Build clip count targets that force enough content to fill the duration
+    recommended_clip_count = max(6, round(dur_min / 12))
     max_recommended_clips = min(20, round(dur_max / 8) + 2)
 
-    return f"""You are an expert short-form content editor. Your job is to analyze the source video and output ONLY high-retention vertical YouTube Shorts / Reels that tell a complete, engaging story.
+    # Compute timeline coverage bins for spread enforcement
+    if source_duration > 0:
+        early_end = source_duration * 0.25
+        mid_start = source_duration * 0.25
+        mid_end = source_duration * 0.75
+        late_start = source_duration * 0.75
+    else:
+        early_end = mid_start = mid_end = late_start = 0
 
-===== CRITICAL: DURATION REQUIREMENT =====
-Each reel group MUST be {dur_min}-{dur_max} seconds long. This is a HARD MINIMUM. Do NOT produce reels shorter than {dur_min} seconds unless the source video itself is shorter than {dur_min} seconds.
-FAILURE MODE: If your selected clips and narration only sum to 40-60 seconds, ADD MORE CLIPS. You need ENOUGH content to fill {dur_min}s.
-Total estimated duration = sum(clip durations) + sum(narration durations) + 2s padding. Calculate this explicitly and adjust clip count until it reaches {dur_min}s minimum.
+    return f"""You are an elite short-form content strategist. Your SOLE job is to find the 5-8 highest-impact, most viral-worthy moments in this video and assemble them into a {dur_min}-{dur_max} second vertical reel that MAXIMIZES viewer retention.
+
+You are NOT a summarizer. You are a HUNTER — scanning for PEAK MOMENTS only. Every second must earn its place.
+
+===== CORE MISSION: FIND PEAK MOMENTS =====
+Scan the ENTIRE transcript for moments that make viewers STOP SCROLLING. These are:
+
+TIER 1 — HIGHEST VALUE (always include if present):
+• Action climaxes: physical feats, reveals, demonstrations, transformations
+• Emotional peaks: shock, triumph, breakdown, laughter, tears, rage
+• Stakes moments: "if this fails...", ultimatums, gambles, high-consequence decisions
+• Viral hooks: outrageous claims, absurd situations, "did that just happen?" moments
+
+TIER 2 — HIGH VALUE (include 2-3 per group):
+• Key payoffs: answers to built-up questions, before/after reveals, results
+• Surprising twists: plot turns, unexpected outcomes, contrarian takes
+• Humor peaks: the biggest laugh, funniest exchange, most absurd moment
+• Expert insights: specific numbers, data points, professional techniques
+
+TIER 3 — SUPPORTING (use to fill gaps or bridge TIER 1-2 moments):
+• Setup context: necessary background that makes TIER 1-2 moments land
+• Transitional energy: moments that maintain momentum between peaks
+• Reactions: genuine audience/participant reactions to high moments
+
+EXCLUDE entirely: filler, greetings, repetitive explanations, low-energy passages, generic statements, transitions without substance.
+
+===== DURATION & STRUCTURE =====
+Each reel group: {dur_min}-{dur_max} seconds (HARD MINIMUM {dur_min}s).
+Total estimated duration = sum(clip durations) + sum(narration durations) + 2s padding.
+You MUST hit {dur_min}s minimum. If your first selection is short, ADD MORE HIGH-VALUE CLIPS.
+
+Clips per group: {clips_per_group} (8-25 seconds each)
+- SWEET SPOT: 12-18s for dialogue/exposition
+- Extended: 18-25s for demonstrations, stories, transformations
+- Quick cuts: 8-12s for reactions, punchlines, rapid-fire moments
+- NEVER select clips under 6s unless they are absolute gold-tier punchlines
 
 ===== SOURCE VIDEO =====
 Title: {video_title}
 Description: {video_description[:10000]}
 Duration: {source_duration:.1f} seconds
 
-Transcript (timestamps in seconds):
+Transcript (segment index [timestamp]):
 {transcript_text}
 
-===== MANDATORY OUTPUT REQUIREMENT =====
-- You MUST output between {min_groups} and {max_groups} reel_groups. Outputting fewer than {min_groups} is NOT ALLOWED.
-- For a {source_duration:.0f}-second video, you are REQUIRED to find at least {min_groups} distinct story arcs, highlights, or compelling moments spread across the full video timeline.
-- Each group MUST cover a different segment of the video — do NOT cluster all groups in the first few minutes. Spread them across early, middle, and late sections of the video.
-- Every group must have a strong hook and a clear payoff. But do NOT use "not enough good content" as an excuse to output fewer groups than required.
-
-===== EXACT SPECIFICATIONS =====
-- Number of reel_groups: 1 to {max_groups} (Upper limit: {max_groups})
-- Clips per group: {clips_per_group} clips (each 8-25 seconds from source — PREFER LONGER CLIPS 12-25s for substantial content, short 3-8s clips only for rapid-fire moments)
-- RECOMMENDED total clips per group: {recommended_clip_count}-{max_recommended_clips} (select enough to fill {dur_min}s minimum)
-- Narration events per group: {narration_per_group} (including the hook)
-- Target reel duration: {reel_duration_target} seconds per group (ABSOLUTE MINIMUM {dur_min}s per group)
-- All clip timestamps MUST be within 0.0 to {source_duration:.1f}
-{reuse_note}
+===== MANDATORY OUTPUT =====
+- Output {min_groups}-{max_groups} reel_groups. Each group tells a DIFFERENT story arc.
+- Groups MUST be spread across the FULL video timeline — NOT clustered in the first few minutes.
+- Timeline coverage is MANDATORY:
+  * Early zone: 0.0s - {early_end:.0f}s (at least 1-2 clips from here)
+  * Middle zone: {mid_start:.0f}s - {mid_end:.0f}s (at least 2-3 clips from here)
+  * Late zone: {late_start:.0f}s - {source_duration:.0f}s (at least 1-2 clips from here)
+- Every group needs a HOOK (opening 3s), BUILD (middle tension), and PAYOFF (final 5-8s).
 
 ===== CLIP SELECTION RULES =====
-Select clips by scanning the transcript chronologically. Prefer:
-1. Action / movement / visual spectacle (take 12-20s segments, not just 3s cuts)
-2. Emotional reactions (faces, laughter, shock, triumph — extend to capture full reaction)
-3. Key dialogue with specific numbers, claims, or reveals (take whole exchange, 15-25s)
-4. Humor, surprises, or absurd moments (let the bit breathe, 10-20s)
-5. Before/after contrasts or turning points (show full transformation, 15-25s)
-
-CRITICAL SPREAD RULE: Distribute clips across early (0-25%), middle (25-75%), and late (75-100%) portions of the video. Do NOT take all clips from the first few minutes. Each group should sample broadly from the source.
-
-===== CLIP LENGTH GUIDELINES =====
-- 8-12s: Tight moments, reactions, quick jokes
-- 12-18s: Standard clips with dialogue/exposition (SWEET SPOT)
-- 18-25s: Extended sequences, demonstrations, stories
-- LESS THAN 8s: Only for rapid-fire montages or punchlines. Avoid <6s clips.
-- TOTAL clip content per group should sum to at LEAST {dur_min - 10}s (so narration + padding fills the rest)
+1. ONLY select moments from TIER 1 or TIER 2. Use TIER 3 sparingly.
+2. Each clip must have a CLEAR reason tied to the group's narrative arc.
+3. No filler. No "overview" clips. Every clip must deliver a specific emotional or informational payload.
+4. Prefer LONGER clips (12-25s) that let moments breathe over rapid-fire cuts.
+5. The final clip of each group must be the STRONGEST moment — the payoff.
+6. Do NOT include clips that merely mention the topic — include clips that DEMONSTRATE it.
 
 ===== NARRATION RULES =====
 Hook (event_type: "hook"):
 - reel_start: 0.0 always. reel_end: 2.5-4.0 seconds.
-- 6-10 words. Specific to this video. Creates curiosity.
-- BANNED: "Watch what happens", "You won't believe", "This is insane"
+- 6-10 words. Specific to this video's content. Creates immediate curiosity.
+- BANNED: "Watch what happens", "You won't believe", "This is insane", "Wait for it"
 
 Commentary (event_type: "commentary"):
-- 8-14 words each. Adds context the viewer can't get from footage alone.
-- HAVE AT LEAST 3-4 commentary events spread across the reel to maintain narrative flow.
-- Distribute across the reel timeline: one near middle (25-40%), one near end (60-80%), one for payoff (85-95%).
-- BANNED: "As you can see", "Notice how"
+- 8-14 words each. Adds SPECIFIC context the viewer cannot get from footage alone.
+- Use numbers, names, or concrete details. Never vague.
+- Distribute across the reel: one at 25-40%, one at 50-65%, one at 70-85%.
+- BANNED: "As you can see", "Notice how", "Check this out", "Pretty cool"
 
-The video system ducks original audio to ~3% during narration — place narration anywhere, even over dialogue.
-===== CRITICAL: NARRATION SPACING =====
-- Leave at least 0.8s clear gap between narration events. Do not stack them.
-- NEVER place narration over the group's key_moment (the main payoff/climax). The finale should have clean unducked audio for full impact.
-- The last 5-8 seconds of the reel should be FREE of narration — let the final footage and original audio land the payoff.
-- If your narration events are too dense, remove one or spread them further apart.
-- Total narration duration (sum of all reel_end - reel_start) should be no more than 30% of the total reel duration.
+The audio system uses AI-powered Voice Activity Detection for ducking — it only ducks when TTS narration is actually speaking. This means narration can be placed over dialogue; the ducking will only activate during actual TTS speech, leaving surrounding dialogue intact.
+
+===== CRITICAL: NARRATION PLACEMENT =====
+- Leave at least 0.8s clear gap between narration events.
+- NEVER place narration over the group's key_moment (the main payoff/climax).
+- The last 5-8 seconds of the reel should be FREE of narration — let the payoff land.
+- Total narration duration should be no more than 25% of total reel duration.
+- Narration events must NOT overlap each other.
 
 ===== TEXT RULES =====
-Allowed characters: letters, numbers, . , ! ? ' - — " : ;
+Allowed: letters, numbers, . , ! ? ' - — " : ;
 BANNED: / \\ | * # _ < > [ ] {{ }}
-Use contractions. Be conversational.
+Use contractions. Be conversational. Be specific.
 
-===== BEFORE OUTPUTTING, VERIFY =====
-1. Calculate: total_clip_duration = sum of (source_end - source_start) for all clips
-2. Calculate: total_narration_duration = sum of (reel_end - reel_start) for all narration events
-3. Calculate: estimated_duration = total_clip_duration + total_narration_duration + 2.0
-4. Is estimated_duration >= {dur_min}?
-   - If NO: Add more clips or extend clip durations until it is.
-   - If YES: Ensure estimated_duration does not exceed {dur_max}. Adjust if needed.
-5. Set estimated_duration_seconds = estimated_duration from step 3.
-6. Are clips spread across early/middle/late sections of the video?
-   - If NO: Replace some clips to ensure broad coverage.
+===== SELF-VERIFICATION (MANDATORY) =====
+Before outputting, you MUST verify:
+1. total_clip_duration = sum of (source_end - source_start) for all clips
+2. total_narration_duration = sum of (reel_end - reel_start) for all narration events
+3. estimated_duration = total_clip_duration + total_narration_duration + 2.0
+4. estimated_duration >= {dur_min}? If NO: add more clips until YES.
+5. Clips span early/middle/late zones? If NO: replace clips to fix coverage.
+6. estimated_duration_seconds = estimated_duration from step 3.
 
-===== OUTPUT (STRICT JSON) =====
+===== OUTPUT (STRICT JSON ONLY) =====
 Output ONLY valid JSON. No markdown. No explanation.
 Use "source_start" and "source_end" for clip timestamps.
 
@@ -330,25 +351,25 @@ Use "source_start" and "source_end" for clip timestamps.
   "reel_groups": [
     {{
       "group_index": 0,
-      "group_reasoning": "Why these clips form a compelling arc (include estimated duration breakdown)",
-      "estimated_duration_seconds": 90.0,
+      "group_reasoning": "Why these specific moments form a compelling arc. Include duration breakdown.",
+      "estimated_duration_seconds": {dur_min}.0,
       "reel_summary": {{
         "title": "Scroll-stopping title (max 60 chars)",
         "short_description": "One-sentence hook (max 150 chars)",
         "source_understanding": "What this covers",
         "narrative_angle": "Emotional framing",
-        "key_moment": "The payoff moment"
+        "key_moment": "The single strongest moment in this group"
       }},
       "source_clips": [
-        {{"source_start": 0.0, "source_end": 15.0, "reason": "SETUP: Hook viewers with opening scene"}},
-        {{"source_start": 45.0, "source_end": 60.0, "reason": "TENSION: Build with key dialogue (15s)"}},
-        {{"source_start": 120.0, "source_end": 138.0, "reason": "PAYOFF: Climax moment (18s)"}}
+        {{"source_start": 0.0, "source_end": 15.0, "reason": "HOOK: Open with highest-impact visual/verbal moment"}},
+        {{"source_start": 45.0, "source_end": 60.0, "reason": "BUILD: Escalate tension with key dialogue"}},
+        {{"source_start": 120.0, "source_end": 138.0, "reason": "PAYOFF: The climactic reveal/transformation"}}
       ],
       "narration_events": [
-        {{"event_type": "hook", "reel_start": 0.0, "reel_end": 3.0, "text": "This changes everything we know about...", "voice_id": null}},
-        {{"event_type": "commentary", "reel_start": 25.0, "reel_end": 28.0, "text": "Notice what happens right here — pure genius.", "voice_id": null}},
-        {{"event_type": "commentary", "reel_start": 55.0, "reel_end": 58.0, "text": "This is the moment everything clicked for me.", "voice_id": null}},
-        {{"event_type": "commentary", "reel_start": 80.0, "reel_end": 83.0, "text": "And that's why this approach works so well.", "voice_id": null}}
+        {{"event_type": "hook", "reel_start": 0.0, "reel_end": 3.0, "text": "Specific hook tied to this video...", "voice_id": null}},
+        {{"event_type": "commentary", "reel_start": 25.0, "reel_end": 28.0, "text": "Specific context with numbers or details.", "voice_id": null}},
+        {{"event_type": "commentary", "reel_start": 55.0, "reel_end": 58.0, "text": "Expert insight the footage alone doesn't convey.", "voice_id": null}},
+        {{"event_type": "commentary", "reel_start": 80.0, "reel_end": 83.0, "text": "Payoff line that ties the story together.", "voice_id": null}}
       ]
     }}
   ]

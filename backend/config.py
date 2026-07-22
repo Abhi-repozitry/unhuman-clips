@@ -54,3 +54,11 @@ TTS_VOICE = "en-US-ChristopherNeural"
 
 CAPTION_FONT_SIZE = 64
 CAPTION_FONT = "Arial"
+
+# VAD-based audio ducking configuration
+VAD_THRESHOLD = float(os.environ.get("VAD_THRESHOLD", "0.5"))
+VAD_PRE_BUFFER_SECONDS = float(os.environ.get("VAD_PRE_BUFFER_SECONDS", "0.4"))
+VAD_POST_BUFFER_SECONDS = float(os.environ.get("VAD_POST_BUFFER_SECONDS", "0.25"))
+VAD_SCURVE_RAMP_SECONDS = float(os.environ.get("VAD_SCURVE_RAMP_SECONDS", "0.15"))
+VAD_DUCKING_DEPTH = float(os.environ.get("VAD_DUCKING_DEPTH", "0.97"))
+VAD_SILENCE_THRESHOLD = float(os.environ.get("VAD_SILENCE_THRESHOLD", "0.3"))

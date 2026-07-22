@@ -156,21 +156,40 @@ def call_llm_sync(
                 except Exception:
                     pass
 
-                response = client.chat.completions.create(**kwargs)
-                raw = response.choices[0].message.content
-                if raw is None:
-                    finish_reason = response.choices[0].finish_reason
-                    refusal = getattr(response.choices[0].message, 'refusal', None)
-                    raise RuntimeError(
-                        f"NVIDIA API returned empty content. "
-                        f"Finish reason: {finish_reason}. Refusal: {refusal}."
-                    )
-
-                raw = raw.strip()
-                usage = getattr(response, 'usage', None)
+                raw = None
                 token_count = ""
-                if usage:
-                    token_count = f" ({usage.completion_tokens} out / {usage.prompt_tokens} in tokens)"
+                try:
+                    kwargs["stream"] = True
+                    response = client.chat.completions.create(**kwargs)
+                    full_content = ""
+                    chunk_count = 0
+                    for chunk in response:
+                        delta = chunk.choices[0].delta if chunk.choices else None
+                        if delta and delta.content:
+                            full_content += delta.content
+                            chunk_count += 1
+                            if chunk_count % 10 == 0 and reporter and interactions is not None:
+                                reporter.set_stage_data_key("llm_interactions", [i.model_dump() for i in interactions])
+                    raw = full_content.strip()
+                    usage = getattr(chunk, 'usage', None) if chunk else None
+                    if usage:
+                        token_count = f" ({usage.completion_tokens} out / {usage.prompt_tokens} in tokens)"
+                except Exception as stream_err:
+                    # Fallback to non-streaming if streaming fails
+                    kwargs.pop("stream", None)
+                    response = client.chat.completions.create(**kwargs)
+                    raw = response.choices[0].message.content
+                    if raw is None:
+                        finish_reason = response.choices[0].finish_reason
+                        refusal = getattr(response.choices[0].message, 'refusal', None)
+                        raise RuntimeError(
+                            f"NVIDIA API returned empty content. "
+                            f"Finish reason: {finish_reason}. Refusal: {refusal}."
+                        )
+                    raw = raw.strip()
+                    usage = getattr(response, 'usage', None)
+                    if usage:
+                        token_count = f" ({usage.completion_tokens} out / {usage.prompt_tokens} in tokens)"
 
                 if interactions is not None:
                     interactions.append(LLMInteraction(

@@ -45,11 +45,13 @@ def validate_and_adjust_narration_timings(
     reporter,
     group_idx: int,
 ):
-    """
-    Map reel timestamps to source transcript speech intervals across source_clips.
-    Detect commentary narration events that collide with active speech (>30% overlap)
+    """Map reel timestamps to source transcript speech intervals across source_clips.
+    Detect commentary narration events that collide with active speech (>15% overlap)
     and automatically shift their reel_start to nearby speech gaps or the post-clip area.
     Ensures non-overlapping narration windows and caps all narrations within target_duration.
+
+    IMPROVED: Works with VAD-driven ducking by ensuring narration events are placed
+    in genuinely silent windows, and maintains strict 0.8s minimum gap between events.
     """
     if not group_narration_audio:
         return
@@ -86,29 +88,29 @@ def validate_and_adjust_narration_timings(
 
     def find_speech_gap(duration: float, search_start: float) -> float:
         """Find a gap of at least `duration` seconds with minimal speech overlap.
-        Enforces 0.4s minimum distance from any speech boundary."""
+        Enforces 0.5s minimum distance from any speech boundary for clean VAD-driven ducking."""
         candidate = search_start
         max_search = max(target_duration, cumulative_offset + 30.0)
         while candidate + duration <= max_search:
             overlap, _ = get_speech_overlap(candidate, candidate + duration)
-            if overlap <= 0.05:  # Tighter: near-zero overlap required
-                # Verify 0.4s gap from nearest speech boundaries
+            if overlap <= 0.05:  # Near-zero overlap required for clean ducking
+                # Verify 0.5s gap from nearest speech boundaries
                 gap_ok = True
                 for s_start, s_end, _ in reel_speech_intervals:
                     # Check narration start isn't too close to speech end
-                    if abs(candidate - s_end) < 0.4 and candidate >= s_end - 0.1:
+                    if abs(candidate - s_end) < 0.5 and candidate >= s_end - 0.1:
                         gap_ok = False
                         break
                     # Check narration end isn't too close to speech start
-                    if abs((candidate + duration) - s_start) < 0.4 and (candidate + duration) <= s_start + 0.1:
+                    if abs((candidate + duration) - s_start) < 0.5 and (candidate + duration) <= s_start + 0.1:
                         gap_ok = False
                         break
                 if gap_ok:
                     return candidate
-            next_step = candidate + 0.3  # Finer search granularity
+            next_step = candidate + 0.2  # Even finer search granularity for VAD precision
             for s_start, s_end, _ in reel_speech_intervals:
                 if s_start <= candidate < s_end:
-                    next_step = max(next_step, s_end + 0.4)  # 0.4s gap after speech
+                    next_step = max(next_step, s_end + 0.5)  # 0.5s gap after speech
             candidate = next_step
         return search_start
 
@@ -124,7 +126,7 @@ def validate_and_adjust_narration_timings(
         overlap, texts = get_speech_overlap(reel_s, reel_e)
         overlap_ratio = overlap / duration if duration > 0 else 0.0
 
-        if event_type in ("commentary", "hook") and overlap_ratio > 0.15:  # Stricter: 15% threshold
+        if event_type in ("commentary", "hook") and overlap_ratio > 0.10:  # Strict: 10% threshold for VAD precision
             sample_text = texts[0][:60] + "..." if texts else ""
             reporter.log_info(
                 f"[WARN] Group {group_idx+1}: {event_type.capitalize()} narration '{nar['text'][:40]}...' "
@@ -140,19 +142,19 @@ def validate_and_adjust_narration_timings(
                     f"[INFO] Group {group_idx+1}: Auto-shifted {event_type} from "
                     f"[{old_start:.2f}s] -> [{nar['reel_start']:.2f}s-{nar['reel_end']:.2f}s] (gap verified)"
                 )
-            elif overlap_ratio > 0.5:  # Severe overlap and no gap found
+            elif overlap_ratio > 0.4:  # Severe overlap and no gap found
                 reporter.log_info(
                     f"[WARN] Group {group_idx+1}: Could not find gap for '{nar['text'][:30]}...' "
                     f"({overlap_ratio*100:.0f}% overlap). Consider removing this narration."
                 )
 
-    # 3. Ensure narrations do not overlap with each other
+    # 3. Ensure narrations do not overlap with each other (0.8s minimum gap)
     group_narration_audio.sort(key=lambda x: x["reel_start"])
     for i in range(1, len(group_narration_audio)):
         prev_end = group_narration_audio[i-1]["reel_end"]
         curr_start = group_narration_audio[i]["reel_start"]
         curr_dur = group_narration_audio[i]["duration"]
-        min_gap = 0.4  # Increased from 0.2s to 0.4s for cleaner separation
+        min_gap = 0.8  # Strict 0.8s minimum gap for clean separation
         if curr_start < prev_end + min_gap:
             new_start = prev_end + min_gap
             # Re-check speech overlap in case shifting caused a new collision
@@ -685,7 +687,7 @@ class QueueManager:
                 }
                 reporter.progress_callback(msg, prog)
 
-            group_output_path = await asyncio.to_thread(
+            compose_result = await asyncio.to_thread(
                 compose_group,
                 job.id,
                 group_idx,
@@ -700,12 +702,35 @@ class QueueManager:
                 compositor_progress,
             )
 
+            # compose_group now returns a dict with output_path, vad_stats, vad_analysis
+            if isinstance(compose_result, dict):
+                group_output_path = compose_result["output_path"]
+                vad_stats = compose_result.get("vad_stats", {"active": False})
+                vad_analysis = compose_result.get("vad_analysis", [])
+            else:
+                # Backward compatibility if compose_group returns a string
+                group_output_path = compose_result
+                vad_stats = {"active": False}
+                vad_analysis = []
+
+            # Store VAD stats in stage_data for frontend display
+            existing_stage_data = job.stage_data if isinstance(job.stage_data, dict) else {}
+            job.stage_data = {
+                **existing_stage_data,
+                "vad_stats": vad_stats,
+                "vad_analysis": vad_analysis,
+            }
+            reporter.set_stage_data_key("vad_stats", vad_stats)
+            reporter.set_stage_data_key("vad_analysis", vad_analysis)
+
             # --- EDITING for this group ---
             job.stage_index = 8
             job.stage_data = {
                 "status": "editing",
                 "group_index": group_idx,
                 "total_groups": job.num_output_groups,
+                "vad_stats": vad_stats,
+                "vad_analysis": vad_analysis,
             }
             reporter.update_stage(JobStatus.EDITING, f"Group {group_idx+1}/{job.num_output_groups}: Final edit...", 0, 8)
 

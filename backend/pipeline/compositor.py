@@ -1,7 +1,11 @@
 import subprocess
 import os
 from pathlib import Path
-from backend.config import HOOK_SECONDS, FFMPEG_PATH, FFPROBE_PATH
+from backend.config import (
+    HOOK_SECONDS, FFMPEG_PATH, FFPROBE_PATH,
+    VAD_THRESHOLD, VAD_PRE_BUFFER_SECONDS, VAD_POST_BUFFER_SECONDS,
+    VAD_SCURVE_RAMP_SECONDS, VAD_DUCKING_DEPTH, VAD_SILENCE_THRESHOLD,
+)
 from typing import Callable, Optional, List, Dict, Any
 
 
@@ -84,56 +88,196 @@ def _ass_filter(path: str) -> str:
     return f"ass=filename={filename}"
 
 
-def _build_ducking_filter_chain(narration_events, input_label="0:a", output_label="ducked",
-                                 target_duration: float = 0.0, key_moment_end: float = 0.0):
+def get_speech_timestamps_from_narration(
+    narration_path: str,
+    threshold: float = VAD_THRESHOLD,
+    min_speech_duration_ms: int = 100,
+    min_silence_duration_ms: int = 200,
+) -> List[Dict[str, float]]:
+    """Run Silero VAD on a narration audio file to detect precise speech timestamps.
+
+    Returns list of {"start": float, "end": float} dicts for each detected
+    speech segment within the narration audio. These are used to drive
+    intelligent ducking — original audio is only ducked during actual TTS
+    speech, not during silence or breath pauses within the narration.
+
+    Falls back to a single speech window spanning the full file if VAD fails.
+    Uses the same API pattern as editor.py for consistency.
     """
-    Build a robust single-filter ducking expression.
-    Ducks audio to ~0.03 during narration events — original audio is near-silent, avoiding voice overlap.
-    Uses tighter pre-duck buffer (0.4s before) and post-duck buffer (0.25s after) to prevent bleed.
-    Uses smooth 0.1s ramps for natural transitions.
-    SKIPS ducking during the final key moment (last 8s of the group) to let the payoff breathe.
+    fallback = [{"start": 0.0, "end": _get_audio_duration(narration_path)}]
+
+    try:
+        import torch
+        import torchaudio
+        from silero_vad import get_speech_timestamps, read_audio
+    except ImportError:
+        print(f"[WARN] silero-vad or torch not available, using full-window fallback for {Path(narration_path).name}")
+        return fallback
+
+    try:
+        wav, sr = read_audio(narration_path, sampling_rate=16000)
+
+        if len(wav) == 0:
+            return fallback
+
+        speech_timestamps = get_speech_timestamps(
+            wav,
+            sr,
+            threshold=threshold,
+            min_speech_duration_ms=min_speech_duration_ms,
+            min_silence_duration_ms=min_silence_duration_ms,
+            return_seconds=True,
+        )
+
+        if not speech_timestamps:
+            return fallback
+
+        return [{"start": ts["start"], "end": ts["end"]} for ts in speech_timestamps]
+
+    except Exception as e:
+        print(f"[WARN] Silero VAD failed on {Path(narration_path).name}: {e}, using full-window fallback")
+        return fallback
+
+
+def _get_audio_duration(audio_path: str) -> float:
+    """Get duration of an audio file using ffprobe."""
+    try:
+        result = subprocess.run(
+            [FFPROBE_PATH, "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", audio_path],
+            capture_output=True, text=True, timeout=15
+        )
+        return float(result.stdout.strip())
+    except (subprocess.CalledProcessError, ValueError, OSError):
+        return 0.0
+
+
+def _build_ducking_filter_chain(
+    narration_events: List[Dict[str, Any]],
+    narration_vad_timestamps: Optional[List[List[Dict[str, float]]]] = None,
+    input_label: str = "0:a",
+    output_label: str = "ducked",
+    target_duration: float = 0.0,
+    key_moment_end: float = 0.0,
+) -> str:
+    """Build a VAD-driven ducking filter chain using Silero VAD speech timestamps.
+
+    Instead of ducking during the entire narration event window (which includes
+    silence/breath pauses), this function uses per-narration VAD timestamps to
+    duck ONLY during actual TTS speech. This produces much more natural ducking
+    that preserves the original audio during narration pauses.
+
+    Features:
+    - VAD-precise ducking: only ducks during detected speech, not silence
+    - S-curve ramps: smooth 3x²-2x³ Hermite transitions (no clicks)
+    - Pre/post buffers: tight 0.4s pre, 0.25s post around each speech segment
+    - Payoff zone protection: skips ducking for the final 8s key moment
+    - Depth: ducks original audio to ~3% (configurable via VAD_DUCKING_DEPTH)
     """
-    valid_events = [ev for ev in narration_events if ev.get("reel_end", 0) - ev.get("reel_start", 0) >= 0.3]
+    if not narration_events:
+        return f"[{input_label}]anull[{output_label}]"
+
+    # Filter valid narration events
+    valid_events = []
+    valid_vad = []
+    for i, ev in enumerate(narration_events):
+        dur = ev.get("reel_end", 0) - ev.get("reel_start", 0)
+        if dur >= 0.3:
+            valid_events.append(ev)
+            if narration_vad_timestamps and i < len(narration_vad_timestamps):
+                valid_vad.append(narration_vad_timestamps[i])
+            else:
+                # No VAD data for this event — use full window as fallback
+                valid_vad.append([{"start": ev["reel_start"], "end": ev["reel_end"]}])
+
     if not valid_events:
         return f"[{input_label}]anull[{output_label}]"
 
-    # Identify the payoff zone: the final key moment (last 8s of target duration or last narration window)
+    # Payoff zone: the final 8s of the reel or after key_moment_end
     payoff_start = max(0.0, (key_moment_end if key_moment_end > 0 else target_duration) - 8.0)
-    
-    print(f"[INFO] Audio ducking: {len(valid_events)} narration windows (payoff silence zone starts at {payoff_start:.1f}s)")
+
+    PRE_BUF = VAD_PRE_BUFFER_SECONDS
+    POST_BUF = VAD_POST_BUFFER_SECONDS
+    RAMP = VAD_SCURVE_RAMP_SECONDS
+    DEPTH = VAD_DUCKING_DEPTH
+
+    print(f"[INFO] VAD-driven ducking: {len(valid_events)} narration events, "
+          f"payoff zone starts at {payoff_start:.1f}s, ramp={RAMP}s, depth={DEPTH}")
+
     duck_terms = []
-    PRE_BUF = 0.4   # Tighter pre-buffer: 0.4s (was 0.3s)
-    POST_BUF = 0.25 # Tighter post-buffer: 0.25s (was 0.2s)
-    RAMP = 0.1      # Smoother ramp: 0.1s (was 0.08s)
-    
-    for i, ev in enumerate(valid_events):
-        # Skip ducking if event falls entirely within the payoff zone
-        if ev["reel_start"] >= payoff_start:
-            print(f"[INFO]   Skipping duck window {i+1}: narration at [{ev['reel_start']:.3f}s-{ev['reel_end']:.3f}s] is in payoff zone (after {payoff_start:.1f}s)")
-            continue
-            
-        # Apply pre-duck buffer and post-duck buffer
-        s = max(0.0, ev["reel_start"] - PRE_BUF)
-        e = ev["reel_end"] + POST_BUF
-        
-        # If the duck window would extend into payoff zone, cap it there
-        if s < payoff_start < e:
-            e = payoff_start
-            print(f"[INFO]   Capped duck window {i+1} at payoff boundary: [{s:.3f}s - {e:.3f}s]")
-        
-        # Only add if we have a valid window after capping
-        if e - s < 0.2:
-            continue
-            
-        print(f"[INFO]   Duck window {i+1}: [{s:.3f}s - {e:.3f}s] "
-              f"(narration [{ev['reel_start']:.3f}s - {ev['reel_end']:.3f}s], "
-              f"pre-buf={PRE_BUF}s, post-buf={POST_BUF}s, ramp={RAMP}s)")
-        ramp_in = f"min(1,max(0,(t-{s:.3f})/{RAMP}))"
-        ramp_out = f"min(1,max(0,(t-({e:.3f}-{RAMP}))/{RAMP}))"
-        duck_terms.append(f"if(between(t,{s:.3f},{e:.3f}),({ramp_in})*(1-({ramp_out})),0)")
+
+    for ev_idx, (ev, vad_segments) in enumerate(zip(valid_events, valid_vad)):
+        # Process each VAD-detected speech segment within this narration event
+        for seg_idx, seg in enumerate(vad_segments):
+            seg_start = seg.get("start", 0.0)
+            seg_end = seg.get("end", 0.0)
+            seg_dur = seg_end - seg_start
+            if seg_dur < 0.1:
+                continue
+
+            # Convert VAD-relative timestamps to reel-absolute timestamps
+            # VAD timestamps are within the individual narration audio file,
+            # so we offset by the narration event's reel_start
+            reel_offset = ev["reel_start"]
+            abs_start = reel_offset + seg_start
+            abs_end = reel_offset + seg_end
+
+            # Apply pre/post buffers
+            duck_start = max(0.0, abs_start - PRE_BUF)
+            duck_end = abs_end + POST_BUF
+
+            # Skip if entirely in payoff zone
+            if duck_start >= payoff_start:
+                print(f"[INFO]   VAD skip (payoff): narr {ev_idx+1} seg {seg_idx+1} "
+                      f"[{abs_start:.3f}-{abs_end:.3f}s] in payoff zone")
+                continue
+
+            # Cap at payoff boundary if it overlaps
+            if duck_start < payoff_start < duck_end:
+                duck_end = payoff_start
+
+            # Skip tiny windows
+            if duck_end - duck_start < 0.15:
+                continue
+
+            # Build S-curve duck expression using Hermite 3x²-2x³
+            # ramp_in: ease from 0→1 over RAMP seconds at duck_start
+            # ramp_out: ease from 1→0 over RAMP seconds before duck_end
+            ramp_in_start = duck_start
+            ramp_in_end = duck_start + RAMP
+            ramp_out_start = duck_end - RAMP
+            ramp_out_end = duck_end
+
+            # S-curve expression: smooth ease-in-ease-out
+            # In the ramp-in zone: sigmoid curve from 0 to 1
+            # In the sustained zone: full duck (1.0)
+            # In the ramp-out zone: sigmoid curve from 1 to 0
+            # Outside all zones: 0
+            ri_s = f"{ramp_in_start:.4f}"
+            ri_e = f"{ramp_in_end:.4f}"
+            ro_s = f"{ramp_out_start:.4f}"
+            ro_e = f"{ramp_out_end:.4f}"
+            r = f"{RAMP:.4f}"
+
+            expr = (
+                f"if(between(t,{ri_s},{ro_e}),"
+                f"if(lt(t,{ri_e}),"
+                # Ramp-in: Hermite via xn*xn*(3-2*xn) where xn=(t-ri_s)/RAMP
+                f"((t-{ri_s})/{r})*((t-{ri_s})/{r})*(3-2*(t-{ri_s})/{r}),"
+                f"if(lt(t,{ro_s}),"
+                # Sustained zone
+                f"1.0,"
+                # Ramp-out: 1 - Hermite
+                f"(1.0-((t-{ro_s})/{r})*((t-{ro_s})/{r})*(3-2*(t-{ro_s})/{r}))"
+                f")))"
+            )
+
+            duck_terms.append(expr)
+            print(f"[INFO]   VAD duck seg: narr {ev_idx+1} seg {seg_idx+1} "
+                  f"[{abs_start:.3f}-{abs_end:.3f}s] -> duck window "
+                  f"[{duck_start:.3f}-{duck_end:.3f}s]")
 
     if not duck_terms:
-        # All events were in the payoff zone or too short — no ducking needed
         return f"[{input_label}]anull[{output_label}]"
 
     if len(duck_terms) == 1:
@@ -141,10 +285,9 @@ def _build_ducking_filter_chain(narration_events, input_label="0:a", output_labe
     else:
         duck_expr = f"min(1.0,{'+'.join(duck_terms)})"
 
-    # Ducking factor 0.97 -> original audio drops to 0.03 (3%) during narration
-    vol_expr = f"1.0-({duck_expr}*0.97)"
-    print(f"[INFO] Audio ducking depth: 0.97 (original audio -> 3% volume during narration). "
-          f"{len(duck_terms)} active duck windows, payoff zone protected after {payoff_start:.1f}s")
+    vol_expr = f"1.0-({duck_expr}*{DEPTH:.2f})"
+    print(f"[INFO] VAD ducking: {len(duck_terms)} speech segments, "
+          f"depth={DEPTH*100:.0f}% reduction during TTS speech only")
     return f"[{input_label}]volume='{vol_expr}':eval=frame[{output_label}]"
 
 
@@ -173,7 +316,7 @@ def compose_group(
     working_dir: Path,
     estimated_duration_seconds: float = 0.0,
     progress_cb: Optional[Callable[[str, float], None]] = None
-) -> str:
+) -> Dict[str, Any]:
     """
     Build a single group's output reel.
     - Continuous video from pre-cut group_clip_paths (if available) or trimmed from source_clips
@@ -255,7 +398,19 @@ def compose_group(
     if narration_audio:
         max_narration_end = max(nar.get("reel_end", 0) for nar in narration_audio)
     
-    target_duration = max(total_clip_duration, max_narration_end, estimated_duration_seconds, float(MIN_OUTPUT_DURATION))
+    # IMPROVED TARGET DURATION CALCULATION:
+    # estimated_duration_seconds is the most reliable signal — it represents the
+    # analyzer's intent for how long this reel should be. We respect it as a
+    # strong target, not a hint.
+    #
+    # Priority: estimated_duration_seconds > max_narration_end > total_clip_duration > MIN_OUTPUT_DURATION
+    # We use the HIGHEST of these to ensure nothing gets cut off.
+    target_duration = max(
+        estimated_duration_seconds,    # Analyzer's intended duration (primary signal)
+        max_narration_end,             # Don't cut off narration
+        total_clip_duration,           # Don't cut off clip content
+        float(MIN_OUTPUT_DURATION)     # Never go below minimum
+    )
     target_duration = min(target_duration, float(MAX_OUTPUT_DURATION))
     pad_duration = target_duration - total_clip_duration
 
@@ -432,6 +587,10 @@ def compose_group(
         print(f"[WARN] Group {group_idx}: clip audio duration {clip_audio_dur:.1f}s deviates from target {target_duration:.1f}s by {abs(clip_audio_dur - target_duration):.1f}s!")
 
     # 3. Build narration audio track (padded to target_duration)
+    # Initialize VAD defaults in case narration_audio is empty
+    vad_stats = {"active": False}
+    vad_analysis_entries = []
+
     if narration_audio:
         if progress_cb:
             progress_cb(f"Group {group_idx+1}: Building narration audio track...", 55)
@@ -439,7 +598,8 @@ def compose_group(
         narration_filter_parts = []
         for i, nar in enumerate(narration_audio):
             reel_start = nar["reel_start"]
-            delay_ms = int(reel_start * 1000)
+            # Use round() instead of int() to avoid truncation precision loss
+            delay_ms = round(reel_start * 1000)
             narration_filter_parts.append(
                 f"[{i+1}:a]adelay={delay_ms}|{delay_ms}[nar{i}]"
             )
@@ -468,9 +628,37 @@ def compose_group(
         narr_dur = _get_video_duration_seconds(str(narration_audio_output))
         print(f"[INFO] Group {group_idx}: narration audio output duration: {narr_dur:.1f}s")
 
-    # 4. Apply ducking to clip audio and mix with narration
+    # 4. Apply VAD-driven ducking to clip audio and mix with narration
         if progress_cb:
-            progress_cb(f"Group {group_idx+1}: Applying audio ducking and mixing...", 70)
+            progress_cb(f"Group {group_idx+1}: Running VAD on narration + applying intelligent ducking...", 65)
+
+        # Run Silero VAD on each narration audio file to get precise speech timestamps
+        narration_vad_timestamps = []
+        vad_analysis_entries = []
+        for i, nar in enumerate(narration_audio):
+            vad_segs = get_speech_timestamps_from_narration(nar["path"])
+            narration_vad_timestamps.append(vad_segs)
+            total_speech_dur = sum(s["end"] - s["start"] for s in vad_segs)
+            vad_analysis_entries.append({
+                "segments": len(vad_segs),
+                "speech_duration": round(total_speech_dur, 2),
+                "total_duration": round(nar.get("duration", 0), 2),
+            })
+            print(f"[INFO] VAD narr {i+1}: {len(vad_segs)} speech segments, "
+                  f"total speech={total_speech_dur:.2f}s of {nar.get('duration', 0):.2f}s audio")
+
+        # Aggregate VAD stats for frontend display
+        total_vad_segments = sum(e["segments"] for e in vad_analysis_entries)
+        total_vad_speech = round(sum(e["speech_duration"] for e in vad_analysis_entries), 2)
+        vad_stats = {
+            "active": True,
+            "total_segments": total_vad_segments,
+            "total_speech_duration": total_vad_speech,
+            "narration_count": len(narration_audio),
+        }
+
+        if progress_cb:
+            progress_cb(f"Group {group_idx+1}: Applying VAD-driven audio ducking...", 70)
 
         # Identify the payoff moment (last narration event's end) so ducking skips it
         key_moment_end = 0.0
@@ -479,8 +667,12 @@ def compose_group(
             key_moment_end = max(nar.get("reel_end", 0) for nar in narration_audio)
         
         duck_chain = _build_ducking_filter_chain(
-            narration_audio, input_label="0:a", output_label="ducked",
-            target_duration=target_duration, key_moment_end=key_moment_end
+            narration_audio,
+            narration_vad_timestamps=narration_vad_timestamps,
+            input_label="0:a",
+            output_label="ducked",
+            target_duration=target_duration,
+            key_moment_end=key_moment_end
         )
 
         mixed_audio_output = working_dir / f"group_{group_idx}_mixed_audio.wav"
@@ -492,7 +684,7 @@ def compose_group(
             f"{duck_chain};"
             f"[1:a]volume=1.15[narr];"
             f"[ducked][narr]amix=inputs=2:duration=first:dropout_transition=0.1:normalize=0,"
-            f"alimiter=limit=0.95:attack=5:release=50,"
+            f"alimiter=limit=0.90:attack=3:release=50:level=disabled,"
             f"apad=whole_dur={target_duration:.2f},atrim=end={target_duration:.2f}[mixed]",
             "-map", "[mixed]",
             "-c:a", "pcm_s16le", "-ar", "44100", "-ac", "2",
@@ -547,4 +739,8 @@ def compose_group(
     if abs(actual_duration - target_duration) > 2.0:
         print(f"[WARN] Group {group_idx}: FINAL OUTPUT duration {actual_duration:.1f}s deviates from target {target_duration:.1f}s by {abs(actual_duration - target_duration):.1f}s — check audio/video alignment!")
 
-    return str(output_path)
+    return {
+        "output_path": str(output_path),
+        "vad_stats": vad_stats if narration_audio else {"active": False},
+        "vad_analysis": vad_analysis_entries if narration_audio else [],
+    }

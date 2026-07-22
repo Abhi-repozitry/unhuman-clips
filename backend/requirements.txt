@@ -8,3 +8,6 @@ openai
 python-dotenv
 requests
 edge-tts>=7.2.0,<8
+silero-vad
+torch
+torchaudio
