@@ -7,4 +7,4 @@ faster-whisper
 openai
 python-dotenv
 requests
-edge-tts
+edge-tts>=7.2.0,<8

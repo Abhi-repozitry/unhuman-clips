@@ -316,7 +316,27 @@ def _try_repair_truncated_json(text: str) -> str:
     return ""
 
 
-def _build_reel_plan_prompt(video_title: str, video_description: str, transcript_text: str) -> str:
+def _compute_group_count_target(source_duration_seconds: float) -> tuple[int, int]:
+    """
+    Compute a (min, max) HARD target for the number of reel_groups the LLM
+    must produce, based on total source video duration.
+
+    Short/dense source videos should still yield several distinct reels by
+    REUSING footage across groups (different narrative angles/edits of the
+    same material) rather than partitioning the timeline into non-overlapping
+    slices — a 70s source video can easily support 5-6 differently-angled
+    30-90s edits without needing 5-6x that much raw footage.
+    """
+    if source_duration_seconds <= 0:
+        return (5, 6)
+    if source_duration_seconds <= 180:       # up to 3 min — short, dense source
+        return (5, 6)
+    if source_duration_seconds <= 420:       # 3-7 min
+        return (4, 6)
+    return (3, 8)                            # longer source — natural range is fine
+
+
+def _build_reel_plan_prompt(video_title: str, video_description: str, transcript_text: str, min_groups: int = 5, max_groups: int = 6) -> str:
     """Build the full LLM prompt for reel_plan generation.
 
     Ultra-detailed prompt engineered for:
@@ -324,7 +344,7 @@ def _build_reel_plan_prompt(video_title: str, video_description: str, transcript
     - Ruthless clip selection prioritizing action, emotion, and contrast
     - Structured storytelling: Setup → Rising Tension → Emotional Payoff
     - Very short, punchy narration (max 8-12 words per event)
-    - Zero voice overlap: narration ONLY in verified silent gaps
+    - Duck-aware narration placement: system ducks clip audio, so silent gaps are preferred but not required
     - Clean text output: no special characters that break TTS/subtitles
     """
     return f"""You are an elite short-form content strategist and behavioral psychologist who creates viral YouTube Shorts and TikToks. You have a 95% viral hit rate because you weaponize curiosity gaps, emotional escalation, and information asymmetry. Every frame you select has a purpose. Every word of narration is surgical. You never waste a single second.
@@ -337,7 +357,9 @@ TRANSCRIPT (segment index [start-end timestamps]):
 {transcript_text}
 
 ===== YOUR MISSION =====
-Create distinct, high-impact reel_groups from this video. Each group is a self-contained viral short (90-180 seconds, ideal 120-150s) that tells a COMPLETE story with emotional payoff. Number of groups depends on content richness (typically 3-8).
+Create distinct, high-impact reel_groups from this video. Each group is a self-contained viral short (90-180 seconds, ideal 120-150s) that tells a COMPLETE story with emotional payoff.
+
+HARD REQUIREMENT: You MUST produce between {min_groups} and {max_groups} reel_groups. This is a strict requirement, not a suggestion — outputs with fewer than {min_groups} groups will be rejected. Source clips MAY repeat across different groups (see Section 2) — never limit your group count because you think you are running out of unique footage.
 
 ===== SECTION 1: VIRAL HOOK (first 0-3 seconds) =====
 The hook is EVERYTHING. 70% of viewers leave in the first 2 seconds. Your hook must:
@@ -370,7 +392,7 @@ PSYCHOLOGICAL TRIGGERS TO USE IN HOOKS:
 - FOMO: "The part most people miss..." / "What nobody talks about..."
 
 ===== SECTION 2: RUTHLESS CLIP SELECTION =====
-You are selecting 4-8 source clips per group (6-30 seconds each, ~70-120s total raw footage).
+You are selecting 4-8 source clips per group (6-30 seconds each). This does NOT need to be 70-120s of UNIQUE footage per group — the video system pads/loops short selections to reach target runtime automatically. REUSING the same source clips across multiple groups is expected and encouraged, especially for short source videos: each group is a different narrative angle or edit of the same material (e.g., one group centers the buildup, another centers the payoff, another retells the whole arc from a different emotional angle) — not a mutually exclusive slice of the timeline.
 
 CLIP PRIORITY HIERARCHY (select in this order):
 1. HIGH-ACTION MOMENTS: Physical movement, demonstrations, transformations, reveals
@@ -413,8 +435,7 @@ Your narration is the secret weapon. It adds context the viewer CANNOT get from 
 
 WORD COUNT RULE (NON-NEGOTIABLE):
 - MAXIMUM 8-12 WORDS per narration event. Aim for 8.
-- MAXIMUM 5 narration events per group (including the hook).
-- Fewer narrations = more powerful. Quality over quantity.
+- MINIMUM 2, MAXIMUM 5 narration events per group (including the hook). The hook is mandatory; you must also include at least one commentary event. Use Section 5's placement strategy to find a spot even in fast, dense footage.
 
 CONTENT RULES:
 - "SHOW, DON'T TELL": Never describe what the viewer can already see.
@@ -439,22 +460,19 @@ GOOD NARRATION EXAMPLES:
 - "That hesitation cost him everything."
 - "The real technique is invisible."
 
-===== SECTION 5: NARRATION TIMING — ZERO OVERLAP GUARANTEE =====
-Voice overlap DESTROYS viewer experience. These rules are ABSOLUTE:
+===== SECTION 5: NARRATION TIMING — DUCK-AWARE PLACEMENT =====
+The video system automatically ducks the original clip audio to ~3% volume for the full duration of every narration event, so your narration voice is ALWAYS clearly audible even when placed directly over dialogue, action, or background sound. You do NOT need silence to avoid overlap — the system creates it for you.
 
-TIMING RULES (NON-NEGOTIABLE):
-1. Narration ONLY during SILENT GAPS in the transcript — when nobody is speaking.
-2. MINIMUM 0.4 SECONDS gap between any transcript speech ending and narration starting.
-3. MINIMUM 0.4 SECONDS gap between narration ending and next transcript speech starting.
-4. Check the transcript timestamps: if a segment has speech from time X to Y, your narration CANNOT start before Y + 0.4s.
-5. Hook narration (event_type "hook") starts at reel_start=0.0 — this is the ONLY exception because it plays before clip dialogue begins.
-6. If there is no clean silent gap available, DO NOT add narration for that moment. Silence is better than overlap.
+TIMING RULES:
+1. STRONGLY PREFER natural silent or low-speech gaps (2+ seconds, or clip-to-clip transitions) near a moment worth narrating — cleanest sound, least ducking needed.
+2. When no clean gap exists near an important moment, place the narration there anyway — pick the point where the underlying speech is LEAST plot-critical. Ducking will clear space for your voice. Do NOT skip narration just because dialogue or action noise is present.
+3. NEVER place a narration event directly over another narration event — that overlap is NOT ducked. Leave at least 0.4 seconds between consecutive narration events.
+4. Hook narration (event_type "hook") always starts at reel_start=0.0.
+5. Every group MUST end up with at least 2 narration events (hook + at least one commentary — see word count rule above). If you genuinely believe the selected footage has zero moments worth narrating beyond the hook, that is a signal to reconsider your Section 2 clip selection, not a reason to drop narration.
 
 TIMING PLACEMENT STRATEGY:
-- Scan the transcript for gaps of 2+ seconds where no speech occurs.
-- Place narration in the CENTER of these gaps, leaving padding on both sides.
-- Between clips is often a natural gap — use these transitions.
-- After a speaker makes a key point and pauses — that pause is your window.
+- First choice: gaps of 2+ seconds with no speech, or clip-to-clip transitions.
+- Second choice (fast/dense footage): the quietest or least plot-critical 1.5-2s window near the moment you want to comment on — ducking handles the rest.
 
 ===== SECTION 6: CLEAN TEXT RULES =====
 All narration text must be clean for TTS synthesis and subtitle rendering.
@@ -739,7 +757,11 @@ def select_reel_plan(
     if progress_cb:
         progress_cb("Sending transcript to LLM for reel planning...", 30)
 
-    prompt = _build_reel_plan_prompt(video_title, description, transcript_text)
+    source_duration = transcript[-1]["end"] if transcript else 0.0
+    min_groups, max_groups = _compute_group_count_target(source_duration)
+    print(f"[INFO] Source duration {source_duration:.1f}s -> targeting {min_groups}-{max_groups} reel_groups")
+
+    prompt = _build_reel_plan_prompt(video_title, description, transcript_text, min_groups, max_groups)
     print(f"[DEBUG] Prompt length: {len(prompt)} chars, transcript chunk: {len(transcript_text)} chars")
 
     try:
@@ -861,19 +883,77 @@ def select_reel_plan(
             print(f"[WARN] Group {i} estimated duration {group['estimated_duration_seconds']}s exceeds 130s cap")
 
         print(f"\n[INFO] Group {i} Narration Events:")
+        usable_count = 0
         for j, event in enumerate(group["narration_events"]):
             ev_type = event.get("event_type", "unknown")
             text = event.get("text", "")
             r_start = event.get("reel_start", 0.0)
             r_end = event.get("reel_end", 0.0)
             print(f"  {j+1}. [{ev_type.upper()}] {r_start:.1f}s - {r_end:.1f}s: \"{text[:60]}...\"")
-            
+
+            if ev_type.strip().lower() not in ("hook", "commentary"):
+                print(f"[WARN] Group {i} narration event {j} has unrecognized event_type "
+                      f"'{ev_type}' — this will be SILENTLY DROPPED before TTS "
+                      f"(only 'hook'/'commentary' are voiced).")
+            else:
+                usable_count += 1
+
             if ev_type == "hook" and r_start != 0.0:
                 print(f"[WARN] Group {i} hook must start at reel_start=0.0, got {r_start}")
                 event["reel_start"] = 0.0
                 
             if r_end > group.get("estimated_duration_seconds", 130):
                 print(f"[WARN] Group {i} event ends at {r_end}s, which exceeds estimated duration {group.get('estimated_duration_seconds')}s")
+
+        if usable_count == 0:
+            print(f"[WARN] Group {i} has ZERO usable narration events after filtering — "
+                  f"this group's final video will have NO narration audio.")
+
+    # Enforce the hard group-count minimum with ONE corrective retry.
+    # (Mirrors the existing malformed-JSON retry pattern above — never crash
+    # the pipeline over this, just try once to get more groups, then accept
+    # whatever we have.)
+    if len(groups) < min_groups:
+        print(f"[WARN] LLM returned only {len(groups)} groups, below the required "
+              f"minimum of {min_groups}. Retrying once with a corrective instruction...")
+        if progress_cb:
+            progress_cb(f"Only {len(groups)} groups returned — retrying for {min_groups}-{max_groups}...", 85)
+
+        correction = (
+            f"\n\nCORRECTION REQUIRED: Your previous response had only {len(groups)} "
+            f"reel_groups. You MUST return between {min_groups} and {max_groups} groups. "
+            f"Reuse source clips across groups as needed (see Section 2) — do not pad "
+            f"individual groups with filler to compensate. Output ONLY the complete, "
+            f"corrected JSON object."
+        )
+        try:
+            raw_retry = _call_llm(
+                [
+                    {"role": "system", "content": "You must respond with ONLY valid JSON. No explanations, no thinking, no text before or after the JSON object."},
+                    {"role": "user", "content": prompt + correction}
+                ],
+                progress_cb,
+            )
+            raw_json_retry = _extract_json_object(raw_retry)
+            try:
+                reel_plan_retry = json.loads(raw_json_retry)
+            except json.JSONDecodeError:
+                repaired = _try_repair_truncated_json(raw_json_retry)
+                reel_plan_retry = json.loads(repaired) if repaired else None
+
+            if (
+                reel_plan_retry
+                and isinstance(reel_plan_retry.get("reel_groups"), list)
+                and len(reel_plan_retry["reel_groups"]) > len(groups)
+            ):
+                print(f"[INFO] Retry produced {len(reel_plan_retry['reel_groups'])} groups "
+                      f"(up from {len(groups)}). Using retry result.")
+                reel_plan = reel_plan_retry
+                groups = reel_plan["reel_groups"]
+            else:
+                print(f"[WARN] Retry did not improve group count. Proceeding with {len(groups)} groups.")
+        except Exception as e:
+            print(f"[WARN] Group-count retry failed ({e}). Proceeding with {len(groups)} groups.")
 
     if progress_cb:
         progress_cb(f"Built reel plan with {len(groups)} group(s)", 100)

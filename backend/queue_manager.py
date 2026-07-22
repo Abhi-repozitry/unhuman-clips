@@ -1,12 +1,11 @@
 import asyncio
 from pathlib import Path
 from typing import Optional, Callable, List
-from backend.models import VideoJob, JobStatus, ReelPlan, ReelGroup, OutputReel
+from backend.models import VideoJob, JobStatus, ReelPlan, ReelGroup, OutputReel, NarrationEvent
 from backend.config import HOOK_SECONDS, get_job_working_dir, FFMPEG_PATH, FFPROBE_PATH
 from backend.pipeline.downloader import download_video
 from backend.pipeline.transcriber import transcribe_video
-from backend.pipeline.analyzer import select_reel_plan, select_clips
-from backend.pipeline.commentary import write_commentary
+from backend.pipeline.analyzer import select_reel_plan
 from backend.pipeline.clipper import cut_group_clips
 from backend.pipeline.tts import synthesize_commentary
 from backend.pipeline.captioner import generate_clip_ass, generate_commentary_ass
@@ -205,7 +204,15 @@ class QueueManager:
         self.loop = loop
 
     def add_job(self, url: str) -> VideoJob:
-        self.jobs = {k: v for k, v in self.jobs.items() if v.status == "DONE"}
+        # Prune completed/terminal jobs only — NEVER drop a job that's still
+        # in-flight (QUEUED/DOWNLOADING/.../COMPOSITING/EDITING). The previous
+        # version kept only status == "DONE", which silently deleted any job
+        # still processing the moment a new job was submitted — it kept
+        # running in the background (the worker holds a direct object
+        # reference) but vanished from get_jobs()/lookup-by-id, making it
+        # look like the job or its output disappeared.
+        terminal = (JobStatus.DONE, JobStatus.ERROR)
+        self.jobs = {k: v for k, v in self.jobs.items() if v.status not in terminal}
         job = VideoJob(url=url)
         self.jobs[job.id] = job
         self.queue.put_nowait(job.id)
@@ -442,7 +449,53 @@ class QueueManager:
 
 
             job.stage_index = 5
-            group_narration_events = [e for e in group.narration_events if e.event_type in ("hook", "commentary")]
+            raw_narration_events = list(group.narration_events)
+            group_narration_events = []
+            dropped = []
+            for e in raw_narration_events:
+                if e.event_type.strip().lower() in ("hook", "commentary"):
+                    group_narration_events.append(e)
+                else:
+                    dropped.append(e)
+            if dropped:
+                reporter.log_info(
+                    f"[WARN] Group {group_idx+1}: dropped {len(dropped)} narration event(s) "
+                    f"with unrecognized event_type: {[e.event_type for e in dropped]!r} "
+                    f"(only 'hook'/'commentary' are voiced)."
+                )
+
+            if not group_narration_events:
+                # Analyzer produced zero usable narration for this group (LLM skipped
+                # narration entirely, e.g. because it found no silent gap under the old
+                # prompt rules). Never ship a fully-silent reel — inject a minimal hook
+                # line from the group's own summary so there's at least SOME narration.
+                fallback_text = (
+                    group.reel_summary.short_description or group.reel_summary.title or ""
+                ).strip()
+                if fallback_text:
+                    fallback_text = fallback_text[:80]
+                    group.narration_events.append(
+                        NarrationEvent(
+                            event_type="hook",
+                            reel_start=0.0,
+                            reel_end=3.0,
+                            text=fallback_text,
+                            voice_id=None,
+                        )
+                    )
+                    group_narration_events = [group.narration_events[-1]]
+                    reporter.log_info(
+                        f"[WARN] Group {group_idx+1}: analyzer returned NO usable narration "
+                        f"events (raw count from LLM: {len(raw_narration_events)}). Injected "
+                        f"a fallback hook line so this reel isn't fully silent: "
+                        f"\"{fallback_text}\""
+                    )
+                else:
+                    reporter.log_info(
+                        f"[WARN] Group {group_idx+1}: analyzer returned NO usable narration "
+                        f"events and no reel_summary text was available for a fallback. "
+                        f"This group's final video will have NO narration audio."
+                    )
             total_narration = len(group_narration_events)
             job.stage_data = {
                 "status": "voicing",
