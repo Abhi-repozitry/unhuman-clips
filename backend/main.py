@@ -24,7 +24,7 @@ class ConnectionManager:
             self.active_connections.remove(websocket)
 
     async def broadcast(self, job: VideoJob):
-        message = job.model_dump_json(mode="json")
+        message = job.model_dump_json()
         disconnected = []
         for connection in self.active_connections:
             try:

@@ -15,9 +15,9 @@ from backend.config import (
     MIN_OUTPUT_DURATION,
     MAX_OUTPUT_DURATION,
 )
-from backend.models import ReelPlan
+from backend.models import ReelPlan, LLMInteraction
 from backend.providers.llm import call_llm_sync
-from typing import Callable, Optional
+from typing import Any, Callable, Optional, List
 
 
 def _format_full_transcript(transcript: list) -> str:
@@ -42,9 +42,13 @@ def _summarize_transcript_for_llm(transcript: list, max_total_chars: int = 10000
     return _format_full_transcript(transcript)
 
 
-def _call_llm(messages: list, progress_cb: Optional[Callable[[str, float], None]] = None) -> str:
+def _call_llm(messages: list, progress_cb: Optional[Callable[[str, float], None]] = None,
+              reporter: Optional[Any] = None,
+              interactions: Optional[List[LLMInteraction]] = None,
+              stage_name: str = "reel_plan") -> str:
     """Call NVIDIA LLM with primary model, retry with fallback on failure.
-    Uses exponential backoff between retries."""
+    Uses exponential backoff between retries. Now collects LLMInteraction records
+    for rich UI display and logs via reporter."""
     if not NVIDIA_API_KEY:
         raise RuntimeError(
             "NVIDIA_API_KEY is not set. Skipping LLM analysis and using local fallback."
@@ -68,13 +72,19 @@ def _call_llm(messages: list, progress_cb: Optional[Callable[[str, float], None]
                 temperature=0.0,
                 max_tokens=131072,
                 timeout=480.0,
+                reporter=reporter,
+                interactions=interactions,
+                stage_name=stage_name,
             )
             truncated = raw_content[:300] + "..." if len(raw_content) > 300 else raw_content
             print(f"[DEBUG] LLM response preview (model {model}): {truncated}")
-            
+
+            # Broadcast updated interactions after each successful call
+            if reporter and interactions is not None:
+                reporter.set_stage_data_key("llm_interactions", [i.model_dump() for i in interactions])
+
             # Log full raw content to a debug file
             try:
-                import time
                 from backend.config import WORKING_DIR
                 debug_path = WORKING_DIR / f"llm_debug_{int(time.time())}.txt"
                 debug_path.parent.mkdir(parents=True, exist_ok=True)
@@ -83,12 +93,12 @@ def _call_llm(messages: list, progress_cb: Optional[Callable[[str, float], None]
                 print(f"[DEBUG] Full LLM raw output saved to {debug_path}")
             except Exception as log_e:
                 print(f"[WARN] Failed to write LLM debug log: {log_e}")
-                
+
             return raw_content.strip()
         except Exception as e:
             print(f"[WARN] LLM call failed with model {model}: {e}")
             last_error = e
-            
+
     raise RuntimeError(f"All NVIDIA models failed after retries. Last error: {last_error}") from last_error
 
 
@@ -306,7 +316,6 @@ Use "source_start" and "source_end" for clip timestamps.
 
 
 
-
 def _extract_json_object(text: str) -> str:
     """Extract first JSON object from text, stripping markdown fences and outer conversational text."""
     t = text.strip()
@@ -332,9 +341,13 @@ def select_reel_plan(
     transcript: list,
     video_title: str,
     video_description: str,
-    progress_cb: Optional[Callable[[str, float], None]] = None
+    progress_cb: Optional[Callable[[str, float], None]] = None,
+    reporter: Optional[Any] = None,
+    interactions: Optional[List[LLMInteraction]] = None,
 ) -> dict:
-    """Main entry: returns reel_plan dict with reel_groups array."""
+    """Main entry: returns reel_plan dict with reel_groups array.
+    If reporter and interactions are provided, collects structured LLMInteraction
+    records during processing and broadcasts them live via set_stage_data_key."""
     if progress_cb:
         progress_cb("Preparing transcript for reel analysis...", 10)
 
@@ -387,6 +400,9 @@ def select_reel_plan(
                 {"role": "user", "content": prompt}
             ],
             progress_cb,
+            reporter=reporter,
+            interactions=interactions,
+            stage_name="reel_plan",
         )
     except Exception as e:
         raise RuntimeError(f"LLM failed: {e}") from e
@@ -423,6 +439,9 @@ def select_reel_plan(
                 }
             ],
             progress_cb,
+            reporter=reporter,
+            interactions=interactions,
+            stage_name="reel_plan_retry",
         )
 
         try:
@@ -491,7 +510,7 @@ def select_reel_plan(
             if ev_type == "hook" and r_start != 0.0:
                 print(f"[WARN] Group {i} hook must start at reel_start=0.0, got {r_start}")
                 event["reel_start"] = 0.0
-                
+
             if r_end > group.get("estimated_duration_seconds", 130):
                 print(f"[WARN] Group {i} event ends at {r_end}s, which exceeds estimated duration {group.get('estimated_duration_seconds')}s")
 
@@ -577,6 +596,10 @@ def select_reel_plan(
     avg_duration = sum(g.get("estimated_duration_seconds", 0) for g in groups) / max(len(groups), 1)
     print(f"[INFO] REEL PLAN STATS: {len(groups)} groups, {total_clips} total clips, "
           f"{total_narrations} total narrations, avg duration {avg_duration:.1f}s")
+
+    # Broadcast final interactions state
+    if reporter and interactions is not None:
+        reporter.set_stage_data_key("llm_interactions", [i.model_dump() for i in interactions])
 
     return ReelPlan(**reel_plan)
 

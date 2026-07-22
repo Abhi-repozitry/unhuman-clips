@@ -45,6 +45,12 @@ class ProgressReporter:
     def log_debug(self, message: str):
         self.log(message, "debug")
 
+    def set_stage_data_key(self, key: str, value: Any):
+        """Set a key on stage_data and broadcast immediately.
+        Used for live-updating UI components (e.g., llm_interactions)."""
+        self.job.stage_data[key] = value
+        self._broadcast()
+
     def set_clip_details(self, clip_details: list):
         self.job.clip_details = clip_details
         self._broadcast()

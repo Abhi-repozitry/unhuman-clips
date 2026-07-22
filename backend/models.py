@@ -51,6 +51,20 @@ class ReelPlan(BaseModel):
     is_fallback: bool = False
 
 
+class LLMInteraction(BaseModel):
+    """Structured log entry for an LLM interaction during pipeline processing.
+    Collected in stage_data['llm_interactions'] and broadcast via WebSocket
+    for live UI rendering."""
+    timestamp: str = ""
+    type: str = ""  # "prompt" | "response" | "error" | "retry"
+    role: str = ""  # "system" | "user" | "assistant"
+    content: str = ""  # preview (truncated for UI)
+    full_content: str = ""  # full raw text (for expand modal)
+    model: str = ""
+    retry_count: int = 0
+    error_type: str = ""  # "timeout" | "rate_limit" | "connection" | "json_parse" | "empty_content" | "unknown"
+
+
 class JobStatus(StrEnum):
     QUEUED = "QUEUED"
     DOWNLOADING = "DOWNLOADING"

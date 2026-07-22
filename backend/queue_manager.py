@@ -332,15 +332,22 @@ class QueueManager:
         job.stage_data = {"status": "sending", "message": "Sending transcript to LLM..."}
         reporter.update_stage(JobStatus.ANALYZING, "Sending transcript to LLM...", 0, 3)
 
+        # Create interactions list for structured LLM log display
+        from backend.models import LLMInteraction
+        llm_interactions: list[LLMInteraction] = []
+
         def analyzer_progress(msg: str, prog: float):
-            job.stage_data = {"status": "processing", "message": msg, "progress": prog}
+            # Preserve existing stage_data keys (e.g., llm_interactions set by reporter.set_stage_data_key)
+            existing = job.stage_data if isinstance(job.stage_data, dict) else {}
+            job.stage_data = {**existing, "status": "processing", "message": msg, "progress": prog}
             reporter.progress_callback(msg, prog)
 
         video_description = result.get("description", "")
         try:
             reel_plan: ReelPlan = await asyncio.wait_for(
                 asyncio.to_thread(
-                    select_reel_plan, job.transcript, job.title or "", video_description, analyzer_progress
+                    select_reel_plan, job.transcript, job.title or "", video_description,
+                    analyzer_progress, reporter, llm_interactions
                 ),
                 timeout=1200.0,  # 20 min hard ceiling; covers 2-model x 2-attempt x 240s budget.
             )
@@ -349,12 +356,18 @@ class QueueManager:
                 "ANALYZING exceeded 20-minute hard ceiling — LLM never responded "
                 "in time even after retries. Check NVIDIA API status."
             )
+        # Store collected LLM interactions in stage_data for UI display
+        if llm_interactions:
+            job.stage_data["llm_interactions"] = [i.model_dump() for i in llm_interactions]
+            reporter.set_stage_data_key("llm_interactions", [i.model_dump() for i in llm_interactions])
+        else:
+            job.stage_data["llm_interactions"] = []
+            reporter.set_stage_data_key("llm_interactions", [])
         if getattr(reel_plan, "is_fallback", False):
             reporter.log_info("Using fallback reel plan (LLM was unavailable) — continuing with fallback.")
-            job.stage_data = {
-                "status": "fallback",
-                "message": "LLM unavailable, using heuristic fallback plan.",
-            }
+            # Preserve llm_interactions when setting fallback status
+            existing = job.stage_data if isinstance(job.stage_data, dict) else {}
+            job.stage_data = {**existing, "status": "fallback", "message": "LLM unavailable, using heuristic fallback plan."}
         job.reel_plan = reel_plan
         job.num_output_groups = len(reel_plan.reel_groups)
         job.current_group_index = 0
@@ -371,7 +384,9 @@ class QueueManager:
         ]
 
         total_clips = sum(len(g.source_clips) for g in reel_plan.reel_groups)
-        job.stage_data = {"status": "done", "groups_found": job.num_output_groups, "total_source_clips": total_clips}
+        # Preserve llm_interactions when setting stage_data to done
+        existing = job.stage_data if isinstance(job.stage_data, dict) else {}
+        job.stage_data = {**existing, "status": "done", "groups_found": job.num_output_groups, "total_source_clips": total_clips}
         reporter.log_info(f"Analyzed: {job.num_output_groups} output group(s), {total_clips} source clips")
 
         # Initialize clip details for tracking (flattened across groups)

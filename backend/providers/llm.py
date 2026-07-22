@@ -10,6 +10,44 @@ import yaml
 import openai
 
 from backend.providers.cache import get_cache, ContentCache
+from backend.models import LLMInteraction
+from datetime import datetime
+
+
+def _now_timestamp() -> str:
+    """Return a human-readable timestamp string for LLMInteraction records."""
+    return datetime.now().strftime("%H:%M:%S.%f")[:12]
+
+
+def _classify_llm_error(e: Exception) -> str:
+    """Classify an LLM error into a canonical category for logging and retry logic."""
+    if isinstance(e, openai.APITimeoutError):
+        return "timeout"
+    if isinstance(e, openai.RateLimitError):
+        return "rate_limit"
+    if isinstance(e, openai.APIConnectionError):
+        return "connection"
+    if isinstance(e, json.JSONDecodeError):
+        return "json_parse"
+    err_str = str(e).lower()
+    if "504" in err_str or "timeout" in err_str or "gateway" in err_str:
+        return "timeout"
+    if "429" in err_str or "rate limit" in err_str or "too many requests" in err_str:
+        return "rate_limit"
+    if "empty content" in err_str or "refusal" in err_str:
+        return "empty_content"
+    if "connection" in err_str or "econnrefused" in err_str or "econnreset" in err_str:
+        return "connection"
+    return "unknown"
+
+
+def _truncate_preview(text: str, max_len: int = 300) -> str:
+    """Return a short preview of the text for UI display."""
+    if not text:
+        return ""
+    if len(text) <= max_len:
+        return text
+    return text[:max_len] + "..."
 
 
 def call_llm_sync(
@@ -20,11 +58,19 @@ def call_llm_sync(
     temperature: float = 0.0,
     max_tokens: int = 131072,
     timeout: float = 480.0,
+    reporter: Optional[Any] = None,
+    interactions: Optional[List[LLMInteraction]] = None,
+    stage_name: str = "reel_plan",
 ) -> str:
-    """Synchronous LLM call with retry on failure and exponential backoff.
-    Falls back to NVIDIA_MODEL_FALLBACK if primary model fails.
-    Default max_tokens (65536) ensures both primary and fallback models
-    have ample room for deep reasoning and long-form output.
+    """Synchronous LLM call with enhanced retry logic and exponential backoff.
+    
+    Features:
+    - 4-5 total attempts per model with exponential backoff [1, 3, 6, 10]s
+    - Falls back to NVIDIA_MODEL_FALLBACK if primary model exhausts retries
+    - Classifies errors into categories (timeout, rate_limit, connection, etc.)
+    - Collects structured LLMInteraction records for UI display
+    - Detailed logging via reporter.log_info/log_warn
+    - temperature=0.0 for determinism where possible
     """
     from backend.config import NVIDIA_MODEL_FALLBACK
 
@@ -32,25 +78,76 @@ def call_llm_sync(
     if NVIDIA_MODEL_FALLBACK and NVIDIA_MODEL_FALLBACK != model:
         models_to_try.append(NVIDIA_MODEL_FALLBACK)
 
-    backoff_delays = [3, 8, 15]
+    # Exponential backoff: 1s, 3s, 6s, 10s
+    backoff_delays = [1, 3, 6, 10]
+    # Total attempts per model: up to 4-5 retries
+    max_attempts_per_model = 5
+
     last_error = None
 
-    for m in models_to_try:
-        for attempt in range(2):
+    # Capture the initial prompt as an interaction
+    if interactions is not None:
+        prompt_content = json.dumps(messages, indent=2) if isinstance(messages, list) else str(messages)
+        system_msg = next((m for m in messages if m.get("role") == "system"), None)
+        user_msg = next((m for m in messages if m.get("role") == "user"), None)
+        interactions.append(LLMInteraction(
+            timestamp=_now_timestamp(),
+            type="prompt",
+            role="user",
+            content=_truncate_preview(user_msg.get("content", "") if user_msg else prompt_content),
+            full_content=prompt_content,
+            model=model,
+            retry_count=0,
+        ))
+        if system_msg:
+            interactions.append(LLMInteraction(
+                timestamp=_now_timestamp(),
+                type="prompt",
+                role="system",
+                content=_truncate_preview(system_msg.get("content", "")),
+                full_content=system_msg.get("content", ""),
+                model=model,
+                retry_count=0,
+            ))
+        if reporter:
+            prompt_preview = _truncate_preview(prompt_content, 120)
+            reporter.log_info(f"[LLM] Prompt sent ({stage_name}) — {len(prompt_content)} chars")
+            # Broadcast live interactions to UI during LLM processing
+            reporter.set_stage_data_key("llm_interactions", [i.model_dump() for i in interactions])
+
+    for m_idx, current_model in enumerate(models_to_try):
+        for attempt in range(max_attempts_per_model):
             try:
+                if attempt > 0 and interactions is not None:
+                    interactions.append(LLMInteraction(
+                        timestamp=_now_timestamp(),
+                        type="retry",
+                        role="assistant",
+                        content=f"Retrying {current_model} (attempt {attempt + 1}/{max_attempts_per_model})",
+                        full_content=f"Retry #{attempt + 1} with {current_model} after {_classify_llm_error(last_error)} error",
+                        model=current_model,
+                        retry_count=attempt,
+                        error_type=_classify_llm_error(last_error) if last_error else "unknown",
+                    ))
+                    if reporter:
+                        reporter.log_info(f"[LLM] Retry {attempt + 1}/{max_attempts_per_model} with {current_model} (reason: {_classify_llm_error(last_error)})")
+                        reporter.set_stage_data_key("llm_interactions", [i.model_dump() for i in interactions])
+
                 client = openai.OpenAI(base_url=base_url, api_key=api_key, max_retries=0)
                 kwargs = {
-                    "model": m,
+                    "model": current_model,
                     "messages": messages,
                     "temperature": temperature,
                     "max_tokens": max_tokens,
                     "timeout": timeout,
                     "seed": 42,
                 }
+                # Only add response_format if the model supports it
                 try:
                     kwargs["response_format"] = {"type": "json_object"}
                 except Exception:
                     pass
+
                 response = client.chat.completions.create(**kwargs)
                 raw = response.choices[0].message.content
                 if raw is None:
@@ -60,16 +157,65 @@ def call_llm_sync(
                         f"NVIDIA API returned empty content. "
                         f"Finish reason: {finish_reason}. Refusal: {refusal}."
                     )
-                return raw.strip()
+
+                raw = raw.strip()
+                usage = getattr(response, 'usage', None)
+                token_count = ""
+                if usage:
+                    token_count = f" ({usage.completion_tokens} out / {usage.prompt_tokens} in tokens)"
+
+                if interactions is not None:
+                    interactions.append(LLMInteraction(
+                        timestamp=_now_timestamp(),
+                        type="response",
+                        role="assistant",
+                        content=_truncate_preview(raw),
+                        full_content=raw,
+                        model=current_model,
+                        retry_count=attempt,
+                    ))
+                    if reporter:
+                        reporter.log_info(f"[LLM] Response received{token_count} from {current_model}")
+                        # Broadcast live interactions to UI immediately after response
+                        reporter.set_stage_data_key("llm_interactions", [i.model_dump() for i in interactions])
+
+                return raw
+
             except Exception as e:
                 last_error = e
-                if attempt == 0:
+                error_type = _classify_llm_error(e)
+                err_preview = _truncate_preview(str(e), 200)
+
+                if interactions is not None:
+                    interactions.append(LLMInteraction(
+                        timestamp=_now_timestamp(),
+                        type="error",
+                        role="assistant",
+                        content=f"[{error_type.upper()}] {err_preview}",
+                        full_content=str(e),
+                        model=current_model,
+                        retry_count=attempt,
+                        error_type=error_type,
+                    ))
+                    if reporter:
+                        reporter.log_warn(f"[LLM] Error with {current_model} (attempt {attempt + 1}): {error_type} — {err_preview[:100]}")
+
+                # Determine if we should retry or move to next model
+                if attempt < max_attempts_per_model - 1:
                     delay = backoff_delays[min(attempt, len(backoff_delays) - 1)]
+                    if reporter:
+                        reporter.log_info(f"[LLM] Backoff {delay}s before retry {attempt + 2} with {current_model}")
                     time.sleep(delay)
-                    continue
                 else:
+                    # Exhausted retries for this model, try fallback
+                    if reporter:
+                        reporter.log_warn(f"[LLM] Model {current_model} exhausted all {max_attempts_per_model} retries, trying fallback")
                     break
-    raise RuntimeError(f"All NVIDIA models failed. Last error: {last_error}")
+
+    raise RuntimeError(
+        f"All NVIDIA models failed after {max_attempts_per_model} retries each. "
+        f"Last error: {last_error}"
+    )
 
 
 @dataclass
@@ -223,8 +369,11 @@ class LLMProvider:
         model: Optional[str] = None,
         temperature: float = 0.1,
         max_tokens: int = 65536,
-        progress_cb: Optional[Callable[[str, float], None]] = None
+        progress_cb: Optional[Callable[[str, float], None]] = None,
+        reporter: Optional[Any] = None,
+        interactions: Optional[List[LLMInteraction]] = None,
     ) -> str:
+        """Enhanced async LLM call with retry robustness and interaction collection."""
         primary, fallback = self.get_model_config(stage)
         models_to_try = [model or primary]
         if fallback and fallback != primary:
@@ -237,8 +386,8 @@ class LLMProvider:
 
         prompt = messages[0]["content"] if messages else ""
 
-        for model in models_to_try:
-            cache_key = self.generate_cache_key(stage, prompt, params, model)
+        for m_idx, current_model in enumerate(models_to_try):
+            cache_key = self.generate_cache_key(stage, prompt, params, current_model)
 
             if self.config.cache.get("enabled", True):
                 cached_response = get_cache().get(cache_key)
@@ -246,11 +395,14 @@ class LLMProvider:
                     with self._metrics_lock:
                         self._cache_hits += 1
                     if progress_cb:
-                        progress_cb(f"Cache hit for {model}", 100)
+                        progress_cb(f"Cache hit for {current_model}", 100)
+                    if reporter:
+                        reporter.log_info(f"[LLM] Cache hit for {current_model}")
                     return cached_response
                 with self._metrics_lock:
                     self._cache_misses += 1
 
+            # Rate limiting
             wait_time = self._rate_limiter.get_wait_time()
             if wait_time > 0:
                 with self._metrics_lock:
@@ -258,6 +410,8 @@ class LLMProvider:
                     self._total_wait_time += wait_time
                 if progress_cb:
                     progress_cb(f"Rate limited. Waiting {wait_time:.1f}s...", 50)
+                if reporter:
+                    reporter.log_info(f"[LLM] Rate-limited, waiting {wait_time:.1f}s")
                 await asyncio.sleep(wait_time)
 
             if job_id and job_id not in self._per_job_limiter:
@@ -272,46 +426,141 @@ class LLMProvider:
                 if job_wait_time > 0:
                     if progress_cb:
                         progress_cb(f"Job rate limited. Waiting {job_wait_time:.1f}s...", 50)
+                    assert reporter is not None
+                    if reporter:
+                        reporter.log_info(f"[LLM] Job rate-limited, waiting {job_wait_time:.1f}s")
                     await asyncio.sleep(job_wait_time)
 
-            try:
-                with self._metrics_lock:
-                    self._llm_calls += 1
-                self._rate_limiter.check_and_wait()
-                if job_id:
-                    self._per_job_limiter[job_id].check_and_wait()
+            # Log prompt interaction
+            if interactions is not None:
+                system_msg = next((m for m in messages if m.get("role") == "system"), None)
+                user_msg = next((m for m in messages if m.get("role") == "user"), None)
+                prompt_content = user_msg.get("content", "") if user_msg else json.dumps(messages)
+                interactions.append(LLMInteraction(
+                    timestamp=_now_timestamp(),
+                    type="prompt",
+                    role="user",
+                    content=_truncate_preview(prompt_content),
+                    full_content=prompt_content,
+                    model=current_model,
+                    retry_count=0,
+                ))
+                if system_msg:
+                    interactions.append(LLMInteraction(
+                        timestamp=_now_timestamp(),
+                        type="prompt",
+                        role="system",
+                        content=_truncate_preview(system_msg.get("content", "")),
+                        full_content=system_msg.get("content", ""),
+                        model=current_model,
+                        retry_count=0,
+                    ))
+                if reporter:
+                    reporter.log_info(f"[LLM] Prompt sent ({stage}) — {len(prompt_content)} chars")
 
-                response = await self.client.chat.completions.create(
-                    model=model,
-                    messages=messages,
-                    temperature=temperature,
-                    max_tokens=max_tokens
-                )
+            # Enhanced retry loop (like call_llm_sync)
+            backoff_delays = [1, 3, 6, 10]
+            max_attempts = 5
+            last_error = None
 
-                raw_content = response.choices[0].message.content
-                if raw_content is None:
-                    finish_reason = response.choices[0].finish_reason
-                    refusal = getattr(response.choices[0].message, 'refusal', None)
-                    raise RuntimeError(
-                        f"NVIDIA API returned empty content. "
-                        f"Finish reason: {finish_reason}. "
-                        f"Refusal: {refusal}"
+            for attempt in range(max_attempts):
+                try:
+                    with self._metrics_lock:
+                        self._llm_calls += 1
+                    self._rate_limiter.check_and_wait()
+                    if job_id:
+                        self._per_job_limiter[job_id].check_and_wait()
+
+                    if attempt > 0 and interactions is not None:
+                        interactions.append(LLMInteraction(
+                            timestamp=_now_timestamp(),
+                            type="retry",
+                            role="assistant",
+                            content=f"Retrying {current_model} (attempt {attempt + 1}/{max_attempts})",
+                            full_content=f"Retry #{attempt + 1} with {current_model} after {_classify_llm_error(last_error)} error",
+                            model=current_model,
+                            retry_count=attempt,
+                            error_type=_classify_llm_error(last_error) if last_error else "unknown",
+                        ))
+                        if reporter:
+                            reporter.log_info(f"[LLM] Retry {attempt + 1}/{max_attempts} with {current_model} (reason: {_classify_llm_error(last_error)})")
+
+                    response = await self.client.chat.completions.create(
+                        model=current_model,
+                        messages=messages,
+                        temperature=temperature,
+                        max_tokens=max_tokens
                     )
-                if self.config.cache.get("enabled", True):
-                    get_cache().set(cache_key, raw_content.strip(), stage, model)
-                if progress_cb:
-                    progress_cb(f"LLM response from {model}", 100)
-                return raw_content.strip()
 
-            except Exception as e:
-                if progress_cb:
-                    progress_cb(f"Model {model} failed, trying fallback...", 30)
-                print(f"[WARN] LLM call failed with model {model}: {e}")
-                with self._metrics_lock:
-                    self._model_fallbacks += 1
-                continue
+                    raw_content = response.choices[0].message.content
+                    if raw_content is None:
+                        finish_reason = response.choices[0].finish_reason
+                        refusal = getattr(response.choices[0].message, 'refusal', None)
+                        raise RuntimeError(
+                            f"NVIDIA API returned empty content. "
+                            f"Finish reason: {finish_reason}. "
+                            f"Refusal: {refusal}"
+                        )
 
-        raise RuntimeError(f"All NIM models failed for stage {stage}")
+                    raw_content = raw_content.strip()
+                    usage = getattr(response, 'usage', None)
+                    token_count = ""
+                    if usage:
+                        token_count = f" ({usage.completion_tokens} out / {usage.prompt_tokens} in tokens)"
+
+                    if self.config.cache.get("enabled", True):
+                        get_cache().set(cache_key, raw_content, stage, current_model)
+
+                    if interactions is not None:
+                        interactions.append(LLMInteraction(
+                            timestamp=_now_timestamp(),
+                            type="response",
+                            role="assistant",
+                            content=_truncate_preview(raw_content),
+                            full_content=raw_content,
+                            model=current_model,
+                            retry_count=attempt,
+                        ))
+                        if reporter:
+                            reporter.log_info(f"[LLM] Response received{token_count} from {current_model}")
+
+                    if progress_cb:
+                        progress_cb(f"LLM response from {current_model}", 100)
+
+                    return raw_content
+
+                except Exception as e:
+                    last_error = e
+                    error_type = _classify_llm_error(e)
+                    err_preview = _truncate_preview(str(e), 200)
+
+                    if interactions is not None:
+                        interactions.append(LLMInteraction(
+                            timestamp=_now_timestamp(),
+                            type="error",
+                            role="assistant",
+                            content=f"[{error_type.upper()}] {err_preview}",
+                            full_content=str(e),
+                            model=current_model,
+                            retry_count=attempt,
+                            error_type=error_type,
+                        ))
+                        if reporter:
+                            reporter.log_warn(f"[LLM] Error with {current_model} (attempt {attempt + 1}): {error_type} — {err_preview[:100]}")
+
+                    if attempt < max_attempts - 1:
+                        delay = backoff_delays[min(attempt, len(backoff_delays) - 1)]
+                        if reporter:
+                            reporter.log_info(f"[LLM] Backoff {delay}s before retry {attempt + 2} with {current_model}")
+                        await asyncio.sleep(delay)
+                    else:
+                        if reporter:
+                            reporter.log_warn(f"[LLM] Model {current_model} exhausted all {max_attempts} retries")
+                        with self._metrics_lock:
+                            self._model_fallbacks += 1
+                        break  # Try next model
+
+        raise RuntimeError(f"All NIM models failed for stage {stage}. Last error: {last_error}")
 
     async def call_llm_with_fallback(
         self,
@@ -322,11 +571,14 @@ class LLMProvider:
         model: Optional[str] = None,
         temperature: float = 0.1,
         max_tokens: int = 65536,
-        progress_cb: Optional[Callable[[str, float], None]] = None
+        progress_cb: Optional[Callable[[str, float], None]] = None,
+        reporter: Optional[Any] = None,
+        interactions: Optional[List[LLMInteraction]] = None,
     ) -> str:
         try:
             return await self.call_llm(
-                messages, stage, job_id, model, temperature, max_tokens, progress_cb
+                messages, stage, job_id, model, temperature, max_tokens, progress_cb,
+                reporter=reporter, interactions=interactions,
             )
         except Exception as e:
             if fallback_fn:
@@ -334,6 +586,19 @@ class LLMProvider:
                     self._fallback_used += 1
                 if progress_cb:
                     progress_cb("Using local heuristic fallback...", 50)
+                if reporter:
+                    reporter.log_info("[LLM] All models failed, using local heuristic fallback")
+                if interactions is not None:
+                    interactions.append(LLMInteraction(
+                        timestamp=_now_timestamp(),
+                        type="retry",
+                        role="system",
+                        content="Falling back to local heuristic (all LLM models failed)",
+                        full_content=str(e),
+                        model="fallback",
+                        retry_count=0,
+                        error_type="fallback",
+                    ))
                 return fallback_fn()
             raise
 
