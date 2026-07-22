@@ -63,6 +63,8 @@ class LLMInteraction(BaseModel):
     model: str = ""
     retry_count: int = 0
     error_type: str = ""  # "timeout" | "rate_limit" | "connection" | "json_parse" | "empty_content" | "unknown"
+    token_count: str = ""  # e.g., "1500 out / 45000 in tokens" — for UI display of token usage, only populated on response type
+    stage_name: str = ""  # e.g., "reel_plan", "reel_plan_retry" — the pipeline stage this interaction belongs to
 
 
 class JobStatus(StrEnum):

@@ -32,10 +32,10 @@ NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
 NVIDIA_MODEL = os.environ.get("NVIDIA_MODEL", "stepfun-ai/step-3.7-flash")
 NVIDIA_MODEL_FALLBACK = os.environ.get("NVIDIA_MODEL_FALLBACK", "stepfun-ai/step-3.7-flash")
 
-CLIP_COUNT_MIN = int(os.environ.get("CLIP_COUNT_MIN", "5"))
-CLIP_COUNT_MAX = int(os.environ.get("CLIP_COUNT_MAX", "8"))
+CLIP_COUNT_MIN = int(os.environ.get("CLIP_COUNT_MIN", "6"))
+CLIP_COUNT_MAX = int(os.environ.get("CLIP_COUNT_MAX", "12"))
 CLIP_DURATION_SOFT_MIN = float(os.environ.get("CLIP_DURATION_SOFT_MIN", "10"))
-CLIP_DURATION_SOFT_MAX = float(os.environ.get("CLIP_DURATION_SOFT_MAX", "15"))
+CLIP_DURATION_SOFT_MAX = float(os.environ.get("CLIP_DURATION_SOFT_MAX", "30"))
 HOOK_SECONDS = float(os.environ.get("HOOK_SECONDS", "3"))
 INSIGHT_SECONDS_MAX = float(os.environ.get("INSIGHT_SECONDS_MAX", "4"))
 MIN_OUTPUT_DURATION = int(os.environ.get("MIN_OUTPUT_DURATION", "90"))

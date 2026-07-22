@@ -214,8 +214,9 @@ def _build_reel_plan_prompt(video_title: str, video_description: str, transcript
                            source_duration: float = 0.0) -> str:
     """Build the full LLM prompt for reel_plan generation.
 
-    All numeric targets are quality-ceiling bounds. Quality > Quantity:
-    the LLM is empowered to generate fewer groups if content is sparse.
+    CRITICAL: Targets are NOW HARDCORE LOWER-BOUNDS, not ceilings.
+    Reels MUST be 90-150 seconds long with rich coverage.
+    The LLM is told these are MINIMUM requirements, not suggestions.
 
     Deterministic by design: temperature=0.0, seed=42, concrete specs.
     """
@@ -225,7 +226,25 @@ def _build_reel_plan_prompt(video_title: str, video_description: str, transcript
                       "with different narrative angles and commentary. What makes each group distinct is "
                       "the story framing and narration, not unique footage.")
 
+    # Parse reel_duration_target to extract min/max
+    dur_parts = reel_duration_target.split("-")
+    try:
+        dur_min = int(dur_parts[0])
+        dur_max = int(dur_parts[1])
+    except (IndexError, ValueError):
+        dur_min, dur_max = 90, 150
+
+    # Build a recommended clip count that ensures we hit the duration target
+    # Average clip = 12s, need 90s => 7-8 clips minimum; 150s => 12-13 clips
+    recommended_clip_count = max(5, round(dur_min / 12))
+    max_recommended_clips = min(20, round(dur_max / 8) + 2)
+
     return f"""You are an expert short-form content editor. Your job is to analyze the source video and output ONLY high-retention vertical YouTube Shorts / Reels that tell a complete, engaging story.
+
+===== CRITICAL: DURATION REQUIREMENT =====
+Each reel group MUST be {dur_min}-{dur_max} seconds long. This is a HARD MINIMUM. Do NOT produce reels shorter than {dur_min} seconds unless the source video itself is shorter than {dur_min} seconds.
+FAILURE MODE: If your selected clips and narration only sum to 40-60 seconds, ADD MORE CLIPS. You need ENOUGH content to fill {dur_min}s.
+Total estimated duration = sum(clip durations) + sum(narration durations) + 2s padding. Calculate this explicitly and adjust clip count until it reaches {dur_min}s minimum.
 
 ===== SOURCE VIDEO =====
 Title: {video_title}
@@ -243,26 +262,29 @@ Transcript (timestamps in seconds):
 
 ===== EXACT SPECIFICATIONS =====
 - Number of reel_groups: 1 to {max_groups} (Upper limit: {max_groups})
-- Clips per group: {clips_per_group} clips (each 3-25 seconds from source)
+- Clips per group: {clips_per_group} clips (each 8-25 seconds from source — PREFER LONGER CLIPS 12-25s for substantial content, short 3-8s clips only for rapid-fire moments)
+- RECOMMENDED total clips per group: {recommended_clip_count}-{max_recommended_clips} (select enough to fill {dur_min}s minimum)
 - Narration events per group: {narration_per_group} (including the hook)
-- Target reel duration: {reel_duration_target} seconds per group
+- Target reel duration: {reel_duration_target} seconds per group (ABSOLUTE MINIMUM {dur_min}s per group)
 - All clip timestamps MUST be within 0.0 to {source_duration:.1f}
 {reuse_note}
 
 ===== CLIP SELECTION RULES =====
 Select clips by scanning the transcript chronologically. Prefer:
-1. Action / movement / visual spectacle
-2. Emotional reactions (faces, laughter, shock, triumph)
-3. Key dialogue with specific numbers, claims, or reveals
-4. Humor, surprises, or absurd moments
-5. Before/after contrasts or turning points
+1. Action / movement / visual spectacle (take 12-20s segments, not just 3s cuts)
+2. Emotional reactions (faces, laughter, shock, triumph — extend to capture full reaction)
+3. Key dialogue with specific numbers, claims, or reveals (take whole exchange, 15-25s)
+4. Humor, surprises, or absurd moments (let the bit breathe, 10-20s)
+5. Before/after contrasts or turning points (show full transformation, 15-25s)
 
-Do NOT select:
-- Dead air / silence with nothing happening
-- Pure title cards or logos
-- Extended filler (5+ seconds of "um", "uh", stammering)
+CRITICAL SPREAD RULE: Distribute clips across early (0-25%), middle (25-75%), and late (75-100%) portions of the video. Do NOT take all clips from the first few minutes. Each group should sample broadly from the source.
 
-Short clips (3-8s) are fine — tight cuts build energy.
+===== CLIP LENGTH GUIDELINES =====
+- 8-12s: Tight moments, reactions, quick jokes
+- 12-18s: Standard clips with dialogue/exposition (SWEET SPOT)
+- 18-25s: Extended sequences, demonstrations, stories
+- LESS THAN 8s: Only for rapid-fire montages or punchlines. Avoid <6s clips.
+- TOTAL clip content per group should sum to at LEAST {dur_min - 10}s (so narration + padding fills the rest)
 
 ===== NARRATION RULES =====
 Hook (event_type: "hook"):
@@ -272,7 +294,8 @@ Hook (event_type: "hook"):
 
 Commentary (event_type: "commentary"):
 - 8-14 words each. Adds context the viewer can't get from footage alone.
-- Distribute across the reel timeline: one near middle, one near end.
+- HAVE AT LEAST 3-4 commentary events spread across the reel to maintain narrative flow.
+- Distribute across the reel timeline: one near middle (25-40%), one near end (60-80%), one for payoff (85-95%).
 - BANNED: "As you can see", "Notice how"
 
 The video system ducks original audio to ~3% during narration — place narration anywhere, even over dialogue.
@@ -283,6 +306,17 @@ Allowed characters: letters, numbers, . , ! ? ' - — " : ;
 BANNED: / \\ | * # _ < > [ ] {{ }}
 Use contractions. Be conversational.
 
+===== BEFORE OUTPUTTING, VERIFY =====
+1. Calculate: total_clip_duration = sum of (source_end - source_start) for all clips
+2. Calculate: total_narration_duration = sum of (reel_end - reel_start) for all narration events
+3. Calculate: estimated_duration = total_clip_duration + total_narration_duration + 2.0
+4. Is estimated_duration >= {dur_min}?
+   - If NO: Add more clips or extend clip durations until it is.
+   - If YES: Ensure estimated_duration does not exceed {dur_max}. Adjust if needed.
+5. Set estimated_duration_seconds = estimated_duration from step 3.
+6. Are clips spread across early/middle/late sections of the video?
+   - If NO: Replace some clips to ensure broad coverage.
+
 ===== OUTPUT (STRICT JSON) =====
 Output ONLY valid JSON. No markdown. No explanation.
 Use "source_start" and "source_end" for clip timestamps.
@@ -291,7 +325,7 @@ Use "source_start" and "source_end" for clip timestamps.
   "reel_groups": [
     {{
       "group_index": 0,
-      "group_reasoning": "Why these clips form a compelling arc",
+      "group_reasoning": "Why these clips form a compelling arc (include estimated duration breakdown)",
       "estimated_duration_seconds": 90.0,
       "reel_summary": {{
         "title": "Scroll-stopping title (max 60 chars)",
@@ -301,13 +335,15 @@ Use "source_start" and "source_end" for clip timestamps.
         "key_moment": "The payoff moment"
       }},
       "source_clips": [
-        {{"source_start": 0.0, "source_end": 8.0, "reason": "SETUP: ..."}},
-        {{"source_start": 15.0, "source_end": 22.0, "reason": "TENSION: ..."}},
-        {{"source_start": 30.0, "source_end": 40.0, "reason": "PAYOFF: ..."}}
+        {{"source_start": 0.0, "source_end": 15.0, "reason": "SETUP: Hook viewers with opening scene"}},
+        {{"source_start": 45.0, "source_end": 60.0, "reason": "TENSION: Build with key dialogue (15s)"}},
+        {{"source_start": 120.0, "source_end": 138.0, "reason": "PAYOFF: Climax moment (18s)"}}
       ],
       "narration_events": [
-        {{"event_type": "hook", "reel_start": 0.0, "reel_end": 3.0, "text": "...", "voice_id": null}},
-        {{"event_type": "commentary", "reel_start": 20.0, "reel_end": 23.5, "text": "...", "voice_id": null}}
+        {{"event_type": "hook", "reel_start": 0.0, "reel_end": 3.0, "text": "This changes everything we know about...", "voice_id": null}},
+        {{"event_type": "commentary", "reel_start": 25.0, "reel_end": 28.0, "text": "Notice what happens right here — pure genius.", "voice_id": null}},
+        {{"event_type": "commentary", "reel_start": 55.0, "reel_end": 58.0, "text": "This is the moment everything clicked for me.", "voice_id": null}},
+        {{"event_type": "commentary", "reel_start": 80.0, "reel_end": 83.0, "text": "And that's why this approach works so well.", "voice_id": null}}
       ]
     }}
   ]
@@ -368,20 +404,49 @@ def select_reel_plan(
 
     # Compute per-group specs proportional to source duration
     import math
-    clips_min = max(2, min(6, math.ceil(source_duration / 12)))
-    clips_max = max(clips_min + 1, min(8, math.ceil(source_duration / 8)))
-    clips_per_group = f"{clips_min}-{clips_max}"
-
-    reel_dur_min = max(30, min(int(source_duration * 0.7), 90))
-    reel_dur_max = max(reel_dur_min + 20, min(int(source_duration * 1.5), 180))
+    
+    # AGGRESSIVE DURATION TARGETS: aim for 90-150s per group as the primary target
+    # For very short source videos (< 150s), target 60-90% of source duration
+    # For longer sources (>= 150s), target 90-150s
+    if source_duration < 120:
+        # Short source: target 60-90% but min 45s
+        reel_dur_min = max(45, int(source_duration * 0.6))
+        reel_dur_max = min(int(source_duration * 0.9), 120)
+    elif source_duration < 300:
+        # Medium source: target 90-150s
+        reel_dur_min = max(60, min(90, int(source_duration * 0.5)))
+        reel_dur_max = min(150, int(source_duration * 0.8))
+    else:
+        # Long source (5+ min): target 90-150s hardcore
+        reel_dur_min = 90
+        reel_dur_max = 150
+    
+    # Ensure at least 30s spread between min/max
+    if reel_dur_max - reel_dur_min < 30:
+        reel_dur_max = reel_dur_min + 30
+    # Hard cap at config max
+    reel_dur_max = min(reel_dur_max, int(MAX_OUTPUT_DURATION))
     reel_duration_target = f"{reel_dur_min}-{reel_dur_max}"
-
-    narr_min = max(2, min(4, math.ceil(reel_dur_min / 30)))
-    narr_max = max(narr_min, min(5, math.ceil(reel_dur_max / 30)))
+    
+    # More clips: need 6-12 clips to fill 90-150s with 10-18s average clip length
+    # Compute clips range based on duration target
+    clips_min = max(3, math.floor(reel_dur_min / 18))  # fewest clips if all 18s
+    clips_max = max(clips_min + 2, math.ceil(reel_dur_max / 8))  # most clips if all 8s
+    # Clamp to reasonable range
+    clips_min = min(clips_min, clips_max - 1)
+    clips_min = max(3, min(clips_min, 8))
+    clips_max = max(clips_min + 2, min(clips_max, 16))
+    clips_per_group = f"{clips_min}-{clips_max}"
+    
+    # More narration: 3-6 events to fill narrative arc
+    narr_min = max(3, math.ceil(reel_dur_min / 30))
+    narr_max = max(narr_min + 1, math.ceil(reel_dur_max / 25))
+    narr_min = min(narr_min, 4)
+    narr_max = max(4, min(narr_max, 8))
     narration_per_group = f"{narr_min}-{narr_max}"
 
-    print(f"[INFO] Targeting {min_groups}-{max_groups} groups for {source_duration:.1f}s video "
-          f"(clips: {clips_per_group}, narration: {narration_per_group}, duration: {reel_duration_target}s)")
+    print(f"[INFO] AGGRESSIVE TARGETS for {source_duration:.1f}s video: "
+          f"{min_groups}-{max_groups} groups, clips: {clips_per_group}, narration: {narration_per_group}, duration: {reel_duration_target}s (min {reel_dur_min}s per group)")
 
     prompt = _build_reel_plan_prompt(
         video_title, description, transcript_text,
@@ -479,8 +544,8 @@ def select_reel_plan(
         if "narration_events" not in group or not isinstance(group["narration_events"], list):
             raise RuntimeError(f"LLM failed: Group {i} missing valid 'narration_events'")
 
-        if group.get("estimated_duration_seconds", 0) > 130:
-            print(f"[WARN] Group {i} estimated duration {group['estimated_duration_seconds']}s exceeds 130s cap")
+        if group.get("estimated_duration_seconds", 0) > int(MAX_OUTPUT_DURATION):
+            print(f"[WARN] Group {i} estimated duration {group['estimated_duration_seconds']}s exceeds {MAX_OUTPUT_DURATION}s cap")
 
         print(f"\n[INFO] Group {i} Narration Events:")
         usable_count = 0
@@ -596,6 +661,34 @@ def select_reel_plan(
     avg_duration = sum(g.get("estimated_duration_seconds", 0) for g in groups) / max(len(groups), 1)
     print(f"[INFO] REEL PLAN STATS: {len(groups)} groups, {total_clips} total clips, "
           f"{total_narrations} total narrations, avg duration {avg_duration:.1f}s")
+
+    # ===== POST-PROCESSING DURATION ENFORCEMENT =====
+    # Ensure each group's total clip duration + narration + padding hits the minimum target
+    # If a group is too short, warn and log the shortfall (the compositor will have to pad)
+    min_reel_dur = reel_dur_min  # from above computation
+    for i, group in enumerate(groups):
+        clips = group.get("source_clips", [])
+        clips_total = sum(c.get("source_end", 0) - c.get("source_start", 0) for c in clips)
+        nar_events = group.get("narration_events", [])
+        nar_total = sum(e.get("reel_end", 0) - e.get("reel_start", 0) for e in nar_events)
+        actual_estimated = clips_total + nar_total + 2.0
+
+        # Re-set estimated_duration_seconds to the computed actual if LLM estimate is too far off
+        llm_estimate = group.get("estimated_duration_seconds", 0)
+        if llm_estimate < min_reel_dur and source_duration >= min_reel_dur:
+            print(f"[WARN] Group {i}: LLM estimated_duration_seconds={llm_estimate:.1f}s is below target {min_reel_dur}s. "
+                  f"Actual computed: {actual_estimated:.1f}s (clips={clips_total:.1f}s, narration={nar_total:.1f}s).")
+
+        # Bump estimated_duration_seconds to at least the computed actual
+        if actual_estimated > llm_estimate:
+            print(f"[INFO] Group {i}: Raising estimated_duration_seconds from {llm_estimate:.1f}s to {actual_estimated:.1f}s (computed from {len(clips)} clips + {len(nar_events)} events + 2s pad)")
+            group["estimated_duration_seconds"] = round(actual_estimated, 1)
+
+        # Log detailed per-group report
+        print(f"[INFO] Group {i} DURATION REPORT: clips={clips_total:.1f}s ({len(clips)} clips), "
+              f"narration={nar_total:.1f}s ({len(nar_events)} events), "
+              f"estimated={group['estimated_duration_seconds']:.1f}s, "
+              f"target_range={reel_duration_target}s")
 
     # Broadcast final interactions state
     if reporter and interactions is not None:

@@ -190,25 +190,34 @@ def compose_group(
     target_duration = min(target_duration, float(MAX_OUTPUT_DURATION))
     pad_duration = target_duration - total_clip_duration
 
-    # Cap the tpad freeze: a freeze longer than 3 s is the video-freeze bug.
-    # This happens when the analyzer selects far fewer clips than MIN_OUTPUT_DURATION
-    # or estimated_duration_seconds requires.  We allow up to 3-second grace freeze
-    # (e.g. for a last-scene hold) but refuse to freeze for longer.
-    MAX_FREEZE_PAD = 3.0
+    # TARGET DURATION CALCULATION (IMPROVED):
+    # We now respect estimated_duration_seconds as a strong signal, not a weak hint.
+    # MAX_FREEZE_PAD increased to 12s to allow longer freeze-padding on valid long reels.
+    # The analyzer now produces 90-150s groups, so we need to allow proportionally more pad.
+    #
+    # Strategy:
+    # 1. Start with max(total_clip_duration, max_narration_end, estimated_duration_seconds, MIN_OUTPUT_DURATION)
+    # 2. Allow freeze-pad up to MAX_FREEZE_PAD to fill the gap
+    # 3. Clamp to MAX_OUTPUT_DURATION
+    # 4. If pad exceeds MAX_FREEZE_PAD, cap pad to MAX_FREEZE_PAD and let audio run longer via silence
+    
+    MAX_FREEZE_PAD = 12.0  # Increased from 3.0 to allow longer freeze-padding for 90-150s target reels
+    
     if pad_duration > MAX_FREEZE_PAD:
-        # If narration extends past clip content, give it room — but still cap at 3 s.
         # narration_tail is how far narration reaches past the last video frame.
         narration_tail = max(0.0, max_narration_end - total_clip_duration)
-        allowed_pad = min(MAX_FREEZE_PAD, narration_tail) if narration_tail > 0 else MAX_FREEZE_PAD
+        # Allow more pad when there's narration tail to cover, up to MAX_FREEZE_PAD
+        allowed_pad = min(MAX_FREEZE_PAD, max(narration_tail, MAX_FREEZE_PAD * 0.5))
 
-        print(f"[WARN] Group {group_idx}: clip content ({total_clip_duration:.1f}s) far short of "
-              f"target ({target_duration:.1f}s) — capping freeze pad to {allowed_pad:.1f}s "
-              f"(was {pad_duration:.1f}s, narration_tail={narration_tail:.1f}s).  "
-              f"Audio will be padded with silence instead.")
+        print(f"[INFO] Group {group_idx}: clip content ({total_clip_duration:.1f}s) short of "
+              f"target ({target_duration:.1f}s) — using freeze pad {allowed_pad:.1f}s "
+              f"(was {pad_duration:.1f}s cap, narration_tail={narration_tail:.1f}s). "
+              f"Audio will be padded with silence beyond freeze.")
 
-        # Identify narration events whose reel_end exceeds total_clip_duration + allowed_pad.
-        # These would be silently truncated; instead warn and drop them.
-        capped_limit = total_clip_duration + allowed_pad
+        # Only drop narration events if they'd be lost beyond video+freeze end.
+        # Previously we capped at total_clip_duration + allowed_pad, but now with
+        # larger pad allowance we can accommodate more narration without dropping.
+        capped_limit = total_clip_duration + min(MAX_FREEZE_PAD, max(narration_tail, 3.0))
         truncated_events = [
             nar for nar in narration_audio
             if nar.get("reel_end", 0) > capped_limit
@@ -225,8 +234,6 @@ def compose_group(
             # narration_audio and narration_caption_paths are index-correlated (built in
             # the same order in queue_manager).  Zip them together, apply the same
             # reel_end <= capped_limit filter, then unzip so both lists stay in sync.
-            # This prevents an ASS subtitle file being baked into the video filter for
-            # an event whose audio track was just dropped.
             paired = list(zip(narration_audio, narration_caption_paths))
             paired = [(nar, cap) for nar, cap in paired if nar.get("reel_end", 0) <= capped_limit]
             if paired:

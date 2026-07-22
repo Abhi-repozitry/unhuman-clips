@@ -84,6 +84,8 @@ def call_llm_sync(
     max_attempts_per_model = 5
 
     last_error = None
+    # Track prompt content for reporter logging (defined before if-interactions block for scope safety)
+    prompt_content = ""
 
     # Capture the initial prompt as an interaction
     if interactions is not None:
@@ -98,6 +100,7 @@ def call_llm_sync(
             full_content=prompt_content,
             model=model,
             retry_count=0,
+            stage_name=stage_name,
         ))
         if system_msg:
             interactions.append(LLMInteraction(
@@ -108,11 +111,16 @@ def call_llm_sync(
                 full_content=system_msg.get("content", ""),
                 model=model,
                 retry_count=0,
+                stage_name=stage_name,
             ))
-        if reporter:
-            prompt_preview = _truncate_preview(prompt_content, 120)
-            reporter.log_info(f"[LLM] Prompt sent ({stage_name}) — {len(prompt_content)} chars")
-            # Broadcast live interactions to UI during LLM processing
+    if reporter:
+        # Compute prompt_content preview for logging even if interactions is None
+        if not prompt_content:
+            prompt_content = json.dumps(messages, indent=2) if isinstance(messages, list) else str(messages)
+        prompt_preview = _truncate_preview(prompt_content, 120)
+        reporter.log_info(f"[LLM] Prompt sent ({stage_name}) — {len(prompt_content)} chars")
+        # Broadcast live interactions to UI during LLM processing (only if interactions exist)
+        if interactions is not None:
             reporter.set_stage_data_key("llm_interactions", [i.model_dump() for i in interactions])
 
     for m_idx, current_model in enumerate(models_to_try):
@@ -173,6 +181,7 @@ def call_llm_sync(
                         full_content=raw,
                         model=current_model,
                         retry_count=attempt,
+                        token_count=token_count.strip() if token_count else "",
                     ))
                     if reporter:
                         reporter.log_info(f"[LLM] Response received{token_count} from {current_model}")
