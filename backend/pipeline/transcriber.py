@@ -128,9 +128,13 @@ def _load_model():
 
     allow_cpu_fallback = os.environ.get("ALLOW_CPU_WHISPER_FALLBACK") == "1"
     errors = []
-    attempts = [("cuda", WHISPER_COMPUTE_TYPE_CUDA, "CUDA")]
+    attempts = [
+        ("cuda", WHISPER_COMPUTE_TYPE_CUDA, f"CUDA ({WHISPER_COMPUTE_TYPE_CUDA})"),
+        ("cuda", "float16", "CUDA (float16)"),
+        ("cuda", "int8", "CUDA (int8)")
+    ]
     if allow_cpu_fallback:
-        attempts.append(("cpu", WHISPER_COMPUTE_TYPE_CPU, "CPU"))
+        attempts.append(("cpu", WHISPER_COMPUTE_TYPE_CPU, f"CPU ({WHISPER_COMPUTE_TYPE_CPU})"))
 
     for device, compute_type, label in attempts:
         try:
@@ -166,14 +170,27 @@ def transcribe_video(video_path: str, progress_cb: Optional[Callable[[str, float
         raise FileNotFoundError(f"Video file not found: {video_path}")
 
     try:
-        segments, info = _model.transcribe(video_path, word_timestamps=False)
+        segments, info = _model.transcribe(video_path, word_timestamps=True)
         result = []
         seg_list = list(segments)
         total = len(seg_list)
         for i, seg in enumerate(seg_list):
             text = seg.text.strip()
             if text:
-                result.append({"start": seg.start, "end": seg.end, "text": text})
+                words_info = []
+                if hasattr(seg, "words") and seg.words:
+                    for w in seg.words:
+                        words_info.append({
+                            "word": w.word.strip(),
+                            "start": round(w.start, 2),
+                            "end": round(w.end, 2)
+                        })
+                result.append({
+                    "start": round(seg.start, 2),
+                    "end": round(seg.end, 2),
+                    "text": text,
+                    "words": words_info
+                })
             if progress_cb:
                 progress_cb(f"Transcribing segment {i+1}/{total}", ((i + 1) / total) * 100)
         return result

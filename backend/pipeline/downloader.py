@@ -75,8 +75,18 @@ def download_video(url: str, out_dir: str, progress_hook, max_retries: int = 4) 
         format_selector = f"best[ext=mp4][height<={DOWNLOAD_MAX_HEIGHT}][vcodec!=none][acodec!=none]/best[ext=mp4][height<={DOWNLOAD_MAX_HEIGHT}]/best[height<={DOWNLOAD_MAX_HEIGHT}]/best"
         postprocessors = []
 
-    # Cookie file for YouTube auth (if exists)
-    cookie_file = Path(__file__).resolve().parent.parent.parent / "cookies.txt"
+    # Cookie file for YouTube auth — check multiple standard locations
+    root_dir = Path(__file__).resolve().parent.parent.parent
+    desktop_dir = Path.home() / "Desktop"
+    cookie_candidates = [
+        root_dir / "cookies.txt",
+        desktop_dir / "cookies.txt",
+        desktop_dir / "antigravity.google_cookies.txt",
+        root_dir / "backend" / "storage" / "cookies.txt",
+        root_dir / "backend" / "cookies.txt",
+    ]
+    found_cookie = next((p for p in cookie_candidates if p.exists() and p.stat().st_size > 0), None)
+
     ydl_opts = {
         "format": format_selector,
         "outtmpl": outtmpl,
@@ -86,8 +96,9 @@ def download_video(url: str, out_dir: str, progress_hook, max_retries: int = 4) 
         # Avoid resuming/using stale partials when rerunning the same job URL
         "continue_dl": False,
         "overwrites": True,
-        # Force extracting full info so we get title, description, etc.
-        "extract_flat": False,
+        # Enable Node.js EJS challenge solver for YouTube JS challenges
+        "remote_components": ["ejs:github"],
+        "js_runtimes": {"node": {}},
         # Network robustness: socket timeout and retry settings
         "socket_timeout": 30,
         "retries": 5,
@@ -101,8 +112,9 @@ def download_video(url: str, out_dir: str, progress_hook, max_retries: int = 4) 
         ffmpeg_dir = str(Path(FFMPEG_PATH).parent)
         ydl_opts["ffmpeg_location"] = ffmpeg_dir
 
-    if cookie_file.exists():
-        ydl_opts["cookiefile"] = str(cookie_file)
+    if found_cookie:
+        print(f"[INFO] Using YouTube cookie file: {found_cookie}")
+        ydl_opts["cookiefile"] = str(found_cookie)
 
     if postprocessors is not None:
         ydl_opts["postprocessors"] = postprocessors
@@ -119,6 +131,12 @@ def download_video(url: str, out_dir: str, progress_hook, max_retries: int = 4) 
         except Exception as e:
             last_error = e
             err_str = str(e).lower()
+
+            if "sign in to confirm you're not a bot" in err_str or "cookies for the authentication" in err_str:
+                print(f"[WARN] YouTube bot check triggered on attempt {attempt}.")
+                # Non-retryable without cookies
+                break
+
             # Classify as retryable or fatal
             retryable_keywords = [
                 "timed out", "timeout", "connection reset",
@@ -142,6 +160,15 @@ def download_video(url: str, out_dir: str, progress_hook, max_retries: int = 4) 
                     break  # non-retryable error, don't keep trying
 
     if last_error is not None:
+        err_msg = str(last_error)
+        if "sign in to confirm you're not a bot" in err_msg.lower():
+            target_cookie_path = root_dir / "cookies.txt"
+            raise RuntimeError(
+                "YouTube requires authentication cookies for this video.\n"
+                "FIX: Export your YouTube cookies from your browser (e.g. using the 'Get cookies.txt LOCALLY' Chrome/Edge extension) "
+                f"and save the exported file as:\n  {target_cookie_path}"
+            ) from last_error
+
         raise RuntimeError(
             f"Download failed after {max_retries} attempts. Last error: {last_error}"
         ) from last_error

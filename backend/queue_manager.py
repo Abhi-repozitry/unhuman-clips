@@ -526,6 +526,8 @@ class QueueManager:
                 clean_text = _re.sub(r'([,!?;:]){2,}', r'\1', clean_text)
                 # Strip leading/trailing punctuation artifacts (but keep sentence-final punctuation)
                 clean_text = clean_text.strip(' ,-;:')
+                if not clean_text:
+                    clean_text = event.text or "Notice this key moment."
                 event.text = clean_text
 
                 job.stage_data = {
@@ -698,6 +700,7 @@ class QueueManager:
                 group_output_path,
                 group,
                 working_dir,
+                job.id,
             )
 
             job.outputs[group_idx].output_path = final_path
@@ -715,28 +718,34 @@ class QueueManager:
         reporter.log_info(f"Job {job.id} complete with {job.num_output_groups} output(s)")
         await self._broadcast(broadcast_fn, job)
 
-    def _final_edit_group(self, input_path: str, group: ReelGroup, working_dir) -> str:
-        """Light final validation - probe duration, ensure within configured bounds."""
+    def _final_edit_group(self, input_path: str, group: ReelGroup, working_dir, job_id: str) -> str:
+        """Light final validation - ensure output file exists inside OUTPUTS_DIR and duration is capped."""
         from backend.config import OUTPUTS_DIR, MAX_OUTPUT_DURATION
         import subprocess
+        import shutil
+
+        title_slug = "".join(c for c in (group.reel_summary.title or "reel") if c.isalnum() or c in (' ', '_', '-')).strip()
+        title_slug = title_slug.replace(' ', '_')[:40]
+        output_filename = f"{job_id}_reel_{group.group_index}_{title_slug}.mp4"
+        output_path = OUTPUTS_DIR / output_filename
+        output_path.parent.mkdir(parents=True, exist_ok=True)
 
         probe = subprocess.run(
             [FFPROBE_PATH, "-v", "error", "-show_entries", "format=duration",
              "-of", "default=noprint_wrappers=1:nokey=1", input_path],
             capture_output=True, text=True
         )
-        duration = float(probe.stdout.strip()) if probe.returncode == 0 else 0.0
+        duration = float(probe.stdout.strip()) if probe.returncode == 0 and probe.stdout.strip() else 0.0
 
         if duration > float(MAX_OUTPUT_DURATION):
-            output_path = OUTPUTS_DIR / f"{group.group_index}_{group.reel_summary.title[:50]}.mp4"
-            output_path.parent.mkdir(parents=True, exist_ok=True)
             subprocess.run(
                 [FFMPEG_PATH, "-loglevel", "error", "-i", input_path, "-t", str(MAX_OUTPUT_DURATION), "-c", "copy", "-y", str(output_path)],
                 check=True
             )
-            return str(output_path)
+        else:
+            shutil.copy2(input_path, output_path)
 
-        return input_path
+        return str(output_path)
 
     async def _probe_duration(self, path: str) -> float:
         import subprocess

@@ -50,9 +50,12 @@ class ProgressReporter:
         self._broadcast()
 
     def update_clip_progress(self, clip_index: int, status: str, progress: float = 0.0):
-        if self.job.clip_details and clip_index < len(self.job.clip_details):
-            self.job.clip_details[clip_index]["status"] = status
-            self.job.clip_details[clip_index]["progress"] = progress
+        if self.job.clip_details is None:
+            self.job.clip_details = []
+        while len(self.job.clip_details) <= clip_index:
+            self.job.clip_details.append({"index": len(self.job.clip_details), "status": "pending", "progress": 0.0})
+        self.job.clip_details[clip_index]["status"] = status
+        self.job.clip_details[clip_index]["progress"] = progress
         self._broadcast()
 
     def progress_callback(self, message: str, progress: float = 0.0):

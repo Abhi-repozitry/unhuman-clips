@@ -8,42 +8,22 @@ import re
 import shutil
 
 
+from backend.config import FFMPEG_PATH, FFPROBE_PATH
+
+
 def _get_ffmpeg_path() -> str:
-    candidates = [
-        "C:\\Users\\starr\\.vscode\\extensions\\kilocode.kilo-code-7.4.11-win32-x64\\bin\\ffmpeg.exe",
-        "C:\\Users\\starr\\.vscode\\extensions\\kilocode.kilo-code-7.4.9-win32-x64\\bin\\ffmpeg.exe",
-        "C:\\Users\\starr\\.vscode\\extensions\\.8abe98e8-0d96-44cc-a28c-f78f911caf54\\bin\\ffmpeg.exe",
-        "C:\\ffmpeg\\bin\\ffmpeg.exe",
-        "C:\\Program Files\\ffmpeg\\bin\\ffmpeg.exe",
-        "C:\\Program Files (x86)\\ffmpeg\\bin\\ffmpeg.exe",
-    ]
-    for c in candidates:
-        if os.path.exists(c):
-            return c
+    if os.path.exists(FFMPEG_PATH):
+        return FFMPEG_PATH
     path = shutil.which("ffmpeg")
     if path:
         return path
-    try:
-        import imageio_ffmpeg
-        return imageio_ffmpeg.get_ffmpeg_exe()
-    except ImportError:
-        pass
-    raise RuntimeError("ffmpeg not found. Please install ffmpeg and add it to PATH.")
+    raise RuntimeError("ffmpeg not found.")
 
 
 def _get_ffprobe_path() -> Optional[str]:
-    path = shutil.which("ffprobe")
-    if path:
-        return path
-    candidates = [
-        "C:\\ffmpeg\\bin\\ffprobe.exe",
-        "C:\\Program Files\\ffmpeg\\bin\\ffprobe.exe",
-        "C:\\Program Files (x86)\\ffmpeg\\bin\\ffprobe.exe",
-    ]
-    for c in candidates:
-        if os.path.exists(c):
-            return c
-    return None
+    if os.path.exists(FFPROBE_PATH):
+        return FFPROBE_PATH
+    return shutil.which("ffprobe")
 
 
 def get_video_duration(video_path: str) -> float:
@@ -76,7 +56,7 @@ def get_video_duration(video_path: str) -> float:
 def detect_silence_with_vad(
     video_path: str,
     threshold: float = 0.5,
-    min_silence_duration: float = 0.3,  # Reduced from 0.5 to catch more silence
+    min_silence_duration: float = 0.3,
     window_size: float = 0.1
 ) -> List[Dict[str, float]]:
     """Detect silent segments using Silero VAD.
@@ -140,17 +120,17 @@ def detect_silence_with_vad(
 
 def detect_silence_ffmpeg(
     video_path: str,
-    silence_threshold_db: float = -35.0,  # More sensitive (was -40)
-    silence_duration: float = 0.3  # Shorter minimum (was 0.5)
+    silence_threshold_db: float = -35.0,
+    silence_duration: float = 0.3
 ) -> List[Dict[str, float]]:
     """
     Detect silent segments using ffmpeg silencedetect filter.
-    More aggressive: lower threshold and shorter duration to catch more pauses.
+    Parses stateful start/end lines from FFmpeg output.
     """
     import re
 
     cmd = [
-        _get_ffmpeg_path(), "-loglevel", "error",
+        _get_ffmpeg_path(), "-loglevel", "info",
         "-i", str(video_path),
         "-af", f"silencedetect=n={silence_threshold_db}dB:d={silence_duration}",
         "-f", "null", "-",
@@ -166,16 +146,24 @@ def detect_silence_ffmpeg(
         )
 
         stderr = result.stderr
-        silence_pattern = re.compile(
-            r"silence_start: (\d+\.?\d*) \| silence_end: (\d+\.?\d*) \| silence_duration: (\d+\.?\d*)"
-        )
+        silence_start_re = re.compile(r"silence_start:\s*(\d+\.?\d*)")
+        silence_end_re = re.compile(r"silence_end:\s*(\d+\.?\d*)\s*\|\s*silence_duration:\s*(\d+\.?\d*)")
 
         silence_segments = []
-        for match in silence_pattern.finditer(stderr):
-            start = float(match.group(1))
-            end = float(match.group(2))
-            duration = float(match.group(3))
-            silence_segments.append({"start": start, "end": end, "duration": duration})
+        current_start = None
+
+        for line in stderr.splitlines():
+            start_match = silence_start_re.search(line)
+            if start_match:
+                current_start = float(start_match.group(1))
+                continue
+
+            end_match = silence_end_re.search(line)
+            if end_match and current_start is not None:
+                end = float(end_match.group(1))
+                dur = float(end_match.group(2))
+                silence_segments.append({"start": current_start, "end": end, "duration": dur})
+                current_start = None
 
         return silence_segments
 

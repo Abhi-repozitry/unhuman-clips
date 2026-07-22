@@ -366,3 +366,42 @@ def summarize_caption_detection(
         "caption_detection_generated": generated,
         "caption_detection_per_clip": per_clip
     }
+
+
+def extract_visual_scene_summary(video_path: str, duration: float, working_dir: str, sample_interval: float = 15.0) -> List[Dict[str, Any]]:
+    """
+    Sample keyframes at intervals across the video duration and detect text/graphics
+    to provide multimodal visual cues for LLM planning.
+    """
+    if duration <= 0:
+        return []
+
+    working_path = Path(working_dir)
+    working_path.mkdir(parents=True, exist_ok=True)
+    
+    timestamps = [round(t, 1) for t in np.arange(0, duration, max(10.0, sample_interval))]
+    visual_events = []
+
+    for idx, ts in enumerate(timestamps[:30]):  # Cap at 30 keyframe samples max
+        frame_path = str(working_path / f"keyframe_{idx}.jpg")
+        if not _extract_frame(video_path, ts, frame_path):
+            continue
+
+        ocr_res = _try_ocr_engine(frame_path)
+        extracted_text = ""
+        if ocr_res and ocr_res[0].get("text"):
+            extracted_text = ocr_res[0]["text"][:100].strip()
+
+        visual_events.append({
+            "timestamp": ts,
+            "has_screen_text": bool(extracted_text),
+            "screen_text": extracted_text
+        })
+
+        try:
+            if os.path.exists(frame_path):
+                os.remove(frame_path)
+        except OSError:
+            pass
+
+    return visual_events

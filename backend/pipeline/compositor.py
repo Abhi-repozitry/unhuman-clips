@@ -1,7 +1,7 @@
 import subprocess
 import os
 from pathlib import Path
-from backend.config import HOOK_SECONDS, OUTPUTS_DIR, get_job_working_dir, FFMPEG_PATH, FFPROBE_PATH
+from backend.config import HOOK_SECONDS, FFMPEG_PATH, FFPROBE_PATH
 from typing import Callable, Optional, List, Dict, Any
 
 
@@ -38,14 +38,24 @@ def _build_encoder_opts(encoder: str) -> list:
 
 
 def _run_ffmpeg(cmd: list, description: str, attempt: int = 1, max_attempts: int = 2, cwd: str = None):
-    """Run ffmpeg, retrying with CPU encoder if NVENC fails."""
+    """Run ffmpeg with a 600-second timeout, retrying with CPU encoder if NVENC fails.
+    Uses stderr=PIPE, stdout=DEVNULL to prevent pipe buffer deadlock on Windows."""
     try:
-        result = subprocess.run(cmd, capture_output=True, check=True, cwd=cwd)
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            check=True,
+            cwd=cwd,
+            timeout=600,
+        )
         return result
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"{description} timed out after 600 seconds. FFmpeg may be deadlocked or the input is too large.")
     except subprocess.CalledProcessError as e:
+        stderr_text = e.stderr.decode(errors="replace") if e.stderr else "(no stderr)"
         if attempt < max_attempts and "h264_nvenc" in " ".join(cmd) and os.environ.get("ALLOW_CPU_FFMPEG_FALLBACK") == "1":
-            stderr = e.stderr.decode() if e.stderr else ""
-            print(f"[WARN] NVENC failed for {description}, retrying with libx264: {stderr[:200]}")
+            print(f"[WARN] NVENC failed for {description}, retrying with libx264: {stderr_text[:200]}")
             new_cmd = []
             skip_next = False
             for j, arg in enumerate(cmd):
@@ -66,7 +76,7 @@ def _run_ffmpeg(cmd: list, description: str, attempt: int = 1, max_attempts: int
                 else:
                     new_cmd.append(arg)
             return _run_ffmpeg(new_cmd, description, attempt + 1, max_attempts, cwd=cwd)
-        raise RuntimeError(f"{description} failed: {e.stderr.decode() if e.stderr else 'unknown'}") from e
+        raise RuntimeError(f"{description} failed: {stderr_text[:1000]}") from e
 
 
 def _ass_filter(path: str) -> str:
@@ -237,10 +247,12 @@ def compose_group(
     # 1. Build video filter complex
     if use_precut:
         ffmpeg_video_inputs = []
-        for p in group_clip_paths:
+        video_filter_parts = []
+        for i, p in enumerate(group_clip_paths):
             ffmpeg_video_inputs.extend(["-i", str(p)])
-        concat_inputs = "".join(f"[{i}:v]" for i in range(n_clips))
-        video_filter_parts = [f"{concat_inputs}concat=n={n_clips}:v=1:a=0[base_v]"]
+            video_filter_parts.append(f"[{i}:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1[v{i}]")
+        concat_inputs = "".join(f"[v{i}]" for i in range(n_clips))
+        video_filter_parts.append(f"{concat_inputs}concat=n={n_clips}:v=1:a=0[base_v]")
     else:
         ffmpeg_video_inputs = ["-i", source_path]
         video_filter_parts = []
@@ -248,7 +260,7 @@ def compose_group(
             start = clip["source_start"]
             end = clip["source_end"]
             video_filter_parts.append(
-                f"[0:v]trim=start={start}:end={end},setpts=PTS-STARTPTS[v{i}]"
+                f"[0:v]trim=start={start}:end={end},setpts=PTS-STARTPTS,scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1[v{i}]"
             )
         concat_inputs = "".join(f"[v{i}]" for i in range(n_clips))
         video_filter_parts.append(f"{concat_inputs}concat=n={n_clips}:v=1:a=0[base_v]")
@@ -265,18 +277,24 @@ def compose_group(
     video_filter = ";".join(video_filter_parts)
 
     # Add clip captions (bottom)
-    clip_caption_filters = []
+    all_caption_filters = []
     last_v = last_video_label
+    caption_label_idx = 1
     for i, cap_path in enumerate(clip_caption_paths):
-        clip_caption_filters.append(f"[{last_v}]{_ass_filter(cap_path)}[v{i+1}]")
-        last_v = f"v{i+1}"
-    if clip_caption_filters:
-        video_filter += ";" + ";".join(clip_caption_filters)
+        next_label = f"vc{caption_label_idx}"
+        all_caption_filters.append(f"[{last_v}]{_ass_filter(cap_path)}[{next_label}]")
+        last_v = next_label
+        caption_label_idx += 1
 
     # Add narration captions (top)
     for i, cap_path in enumerate(narration_caption_paths):
-        video_filter += f";[{last_v}]{_ass_filter(cap_path)}[v{i+len(clip_caption_filters)+1}]"
-        last_v = f"v{i+len(clip_caption_filters)+1}"
+        next_label = f"vc{caption_label_idx}"
+        all_caption_filters.append(f"[{last_v}]{_ass_filter(cap_path)}[{next_label}]")
+        last_v = next_label
+        caption_label_idx += 1
+
+    if all_caption_filters:
+        video_filter += ";" + ";".join(all_caption_filters)
 
     video_output = working_dir / f"group_{group_idx}_video.mp4"
     ffmpeg_video = [
@@ -389,6 +407,7 @@ def compose_group(
             f"{duck_chain};"
             f"[1:a]volume=1.15[narr];"
             f"[ducked][narr]amix=inputs=2:duration=first:dropout_transition=0.1:normalize=0,"
+            f"alimiter=limit=0.95:attack=5:release=50,"
             f"apad=whole_dur={target_duration:.2f},atrim=end={target_duration:.2f}[mixed]",
             "-map", "[mixed]",
             "-c:a", "pcm_s16le", "-ar", "44100", "-ac", "2",
@@ -421,7 +440,8 @@ def compose_group(
     if progress_cb:
         progress_cb(f"Group {group_idx+1}: Final mux...", 85)
 
-    output_path = OUTPUTS_DIR / f"{job_id}_group{group_idx}.mp4"
+    # Write intermediate output to working_dir; _final_edit_group in queue_manager owns OUTPUTS_DIR placement.
+    output_path = working_dir / f"group_{group_idx}_output.mp4"
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     ffmpeg_final = [
@@ -433,10 +453,7 @@ def compose_group(
         "-shortest",
         "-y", str(output_path)
     ]
-    try:
-        subprocess.run(ffmpeg_final, capture_output=True, check=True)
-    except subprocess.CalledProcessError as e:
-        raise RuntimeError(f"Final mux failed: {e.stderr.decode() if e.stderr else 'unknown'}") from e
+    _run_ffmpeg(ffmpeg_final, f"Group {group_idx} final mux")
 
     actual_duration = _get_video_duration_seconds(str(output_path))
     if progress_cb:

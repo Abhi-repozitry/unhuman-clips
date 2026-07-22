@@ -194,7 +194,7 @@ def generate_commentary_ass(text: str, duration: float, out_path: str,
 
     start_ts = _format_timestamp(start_time)
     end_ts = _format_timestamp(start_time + duration)
-    text_escaped = _escape_ass_text(highlighted)
+    text_escaped = highlighted
 
     dialogue = (
         f"Dialogue: 0,{start_ts},{end_ts},CommentaryCaption,,0,0,0,,"
@@ -336,7 +336,7 @@ def generate_narration_ass(text: str, duration: float, out_path: str,
 
     start_ts = _format_timestamp(0.0)
     end_ts = _format_timestamp(duration)
-    text_escaped = _escape_ass_text(highlighted)
+    text_escaped = highlighted
 
     dialogue = (
         f"Dialogue: 0,{start_ts},{end_ts},NarrationCaption,,0,0,0,,"

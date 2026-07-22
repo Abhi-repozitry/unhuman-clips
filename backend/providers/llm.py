@@ -17,8 +17,8 @@ def call_llm_sync(
     model: str,
     api_key: str,
     base_url: str = "https://integrate.api.nvidia.com/v1",
-    temperature: float = 0.1,
-    max_tokens: int = 65536,
+    temperature: float = 0.0,
+    max_tokens: int = 131072,
     timeout: float = 480.0,
 ) -> str:
     """Synchronous LLM call with retry on failure and exponential backoff.
@@ -45,6 +45,7 @@ def call_llm_sync(
                     "temperature": temperature,
                     "max_tokens": max_tokens,
                     "timeout": timeout,
+                    "seed": 42,
                 }
                 try:
                     kwargs["response_format"] = {"type": "json_object"}
@@ -176,7 +177,7 @@ class LLMProvider:
     def get_model_config(self, stage: str) -> Tuple[str, str]:
         nvidia_config = self.config.providers.get("nvidia_nim", {})
         primary = nvidia_config.get("primary", "stepfun-ai/step-3.7-flash")
-        fallback = nvidia_config.get("fallback", "openai/gpt-oss-120b")
+        fallback = nvidia_config.get("fallback", "stepfun-ai/step-3.7-flash")
         return primary, fallback
 
     @staticmethod

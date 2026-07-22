@@ -1,10 +1,7 @@
 import subprocess
 import os
-from backend.config import CLIPS_DIR
 from typing import Callable, Optional, Any, List, Dict
-
-
-FFMPEG_PATH = r"C:\Projects\unhuman-clips\ffmpeg\ffmpeg-8.1.2-full_build\bin\ffmpeg.exe"
+from backend.config import CLIPS_DIR, FFMPEG_PATH
 
 
 def _get_encoder_opts() -> list[str]:
@@ -28,7 +25,7 @@ def _get_encoder_opts() -> list[str]:
 def cut_clips(source_path: str, clip_windows: list, job_id: str,
               progress_cb: Optional[Callable[[str, float], None]] = None,
               reporter: Optional[Any] = None) -> list[str]:
-    """Legacy flat clip cutting (kept for compatibility)."""
+    """Legacy flat clip cutting with fast input seeking."""
     clip_paths = []
     total = len(clip_windows)
     encoder_opts = _get_encoder_opts()
@@ -43,9 +40,10 @@ def cut_clips(source_path: str, clip_windows: list, job_id: str,
         if reporter:
             reporter.update_clip_progress(i, "clipping", ((i + 1) / total) * 100)
 
+        duration = max(0.1, end - start)
         cmd = [
-            FFMPEG_PATH, "-i", source_path,
-            "-ss", str(start), "-to", str(end),
+            FFMPEG_PATH, "-ss", str(start), "-i", source_path,
+            "-t", str(duration),
         ] + encoder_opts + ["-c:a", "aac", "-y", out_path]
 
         try:
@@ -67,7 +65,7 @@ def cut_group_clips(source_path: str, source_clips: List[Dict[str, float]], job_
                     progress_cb: Optional[Callable[[str, float], None]] = None,
                     reporter: Optional[Any] = None) -> List[str]:
     """
-    Cut clips for a single reel group from source_clips (with source_start/source_end).
+    Cut clips for a single reel group using fast input seeking (-ss before -i).
     Returns list of clip file paths.
     """
     clip_paths = []
@@ -84,9 +82,10 @@ def cut_group_clips(source_path: str, source_clips: List[Dict[str, float]], job_
         if reporter:
             reporter.update_clip_progress(i, "clipping", ((i + 1) / total) * 100)
 
+        duration = max(0.1, end - start)
         cmd = [
-            FFMPEG_PATH, "-i", source_path,
-            "-ss", str(start), "-to", str(end),
+            FFMPEG_PATH, "-ss", str(start), "-i", source_path,
+            "-t", str(duration),
         ] + encoder_opts + ["-c:a", "aac", "-y", out_path]
 
         try:
