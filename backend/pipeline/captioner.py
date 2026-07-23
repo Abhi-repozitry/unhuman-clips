@@ -1,6 +1,16 @@
+"""ASS subtitle caption generator for clip and commentary text.
+
+Generates ASS subtitle files with styled captions: clip captions at bottom,
+commentary/narration captions at top, with key word color highlighting.
+"""
+from __future__ import annotations
+
+from typing import Callable
+
 from backend.config import CAPTION_FONT
-from typing import Callable, Optional
 from backend.pipeline.sanitize import sanitize_text
+
+__all__ = ["generate_clip_ass", "generate_commentary_ass"]
 
 
 # Caption sizes (9:16 portrait, 1080x1920)
@@ -108,12 +118,30 @@ def _highlight_key_words(text: str) -> str:
     return " ".join(result_parts)
 
 
-def generate_clip_ass(transcript: list, clip_start: float, clip_end: float,
-                      out_path: str,
-                      progress_cb: Optional[Callable[[str, float], None]] = None,
-                      start_time: float = 0.0) -> str:
-    """Generate captions for original-clip segments — bottom-aligned with background box.
-    Enhanced with larger font, key word highlighting, and better positioning."""
+def generate_clip_ass(
+    transcript: list[dict],
+    clip_start: float,
+    clip_end: float,
+    out_path: str,
+    progress_cb: Callable[[str, float], None] | None = None,
+    start_time: float = 0.0,
+) -> str:
+    """Generate ASS captions for original-clip segments (bottom-aligned).
+
+    Filters transcript to the clip window, wraps text, and applies
+    key word highlighting with background box styling.
+
+    Args:
+        transcript: Full transcript list with start/end/text keys.
+        clip_start: Clip start time in source video.
+        clip_end: Clip end time in source video.
+        out_path: Output ASS file path.
+        progress_cb: Optional progress callback.
+        start_time: Offset to add to all timestamps.
+
+    Returns:
+        The output ASS file path.
+    """
     if progress_cb:
         progress_cb("Filtering transcript for clip...", 20)
 
@@ -168,10 +196,27 @@ def generate_clip_ass(transcript: list, clip_start: float, clip_end: float,
     return out_path
 
 
-def generate_commentary_ass(text: str, duration: float, out_path: str,
-                            progress_cb: Optional[Callable[[str, float], None]] = None,
-                            start_time: float = 0.0) -> str:
-    """Generate commentary (hook/insight) captions — top center (alignment=8, margin_v=60), larger, with key word highlights."""
+def generate_commentary_ass(
+    text: str,
+    duration: float,
+    out_path: str,
+    progress_cb: Callable[[str, float], None] | None = None,
+    start_time: float = 0.0,
+) -> str:
+    """Generate ASS captions for commentary/hook text (top center).
+
+    Produces larger, bold captions with key word color highlighting.
+
+    Args:
+        text: Commentary text to display.
+        duration: Duration in seconds to show the caption.
+        out_path: Output ASS file path.
+        progress_cb: Optional progress callback.
+        start_time: Start time offset in the output video.
+
+    Returns:
+        The output ASS file path.
+    """
     if progress_cb:
         progress_cb("Wrapping commentary text...", 30)
 

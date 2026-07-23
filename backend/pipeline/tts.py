@@ -1,18 +1,25 @@
-"""
-TTS Module - edge-tts Implementation
+"""TTS module — text-to-speech via Microsoft Edge TTS (edge-tts).
 
-Uses Microsoft Edge's free TTS service (no server required).
-edge-tts's built-in SentenceBoundary handling provides natural pacing.
+Provides synthesize_commentary() with retry logic for transient failures
+and audio validation to catch empty/truncated responses.
 """
+from __future__ import annotations
 
 import asyncio
+import logging
 import os
-import time
-import edge_tts
 import subprocess
+import time
+from typing import Callable
 
-from typing import Callable, Optional
-from backend.config import TTS_VOICE, FFPROBE_PATH
+import edge_tts
+
+from backend.config import TTS_VOICE
+from backend.ffmpeg_utils import get_ffprobe
+
+__all__ = ["synthesize_commentary"]
+
+logger = logging.getLogger(__name__)
 
 # TTS rate — configurable via environment variable
 TTS_RATE = os.environ.get("TTS_RATE", "+10%")
@@ -29,8 +36,26 @@ MAX_TTS_ATTEMPTS = 3
 RETRY_BACKOFF_SECONDS = 1.5
 
 
-def synthesize_commentary(text: str, out_path: str, progress_cb: Optional[Callable[[str, float], None]] = None,
-                          rate: Optional[str] = None) -> float:
+def synthesize_commentary(
+    text: str,
+    out_path: str,
+    progress_cb: Callable[[str, float], None] | None = None,
+    rate: str | None = None,
+) -> float:
+    """Synthesize text to speech using edge-tts with retry logic.
+
+    Args:
+        text: Text to synthesize (must be non-empty).
+        out_path: Output WAV file path.
+        progress_cb: Optional progress callback.
+        rate: TTS rate override (e.g., '+10%'). Defaults to TTS_RATE env var.
+
+    Returns:
+        Duration of the generated audio in seconds.
+
+    Raises:
+        RuntimeError: On empty text, TTS failure after retries, or invalid audio.
+    """
     if not text or not text.strip():
         raise RuntimeError("synthesize_commentary called with empty text — refusing to synthesize silent audio.")
 
@@ -65,7 +90,7 @@ def synthesize_commentary(text: str, out_path: str, progress_cb: Optional[Callab
         except Exception as e:
             last_error = e
             if attempt < MAX_TTS_ATTEMPTS:
-                print(f"[WARN] TTS attempt {attempt}/{MAX_TTS_ATTEMPTS} failed ({e}); retrying...")
+                logger.warning(f"TTS attempt {attempt}/{MAX_TTS_ATTEMPTS} failed ({e}); retrying...")
                 time.sleep(RETRY_BACKOFF_SECONDS * attempt)
             else:
                 raise RuntimeError(f"edge-tts failed after {MAX_TTS_ATTEMPTS} attempts: {last_error}") from last_error
@@ -75,7 +100,7 @@ def synthesize_commentary(text: str, out_path: str, progress_cb: Optional[Callab
 
     try:
         result = subprocess.run(
-            [FFPROBE_PATH, "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", out_path],
+            [get_ffprobe(), "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", out_path],
             capture_output=True, check=True, text=True
         )
         duration = float(result.stdout.strip())

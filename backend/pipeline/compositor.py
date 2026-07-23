@@ -1,36 +1,60 @@
-import subprocess
+"""Video composition module — builds final output from clips, audio, and captions.
+
+Provides compose_group() which renders a single group's output reel with
+VAD-driven audio ducking, caption overlays, and freeze-frame padding.
+"""
+from __future__ import annotations
+
+import logging
 import os
+import subprocess
 from pathlib import Path
+from typing import Any, Callable
+
 from backend.config import (
-    FFMPEG_PATH, FFPROBE_PATH,
-    OUTPUT_WIDTH, OUTPUT_HEIGHT, OUTPUT_FPS,
-    NARRATION_VOLUME_BOOST, ALIMITER_LIMIT, ALIMITER_ATTACK_MS, ALIMITER_RELEASE_MS,
-    VAD_THRESHOLD, VAD_PRE_BUFFER_SECONDS, VAD_POST_BUFFER_SECONDS,
-    VAD_SCURVE_RAMP_SECONDS, VAD_DUCKING_DEPTH, VAD_SILENCE_THRESHOLD,
+    ALIMITER_ATTACK_MS,
+    ALIMITER_LIMIT,
+    ALIMITER_RELEASE_MS,
+    NARRATION_VOLUME_BOOST,
+    OUTPUT_FPS,
+    OUTPUT_HEIGHT,
+    OUTPUT_WIDTH,
+    VAD_DUCKING_DEPTH,
+    VAD_POST_BUFFER_SECONDS,
+    VAD_PRE_BUFFER_SECONDS,
+    VAD_SCURVE_RAMP_SECONDS,
+    VAD_THRESHOLD,
 )
-from typing import Callable, Optional, List, Dict, Any
+from backend.ffmpeg_utils import get_encoder, get_ffmpeg, get_ffprobe
+
+__all__ = ["compose_group"]
+
+logger = logging.getLogger(__name__)
 
 
-def _get_video_encoder(fallback=False):
-    """Return the best available H.264 encoder.
-    Prefer h264_nvenc (GPU), fall back to libx264 (CPU) if NVENC fails or is forced."""
-    if not fallback:
-        try:
-            result = subprocess.run(
-                [FFMPEG_PATH, "-hide_banner", "-encoders"],
-                capture_output=True, text=True, timeout=10
-            )
-            if "h264_nvenc" in result.stdout:
-                return "h264_nvenc"
-        except Exception:
-            pass
-    if os.environ.get("ALLOW_CPU_FFMPEG_FALLBACK") == "1" or fallback:
+def _get_video_encoder(fallback: bool = False) -> str:
+    """Return the best available H.264 encoder (cached after first call).
+
+    Args:
+        fallback: If True, force CPU encoding (libx264).
+
+    Returns:
+        Encoder name string (e.g., 'h264_nvenc' or 'libx264').
+    """
+    if fallback:
         return "libx264"
-    raise RuntimeError("h264_nvenc encoder is not available. Install/configure NVIDIA ffmpeg support or set ALLOW_CPU_FFMPEG_FALLBACK=1.")
+    return get_encoder()
 
 
-def _build_encoder_opts(encoder: str) -> list:
-    """Return encoder-specific ffmpeg arguments."""
+def _build_encoder_opts(encoder: str) -> list[str]:
+    """Return encoder-specific ffmpeg arguments.
+
+    Args:
+        encoder: Encoder name ('h264_nvenc' or 'libx264').
+
+    Returns:
+        List of ffmpeg flag strings for the encoder.
+    """
     if encoder == "h264_nvenc":
         return [
             "-c:v", "h264_nvenc", "-pix_fmt", "yuv420p",
@@ -43,9 +67,30 @@ def _build_encoder_opts(encoder: str) -> list:
         ]
 
 
-def _run_ffmpeg(cmd: list, description: str, attempt: int = 1, max_attempts: int = 2, cwd: str = None):
+def _run_ffmpeg(
+    cmd: list[str],
+    description: str,
+    attempt: int = 1,
+    max_attempts: int = 2,
+    cwd: str | None = None,
+) -> subprocess.CompletedProcess[bytes]:
     """Run ffmpeg with a 600-second timeout, retrying with CPU encoder if NVENC fails.
-    Uses stderr=PIPE, stdout=DEVNULL to prevent pipe buffer deadlock on Windows."""
+
+    Uses stderr=PIPE, stdout=DEVNULL to prevent pipe buffer deadlock on Windows.
+
+    Args:
+        cmd: Full ffmpeg command list.
+        description: Human-readable description for error messages.
+        attempt: Current attempt number (for retry logic).
+        max_attempts: Maximum retry attempts.
+        cwd: Working directory for the subprocess.
+
+    Returns:
+        CompletedProcess result.
+
+    Raises:
+        RuntimeError: On timeout or ffmpeg failure after all attempts.
+    """
     try:
         result = subprocess.run(
             cmd,
@@ -61,12 +106,12 @@ def _run_ffmpeg(cmd: list, description: str, attempt: int = 1, max_attempts: int
     except subprocess.CalledProcessError as e:
         stderr_text = e.stderr.decode(errors="replace") if e.stderr else "(no stderr)"
         if attempt < max_attempts and "h264_nvenc" in " ".join(cmd) and os.environ.get("ALLOW_CPU_FFMPEG_FALLBACK") == "1":
-            print(f"[WARN] NVENC failed for {description}, retrying with libx264: {stderr_text[:200]}")
+            logger.warning(f"NVENC failed for {description}, retrying with libx264: {stderr_text[:200]}")
             # Rebuild command from scratch for CPU encoding (avoids arg patching bugs).
             # Extract only the encoder-agnostic args: -ss, -i, -t, -filter_complex, -map, -y
             # and the output path (always last). Drop everything else (encoder opts, pix_fmt, etc.).
-            new_cmd = [FFMPEG_PATH, "-loglevel", "error"]
-            i = 1  # skip FFMPEG_PATH
+            new_cmd = [get_ffmpeg(), "-loglevel", "error"]
+            i = 1  # skip get_ffmpeg()
             output_path = cmd[-1] if cmd else None
             while i < len(cmd) - 1:  # stop before last arg (output path)
                 arg = cmd[i]
@@ -96,12 +141,65 @@ def _ass_filter(path: str) -> str:
     return f"ass=filename={filename}"
 
 
+def _concat_demuxer(
+    file_list: list[str],
+    output_path: str,
+    copy: bool = True,
+    audio_codec: str = "aac",
+    audio_bitrate: str = "192k",
+    video_codec: str = "libx264",
+    extra_args: list[str] | None = None,
+) -> None:
+    """Concat files using the concat demuxer (avoids re-encoding when possible).
+
+    Writes a temporary file list and runs ffmpeg with -f concat.
+
+    Args:
+        file_list: List of input file paths to concatenate.
+        output_path: Output file path.
+        copy: Use stream copy (fast, lossless) for compatible streams.
+        audio_codec: Audio codec when not copying.
+        audio_bitrate: Audio bitrate when not copying.
+        video_codec: Video codec when not copying.
+        extra_args: Optional extra ffmpeg arguments.
+    """
+    import tempfile
+    working_dir = Path(output_path).parent
+    filelist_path = working_dir / f"_concat_{Path(output_path).stem}.txt"
+
+    with open(filelist_path, "w", encoding="utf-8") as f:
+        for fp in file_list:
+            # Escape single quotes in paths for ffmpeg concat format
+            safe = fp.replace("'", "'\\''")
+            f.write(f"file '{safe}'\n")
+
+    cmd = [
+        get_ffmpeg(), "-loglevel", "error",
+        "-f", "concat", "-safe", "0", "-i", str(filelist_path),
+    ]
+    if extra_args:
+        cmd.extend(extra_args)
+    if copy:
+        cmd.extend(["-c", "copy"])
+    else:
+        cmd.extend(["-c:v", video_codec, "-c:a", audio_codec, "-b:a", audio_bitrate])
+    cmd.extend(["-movflags", "+faststart", "-y", output_path])
+
+    try:
+        _run_ffmpeg(cmd, f"concat {Path(output_path).name}")
+    finally:
+        try:
+            filelist_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def get_speech_timestamps_from_narration(
     narration_path: str,
     threshold: float = VAD_THRESHOLD,
     min_speech_duration_ms: int = 100,
     min_silence_duration_ms: int = 200,
-) -> List[Dict[str, float]]:
+) -> list[dict[str, float]]:
     """Run Silero VAD on a narration audio file to detect precise speech timestamps.
 
     Returns list of {"start": float, "end": float} dicts for each detected
@@ -119,7 +217,7 @@ def get_speech_timestamps_from_narration(
         import torchaudio
         from silero_vad import get_speech_timestamps, read_audio
     except ImportError:
-        print(f"[WARN] silero-vad or torch not available, using full-window fallback for {Path(narration_path).name}")
+        logger.warning(f"silero-vad or torch not available, using full-window fallback for {Path(narration_path).name}")
         return fallback
 
     try:
@@ -143,7 +241,7 @@ def get_speech_timestamps_from_narration(
         return [{"start": ts["start"], "end": ts["end"]} for ts in speech_timestamps]
 
     except Exception as e:
-        print(f"[WARN] Silero VAD failed on {Path(narration_path).name}: {e}, using full-window fallback")
+        logger.warning(f"Silero VAD failed on {Path(narration_path).name}: {e}, using full-window fallback")
         return fallback
 
 
@@ -151,7 +249,7 @@ def _get_audio_duration(audio_path: str) -> float:
     """Get duration of an audio file using ffprobe."""
     try:
         result = subprocess.run(
-            [FFPROBE_PATH, "-v", "error", "-show_entries", "format=duration",
+            [get_ffprobe(), "-v", "error", "-show_entries", "format=duration",
              "-of", "default=noprint_wrappers=1:nokey=1", audio_path],
             capture_output=True, text=True, timeout=15
         )
@@ -161,8 +259,8 @@ def _get_audio_duration(audio_path: str) -> float:
 
 
 def _build_ducking_filter_chain(
-    narration_events: List[Dict[str, Any]],
-    narration_vad_timestamps: Optional[List[List[Dict[str, float]]]] = None,
+    narration_events: list[dict[str, Any]],
+    narration_vad_timestamps: list[list[dict[str, float]]] | None = None,
     input_label: str = "0:a",
     output_label: str = "ducked",
     target_duration: float = 0.0,
@@ -209,8 +307,8 @@ def _build_ducking_filter_chain(
     RAMP = VAD_SCURVE_RAMP_SECONDS
     DEPTH = VAD_DUCKING_DEPTH
 
-    print(f"[INFO] VAD-driven ducking: {len(valid_events)} narration events, "
-          f"payoff zone starts at {payoff_start:.1f}s, ramp={RAMP}s, depth={DEPTH}")
+    logger.info(f"VAD-driven ducking: {len(valid_events)} narration events, "
+                f"payoff zone starts at {payoff_start:.1f}s, ramp={RAMP}s, depth={DEPTH}")
 
     duck_terms = []
 
@@ -236,8 +334,8 @@ def _build_ducking_filter_chain(
 
             # Skip if entirely in payoff zone
             if duck_start >= payoff_start:
-                print(f"[INFO]   VAD skip (payoff): narr {ev_idx+1} seg {seg_idx+1} "
-                      f"[{abs_start:.3f}-{abs_end:.3f}s] in payoff zone")
+                logger.info(f"  VAD skip (payoff): narr {ev_idx+1} seg {seg_idx+1} "
+                            f"[{abs_start:.3f}-{abs_end:.3f}s] in payoff zone")
                 continue
 
             # Cap at payoff boundary if it overlaps
@@ -281,9 +379,9 @@ def _build_ducking_filter_chain(
             )
 
             duck_terms.append(expr)
-            print(f"[INFO]   VAD duck seg: narr {ev_idx+1} seg {seg_idx+1} "
-                  f"[{abs_start:.3f}-{abs_end:.3f}s] -> duck window "
-                  f"[{duck_start:.3f}-{duck_end:.3f}s]")
+            logger.info(f"  VAD duck seg: narr {ev_idx+1} seg {seg_idx+1} "
+                        f"[{abs_start:.3f}-{abs_end:.3f}s] -> duck window "
+                        f"[{duck_start:.3f}-{duck_end:.3f}s]")
 
     if not duck_terms:
         return f"[{input_label}]anull[{output_label}]"
@@ -297,8 +395,8 @@ def _build_ducking_filter_chain(
             duck_expr = f"max({duck_expr},{term})"
 
     vol_expr = f"1.0-({duck_expr}*{DEPTH:.2f})"
-    print(f"[INFO] VAD ducking: {len(duck_terms)} speech segments, "
-          f"depth={DEPTH*100:.0f}% reduction during TTS speech only")
+    logger.info(f"VAD ducking: {len(duck_terms)} speech segments, "
+                f"depth={DEPTH*100:.0f}% reduction during TTS speech only")
     return f"[{input_label}]volume='{vol_expr}':eval=frame[{output_label}]"
 
 
@@ -306,7 +404,7 @@ def _get_video_duration_seconds(video_path: str) -> float:
     """Get duration of a video file using ffprobe."""
     try:
         result = subprocess.run(
-            [FFPROBE_PATH, "-v", "error", "-show_entries", "format=duration",
+            [get_ffprobe(), "-v", "error", "-show_entries", "format=duration",
              "-of", "default=noprint_wrappers=1:nokey=1", video_path],
             capture_output=True, text=True, timeout=15
         )
@@ -318,23 +416,39 @@ def _get_video_duration_seconds(video_path: str) -> float:
 def compose_group(
     job_id: str,
     group_idx: int,
-    group_clip_paths: List[str],
-    source_clips: List[Dict[str, float]],
-    narration_audio: List[Dict[str, Any]],
-    clip_caption_paths: List[str],
-    narration_caption_paths: List[str],
+    group_clip_paths: list[str],
+    source_clips: list[dict[str, float]],
+    narration_audio: list[dict[str, Any]],
+    clip_caption_paths: list[str],
+    narration_caption_paths: list[str],
     source_path: str,
     working_dir: Path,
     estimated_duration_seconds: float = 0.0,
-    progress_cb: Optional[Callable[[str, float], None]] = None
-) -> Dict[str, Any]:
-    """
-    Build a single group's output reel.
-    - Continuous video from pre-cut group_clip_paths (if available) or trimmed from source_clips
-    - Video is padded with last-frame freeze to fill target_duration
-    - Clip captions at BOTTOM (alignment=2, margin_v=80)
-    - Narration captions at TOP (alignment=8, margin_v=60)
-    - Audio: clip audio padded to target_duration & ducked during narration windows + narration audio mixed
+    progress_cb: Callable[[str, float], None] | None = None,
+) -> dict[str, Any]:
+    """Build a single group's output reel.
+
+    Renders continuous video from clips with optional freeze-frame padding,
+    VAD-driven audio ducking during narration, caption overlays, and final mux.
+
+    Args:
+        job_id: Job identifier.
+        group_idx: Group index.
+        group_clip_paths: Paths to pre-cut clip files.
+        source_clips: Source clip metadata with source_start/source_end.
+        narration_audio: TTS audio metadata list.
+        clip_caption_paths: Paths to clip caption ASS files.
+        narration_caption_paths: Paths to narration caption ASS files.
+        source_path: Path to the source video file.
+        working_dir: Working directory for intermediate files.
+        estimated_duration_seconds: Target duration from the analyzer.
+        progress_cb: Optional progress callback.
+
+    Returns:
+        Dict with 'output_path', 'vad_stats', and 'vad_analysis' keys.
+
+    Raises:
+        RuntimeError: On group isolation violations or ffmpeg failures.
     """
     from backend.config import MAX_OUTPUT_DURATION, MIN_OUTPUT_DURATION
     working_dir = Path(working_dir)
@@ -383,11 +497,11 @@ def compose_group(
                 f"does not belong to this group. Cross-group contamination detected."
             )
 
-    print(f"[INFO] Rendering isolated Group {group_idx} with {n_clips} clips and {len(narration_audio)} narration events — all paths validated for group isolation.")
+    logger.info(f"Rendering isolated Group {group_idx} with {n_clips} clips and {len(narration_audio)} narration events — all paths validated for group isolation.")
 
     encoder = _get_video_encoder()
     encoder_opts = _build_encoder_opts(encoder)
-    print(f"[INFO] compose_group {group_idx}: Using video encoder: {encoder}")
+    logger.info(f"compose_group {group_idx}: Using video encoder: {encoder}")
 
     # Check whether to use pre-cut clip files from CLIPPING stage
     use_precut = bool(
@@ -396,9 +510,9 @@ def compose_group(
         and all(os.path.exists(p) for p in group_clip_paths)
     )
     if use_precut:
-        print(f"[INFO] Group {group_idx}: Using {n_clips} pre-cut clip files from CLIPPING stage.")
+        logger.info(f"Group {group_idx}: Using {n_clips} pre-cut clip files from CLIPPING stage.")
     else:
-        print(f"[INFO] Group {group_idx}: Pre-cut clips unavailable or incomplete; trimming from source video.")
+        logger.info(f"Group {group_idx}: Pre-cut clips unavailable or incomplete; trimming from source video.")
 
     if progress_cb:
         progress_cb(f"Group {group_idx+1}: Building continuous video from {n_clips} clips...", 5)
@@ -444,10 +558,10 @@ def compose_group(
         # Allow more pad when there's narration tail to cover, up to MAX_FREEZE_PAD
         allowed_pad = min(MAX_FREEZE_PAD, max(narration_tail, MAX_FREEZE_PAD * 0.5))
 
-        print(f"[INFO] Group {group_idx}: clip content ({total_clip_duration:.1f}s) short of "
-              f"target ({target_duration:.1f}s) — using freeze pad {allowed_pad:.1f}s "
-              f"(was {pad_duration:.1f}s cap, narration_tail={narration_tail:.1f}s). "
-              f"Audio will be padded with silence beyond freeze.")
+        logger.info(f"Group {group_idx}: clip content ({total_clip_duration:.1f}s) short of "
+                    f"target ({target_duration:.1f}s) — using freeze pad {allowed_pad:.1f}s "
+                    f"(was {pad_duration:.1f}s cap, narration_tail={narration_tail:.1f}s). "
+                    f"Audio will be padded with silence beyond freeze.")
 
         # Only drop narration events if they'd be lost beyond video+freeze end.
         # Previously we capped at total_clip_duration + allowed_pad, but now with
@@ -459,8 +573,8 @@ def compose_group(
         ]
         if truncated_events:
             for nar in truncated_events:
-                print(
-                    f"[WARN] Group {group_idx}: dropping narration event that would be truncated — "
+                logger.warning(
+                    f"Group {group_idx}: dropping narration event that would be truncated — "
                     f"type={nar.get('event_type', '?')!r}, "
                     f"reel=[{nar.get('reel_start', 0):.2f}s–{nar.get('reel_end', 0):.2f}s], "
                     f"capped_limit={capped_limit:.2f}s, "
@@ -483,8 +597,8 @@ def compose_group(
         # corrected value, not the original inflated target.
         target_duration = total_clip_duration + pad_duration
 
-    print(f"[INFO] Group {group_idx}: total_clip_duration={total_clip_duration:.1f}s, "
-          f"max_narration_end={max_narration_end:.1f}s, est={estimated_duration_seconds:.1f}s, target={target_duration:.1f}s, pad={pad_duration:.1f}s")
+    logger.info(f"Group {group_idx}: total_clip_duration={total_clip_duration:.1f}s, "
+                f"max_narration_end={max_narration_end:.1f}s, est={estimated_duration_seconds:.1f}s, target={target_duration:.1f}s, pad={pad_duration:.1f}s")
 
     # 1. Build video filter complex
     if use_precut:
@@ -540,7 +654,7 @@ def compose_group(
 
     video_output = working_dir / f"group_{group_idx}_video.mp4"
     ffmpeg_video = [
-        FFMPEG_PATH, "-loglevel", "error"
+        get_ffmpeg(), "-loglevel", "error"
     ] + ffmpeg_video_inputs + [
         "-filter_complex", video_filter,
         "-map", f"[{last_v}]",
@@ -553,18 +667,36 @@ def compose_group(
 
     # Verify video duration
     vid_dur = _get_video_duration_seconds(str(video_output))
-    print(f"[INFO] Group {group_idx}: video output duration: {vid_dur:.1f}s")
+    logger.info(f"Group {group_idx}: video output duration: {vid_dur:.1f}s")
 
     # 2. Build continuous clip audio & pad with silence to target_duration
     if progress_cb:
         progress_cb(f"Group {group_idx+1}: Building continuous clip audio (padded to {target_duration:.1f}s)...", 40)
 
+    clip_audio_output = working_dir / f"group_{group_idx}_clip_audio.wav"
+
     if use_precut:
-        ffmpeg_audio_inputs = []
-        for p in group_clip_paths:
-            ffmpeg_audio_inputs.extend(["-i", str(p)])
-        concat_audio_inputs = "".join(f"[{i}:a]" for i in range(n_clips))
-        audio_filter = f"{concat_audio_inputs}concat=n={n_clips}:v=0:a=1[raw_audio];[raw_audio]apad=whole_dur={target_duration:.2f},atrim=end={target_duration:.2f}[clip_audio]"
+        # Concat demuxer: stream-copy audio from pre-cut clips (no re-encode)
+        raw_audio_tmp = working_dir / f"group_{group_idx}_raw_concat.wav"
+        _concat_demuxer(
+            [str(p) for p in group_clip_paths],
+            str(raw_audio_tmp),
+            copy=False,  # need wav for apad
+            audio_codec="pcm_s16le",
+        )
+        # Pad with silence to target duration
+        ffmpeg_pad = [
+            get_ffmpeg(), "-loglevel", "error",
+            "-i", str(raw_audio_tmp),
+            "-af", f"apad=whole_dur={target_duration:.2f},atrim=end={target_duration:.2f}",
+            "-c:a", "pcm_s16le", "-ar", "44100", "-ac", "2",
+            "-y", str(clip_audio_output)
+        ]
+        _run_ffmpeg(ffmpeg_pad, f"Group {group_idx} clip audio pad")
+        try:
+            raw_audio_tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
     else:
         ffmpeg_audio_inputs = ["-i", source_path]
         audio_filter_parts = []
@@ -581,21 +713,20 @@ def compose_group(
         )
         audio_filter = ";".join(audio_filter_parts)
 
-    clip_audio_output = working_dir / f"group_{group_idx}_clip_audio.wav"
-    ffmpeg_clip_audio = [
-        FFMPEG_PATH, "-loglevel", "error"
-    ] + ffmpeg_audio_inputs + [
-        "-filter_complex", audio_filter,
-        "-map", "[clip_audio]",
-        "-c:a", "pcm_s16le", "-ar", "44100", "-ac", "2",
-        "-y", str(clip_audio_output)
-    ]
-    _run_ffmpeg(ffmpeg_clip_audio, f"Group {group_idx} clip audio")
+        ffmpeg_clip_audio = [
+            get_ffmpeg(), "-loglevel", "error"
+        ] + ffmpeg_audio_inputs + [
+            "-filter_complex", audio_filter,
+            "-map", "[clip_audio]",
+            "-c:a", "pcm_s16le", "-ar", "44100", "-ac", "2",
+            "-y", str(clip_audio_output)
+        ]
+        _run_ffmpeg(ffmpeg_clip_audio, f"Group {group_idx} clip audio")
 
     clip_audio_dur = _get_video_duration_seconds(str(clip_audio_output))
-    print(f"[INFO] Group {group_idx}: clip audio output duration (padded): {clip_audio_dur:.1f}s")
+    logger.info(f"Group {group_idx}: clip audio output duration (padded): {clip_audio_dur:.1f}s")
     if abs(clip_audio_dur - target_duration) > 1.0:
-        print(f"[WARN] Group {group_idx}: clip audio duration {clip_audio_dur:.1f}s deviates from target {target_duration:.1f}s by {abs(clip_audio_dur - target_duration):.1f}s!")
+        logger.warning(f"Group {group_idx}: clip audio duration {clip_audio_dur:.1f}s deviates from target {target_duration:.1f}s by {abs(clip_audio_dur - target_duration):.1f}s!")
 
     # 3. Build narration audio track (padded to target_duration)
     # Initialize VAD defaults in case narration_audio is empty
@@ -623,7 +754,7 @@ def compose_group(
 
         narration_audio_output = working_dir / f"group_{group_idx}_narration.wav"
         ffmpeg_narration = [
-            FFMPEG_PATH, "-loglevel", "error",
+            get_ffmpeg(), "-loglevel", "error",
             "-i", str(clip_audio_output),  # Input 0 placeholder for sample rate matching
         ]
         for nar in narration_audio:
@@ -637,7 +768,7 @@ def compose_group(
         _run_ffmpeg(ffmpeg_narration, f"Group {group_idx} narration audio")
 
         narr_dur = _get_video_duration_seconds(str(narration_audio_output))
-        print(f"[INFO] Group {group_idx}: narration audio output duration: {narr_dur:.1f}s")
+        logger.info(f"Group {group_idx}: narration audio output duration: {narr_dur:.1f}s")
 
     # 4. Apply VAD-driven ducking to clip audio and mix with narration
         if progress_cb:
@@ -655,8 +786,8 @@ def compose_group(
                 "speech_duration": round(total_speech_dur, 2),
                 "total_duration": round(nar.get("duration", 0), 2),
             })
-            print(f"[INFO] VAD narr {i+1}: {len(vad_segs)} speech segments, "
-                  f"total speech={total_speech_dur:.2f}s of {nar.get('duration', 0):.2f}s audio")
+            logger.info(f"VAD narr {i+1}: {len(vad_segs)} speech segments, "
+                        f"total speech={total_speech_dur:.2f}s of {nar.get('duration', 0):.2f}s audio")
 
         # Aggregate VAD stats for frontend display
         total_vad_segments = sum(e["segments"] for e in vad_analysis_entries)
@@ -688,7 +819,7 @@ def compose_group(
 
         mixed_audio_output = working_dir / f"group_{group_idx}_mixed_audio.wav"
         ffmpeg_mix = [
-            FFMPEG_PATH, "-loglevel", "error",
+            get_ffmpeg(), "-loglevel", "error",
             "-i", str(clip_audio_output),
             "-i", str(narration_audio_output),
             "-filter_complex",
@@ -705,13 +836,13 @@ def compose_group(
         _run_ffmpeg(ffmpeg_mix, f"Group {group_idx} audio mix")
 
         mix_dur = _get_video_duration_seconds(str(mixed_audio_output))
-        print(f"[INFO] Group {group_idx}: mixed audio output duration: {mix_dur:.1f}s (target: {target_duration:.1f}s)")
+        logger.info(f"Group {group_idx}: mixed audio output duration: {mix_dur:.1f}s (target: {target_duration:.1f}s)")
         if abs(mix_dur - target_duration) > 0.5:
-            print(f"[WARN] Group {group_idx}: mixed audio duration {mix_dur:.1f}s deviates from target {target_duration:.1f}s by {abs(mix_dur - target_duration):.1f}s — re-padding...")
+            logger.warning(f"Group {group_idx}: mixed audio duration {mix_dur:.1f}s deviates from target {target_duration:.1f}s by {abs(mix_dur - target_duration):.1f}s — re-padding...")
             # Re-pad mixed audio to exactly match target_duration
             repadded_output = working_dir / f"group_{group_idx}_mixed_audio_repadded.wav"
             ffmpeg_repad = [
-                FFMPEG_PATH, "-loglevel", "error",
+                get_ffmpeg(), "-loglevel", "error",
                 "-i", str(mixed_audio_output),
                 "-af", f"apad=whole_dur={target_duration:.2f},atrim=end={target_duration:.2f}",
                 "-c:a", "pcm_s16le", "-ar", "44100", "-ac", "2",
@@ -721,7 +852,7 @@ def compose_group(
             import shutil
             shutil.move(str(repadded_output), str(mixed_audio_output))
             repad_dur = _get_video_duration_seconds(str(mixed_audio_output))
-            print(f"[INFO] Group {group_idx}: re-padded mixed audio duration: {repad_dur:.1f}s")
+            logger.info(f"Group {group_idx}: re-padded mixed audio duration: {repad_dur:.1f}s")
     else:
         mixed_audio_output = clip_audio_output
 
@@ -734,7 +865,7 @@ def compose_group(
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     ffmpeg_final = [
-        FFMPEG_PATH, "-loglevel", "error",
+        get_ffmpeg(), "-loglevel", "error",
         "-i", str(video_output),
         "-i", str(mixed_audio_output),
         "-map", "0:v", "-map", "1:a",
@@ -747,9 +878,9 @@ def compose_group(
     actual_duration = _get_video_duration_seconds(str(output_path))
     if progress_cb:
         progress_cb(f"Group {group_idx+1}: Done ({actual_duration:.1f}s)", 100)
-    print(f"[INFO] Group {group_idx} output: {output_path.name} (final video duration: {actual_duration:.1f}s)")
+    logger.info(f"Group {group_idx} output: {output_path.name} (final video duration: {actual_duration:.1f}s)")
     if abs(actual_duration - target_duration) > 2.0:
-        print(f"[WARN] Group {group_idx}: FINAL OUTPUT duration {actual_duration:.1f}s deviates from target {target_duration:.1f}s by {abs(actual_duration - target_duration):.1f}s — check audio/video alignment!")
+        logger.warning(f"Group {group_idx}: FINAL OUTPUT duration {actual_duration:.1f}s deviates from target {target_duration:.1f}s by {abs(actual_duration - target_duration):.1f}s — check audio/video alignment!")
 
     return {
         "output_path": str(output_path),

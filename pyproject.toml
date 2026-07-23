@@ -1,0 +1,47 @@
+[project]
+name = "unhuman-clips"
+version = "1.0.0"
+requires-python = ">=3.11"
+description = "Video clip generation pipeline — Download, Transcribe, Analyze, Clip, TTS, Caption, Composite"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "integration: full end-to-end pipeline tests (slow, uses mocks for external services)",
+    "gpu: tests requiring NVIDIA GPU or CUDA",
+]
+addopts = "-v --tb=short --strict-markers -x"
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::PendingDeprecationWarning",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+src = ["backend", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # isort
+    "UP",   # pyupgrade
+    "B",    # flake8-bugbear
+    "SIM",  # flake8-simplify
+    "RUF",  # ruff-specific
+]
+ignore = [
+    "E501",   # line too long — handled by formatter
+    "B008",   # function call in default argument — Pydantic Depends
+    "SIM108", # ternary operator — readability preference
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["backend"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "auto"

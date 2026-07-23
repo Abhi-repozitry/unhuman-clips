@@ -4,8 +4,12 @@ All text that flows through the pipeline (LLM output, Whisper transcripts,
 commentary, narration) MUST pass through sanitize_text() before reaching
 captioner.py, tts.py, or compositor.py.
 """
+from __future__ import annotations
+
 import re
 import unicodedata
+
+__all__ = ["sanitize_text"]
 
 # Characters that break ASS subtitles, TTS/SSML, or ffmpeg filters
 _BANNED_CHARS = set('/\\|*#_<>[]{}')

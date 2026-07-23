@@ -1,27 +1,35 @@
+"""Video transcription module — speech-to-text via Faster-Whisper (CTranslate2).
+
+Provides transcribe_video() with lazy model loading and CUDA fallback logic.
+Handles CUDA runtime library preloading for NVIDIA GPU support.
+"""
+from __future__ import annotations
+
 import ctypes
+import logging
 import os
 import sys
 from pathlib import Path
+from typing import Callable
+
+__all__ = ["transcribe_video"]
+
+logger = logging.getLogger(__name__)
 
 
 def _is_windows() -> bool:
+    """Return True if running on Windows."""
     return sys.platform.startswith("win")
 
 
 def _prepare_cuda_runtime_libraries() -> list[str]:
-    """
-    Make CUDA runtime libraries installed by NVIDIA pip wheels visible to
-    CTranslate2/Faster-Whisper before the model is used.
+    """Make CUDA runtime libraries visible to CTranslate2/Faster-Whisper.
 
-    WSL exposes the NVIDIA driver (`libcuda.so`) through /usr/lib/wsl/lib, but
-    CTranslate2 still needs runtime libraries such as `libcublas.so.12` and
-    cuDNN. Those may live inside the project virtualenv instead of a system CUDA
-    install. Loading them with RTLD_GLOBAL avoids runtime failures like:
-    "Library libcublas.so.12 is not found or cannot be loaded".
+    On Windows, DLLs are added to PATH and loaded via add_dll_directory.
+    On Linux, .so files are added to LD_LIBRARY_PATH and loaded with RTLD_GLOBAL.
 
-    On Windows, the DLLs live in `bin` subdirectories and need to be added to
-    the `PATH` or loaded explicitly. On Linux, the `.so` files live in `lib`
-    subdirectories.
+    Returns:
+        List of library paths that were successfully loaded.
     """
     here = Path(__file__).resolve()
     backend_dir = here.parents[1]
@@ -105,10 +113,10 @@ def _prepare_cuda_runtime_libraries() -> list[str]:
                 loaded.append(str(lib_path))
                 break
             except OSError as exc:
-                print(f"[WARN] Could not preload CUDA library {lib_path}: {exc}")
+                logger.warning(f"Could not preload CUDA library {lib_path}: {exc}")
 
     if loaded:
-        print("[INFO] Preloaded CUDA runtime libraries for Faster-Whisper")
+        logger.info("Preloaded CUDA runtime libraries for Faster-Whisper")
     return loaded
 
 
@@ -116,9 +124,9 @@ _prepare_cuda_runtime_libraries()
 
 import faster_whisper
 from backend.config import WHISPER_MODEL_SIZE, WHISPER_COMPUTE_TYPE_CUDA, WHISPER_COMPUTE_TYPE_CPU
-from typing import Callable, Optional
 
 _model = None
+_model_loaded = False
 
 
 def _load_model():
@@ -138,15 +146,15 @@ def _load_model():
 
     for device, compute_type, label in attempts:
         try:
-            print(f"[INFO] Loading Whisper model on {label} (compute_type={compute_type})...")
+            logger.info(f"Loading Whisper model on {label} (compute_type={compute_type})...")
             _model = faster_whisper.WhisperModel(
                 WHISPER_MODEL_SIZE, device=device, compute_type=compute_type
             )
-            print(f"[INFO] Whisper model loaded on {label} successfully")
+            logger.info(f"Whisper model loaded on {label} successfully")
             return _model
         except Exception as e:
             msg = f"Failed to load on {label}: {e}"
-            print(f"[WARN] {msg}")
+            logger.warning(f"{msg}")
             errors.append(msg)
             continue
 
@@ -154,15 +162,21 @@ def _load_model():
     raise RuntimeError("Could not load Whisper model on CUDA.\n  " + "\n  ".join(errors) + hint)
 
 
-# Initialize at module level, catching errors so the app doesn't crash on import
-try:
-    _load_model()
-except Exception as e:
-    print(f"[ERROR] Whisper model initialization failed: {e}")
-    print("[INFO] Transcription will fail at runtime - check CUDA/cuDNN installation")
+def _ensure_model():
+    """Lazily load the Whisper model on first transcription call."""
+    global _model, _model_loaded
+    if _model_loaded:
+        return
+    try:
+        _load_model()
+        _model_loaded = True
+    except Exception as e:
+        logger.error(f"Whisper model initialization failed: {e}")
+        logger.info("Transcription will fail at runtime - check CUDA/cuDNN installation")
 
 
-def transcribe_video(video_path: str, progress_cb: Optional[Callable[[str, float], None]] = None) -> list[dict]:
+def transcribe_video(video_path: str, progress_cb: Callable[[str, float], None] | None = None) -> list[dict]:
+    _ensure_model()
     if _model is None:
         raise RuntimeError("Whisper CUDA model failed to load. Check CUDA/cuDNN installation or ensure sufficient GPU memory.")
 

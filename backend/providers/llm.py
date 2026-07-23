@@ -1,10 +1,25 @@
+"""LLM provider — synchronous OpenAI-compatible API calls with retry logic.
+
+Provides call_llm_sync() with exponential backoff, model fallback,
+error classification, and structured LLMInteraction records for UI display.
+Also provides cached_call_llm_sync() with TTL caching for deterministic prompts.
+"""
+from __future__ import annotations
+
+import hashlib
 import json
+import logging
 import time
-from typing import Any, Dict, List, Optional
+from datetime import datetime
+from typing import Any
+
 import openai
 
 from backend.models import LLMInteraction
-from datetime import datetime
+
+__all__ = ["call_llm_sync", "cached_call_llm_sync", "clear_llm_cache"]
+
+logger = logging.getLogger(__name__)
 
 
 def _now_timestamp() -> str:
@@ -44,15 +59,15 @@ def _truncate_preview(text: str, max_len: int = 300) -> str:
 
 
 def call_llm_sync(
-    messages: List[Dict[str, Any]],
+    messages: list[dict[str, Any]],
     model: str,
     api_key: str,
     base_url: str = "https://integrate.api.nvidia.com/v1",
     temperature: float = 0.0,
     max_tokens: int = 131072,
     timeout: float = 480.0,
-    reporter: Optional[Any] = None,
-    interactions: Optional[List[LLMInteraction]] = None,
+    reporter: Any = None,
+    interactions: list[LLMInteraction] | None = None,
     stage_name: str = "reel_plan",
 ) -> str:
     """Synchronous LLM call with enhanced retry logic and exponential backoff.
@@ -237,3 +252,69 @@ def call_llm_sync(
         f"All NVIDIA models failed after {max_attempts_per_model} retries each. "
         f"Last error: {last_error}"
     )
+
+
+# ---------------------------------------------------------------------------
+# TTL Cache for LLM responses (avoids re-calling for identical prompts)
+# ---------------------------------------------------------------------------
+_LLM_CACHE_TTL = 300  # 5 minutes
+_llm_cache: dict[str, tuple[float, str]] = {}
+
+
+def _cache_key(messages: list, model: str) -> str:
+    """Deterministic cache key from messages + model."""
+    blob = json.dumps({"m": messages, "model": model}, sort_keys=True, default=str)
+    return hashlib.sha256(blob.encode()).hexdigest()[:16]
+
+
+def cached_call_llm_sync(
+    messages: list[dict[str, Any]],
+    model: str,
+    api_key: str,
+    base_url: str = "https://integrate.api.nvidia.com/v1",
+    temperature: float = 0.0,
+    max_tokens: int = 131072,
+    timeout: float = 480.0,
+    reporter: Any = None,
+    interactions: list[LLMInteraction] | None = None,
+    stage_name: str = "reel_plan",
+    use_cache: bool = True,
+) -> str:
+    """LLM call with TTL cache. Cached responses skip the API entirely."""
+    if not use_cache or temperature != 0.0:
+        return call_llm_sync(messages, model, api_key, base_url, temperature,
+                             max_tokens, timeout, reporter, interactions, stage_name)
+
+    key = _cache_key(messages, model)
+    now = time.monotonic()
+
+    if key in _llm_cache:
+        cached_time, cached_val = _llm_cache[key]
+        if now - cached_time < _LLM_CACHE_TTL:
+            logger.debug("[LLM] Cache hit for %s (age %.0fs)", stage_name, now - cached_time)
+            if reporter:
+                reporter.log_debug(f"[LLM] Cache hit for {stage_name} ({now - cached_time:.0f}s old)")
+            if interactions is not None:
+                interactions.append(LLMInteraction(
+                    timestamp=_now_timestamp(),
+                    type="cache_hit",
+                    role="assistant",
+                    content=f"Cache hit for {stage_name}",
+                    full_content=cached_val,
+                    model=model,
+                    retry_count=0,
+                    stage_name=stage_name,
+                ))
+            return cached_val
+        else:
+            del _llm_cache[key]
+
+    result = call_llm_sync(messages, model, api_key, base_url, temperature,
+                           max_tokens, timeout, reporter, interactions, stage_name)
+    _llm_cache[key] = (now, result)
+    return result
+
+
+def clear_llm_cache():
+    """Clear the LLM response cache."""
+    _llm_cache.clear()

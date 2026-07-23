@@ -5,7 +5,7 @@ from typing import Dict, List, Optional, Any
 import subprocess
 import json
 import os
-from backend.config import FFMPEG_PATH
+from backend.ffmpeg_utils import get_ffmpeg
 
 # Module-level EasyOCR reader cache (expensive to instantiate)
 _easyocr_reader = None
@@ -24,7 +24,7 @@ def _extract_frame(video_path: str, timestamp_seconds: float, output_path: str) 
     """Extract a single frame at timestamp from video using ffmpeg."""
     try:
         cmd = [
-            FFMPEG_PATH, "-loglevel", "error",
+            get_ffmpeg(), "-loglevel", "error",
             "-ss", str(timestamp_seconds),
             "-i", str(video_path),
             "-vframes", "1",

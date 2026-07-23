@@ -8,28 +8,13 @@ import re
 import shutil
 
 
-from backend.config import FFMPEG_PATH, FFPROBE_PATH
-
-
-def _get_ffmpeg_path() -> str:
-    if os.path.exists(FFMPEG_PATH):
-        return FFMPEG_PATH
-    path = shutil.which("ffmpeg")
-    if path:
-        return path
-    raise RuntimeError("ffmpeg not found.")
-
-
-def _get_ffprobe_path() -> Optional[str]:
-    if os.path.exists(FFPROBE_PATH):
-        return FFPROBE_PATH
-    return shutil.which("ffprobe")
+from backend.ffmpeg_utils import get_ffmpeg, get_ffprobe
 
 
 def get_video_duration(video_path: str) -> float:
     """Get video duration in seconds using ffprobe."""
     try:
-        ffprobe_path = _get_ffprobe_path()
+        ffprobe_path = get_ffprobe()
         if ffprobe_path:
             cmd = [
                 ffprobe_path, "-v", "error",
@@ -41,7 +26,7 @@ def get_video_duration(video_path: str) -> float:
             return float(result.stdout.strip())
 
         result = subprocess.run(
-            [_get_ffmpeg_path(), "-i", str(video_path)],
+            [get_ffmpeg(), "-i", str(video_path)],
             capture_output=True, text=True, timeout=30
         )
         match = re.search(r"Duration: (\d+):(\d+):(\d+(?:\.\d+)?)", result.stderr)
@@ -132,7 +117,7 @@ def detect_silence_ffmpeg(
     import re
 
     cmd = [
-        _get_ffmpeg_path(), "-loglevel", "info",
+        get_ffmpeg(), "-loglevel", "info",
         "-y",
         "-i", str(video_path),
         "-af", f"silencedetect=n={silence_threshold_db}dB:d={silence_duration}",
@@ -202,7 +187,7 @@ def trim_silence(
 
     if not silence_segments:
         # No silence detected, just copy
-        cmd_copy = [_get_ffmpeg_path(), "-loglevel", "error", "-i", str(input_path), "-c", "copy", "-y", str(output_path)]
+        cmd_copy = [get_ffmpeg(), "-loglevel", "error", "-i", str(input_path), "-c", "copy", "-y", str(output_path)]
         try:
             subprocess.run(cmd_copy, capture_output=True, check=True, timeout=120)
             return True, 0.0
@@ -235,7 +220,7 @@ def trim_silence(
 
     if time_saved <= min_audio_gap:
         # Not worth trimming
-        cmd_copy = [_get_ffmpeg_path(), "-loglevel", "error", "-i", str(input_path), "-c", "copy", "-y", str(output_path)]
+        cmd_copy = [get_ffmpeg(), "-loglevel", "error", "-i", str(input_path), "-c", "copy", "-y", str(output_path)]
         try:
             subprocess.run(cmd_copy, capture_output=True, check=True, timeout=120)
             return True, 0.0
@@ -244,7 +229,7 @@ def trim_silence(
 
     # Apply trim
     cmd_trim = [
-        _get_ffmpeg_path(), "-loglevel", "error",
+        get_ffmpeg(), "-loglevel", "error",
         "-i", str(input_path),
         "-ss", str(start_trim),
         "-to", str(end_trim),
@@ -317,7 +302,7 @@ def apply_edits(
                 input_path = str(temp_path)
 
     # Step 2: Final copy (no speed adjustment — natural pacing at 1.0x)
-    final_cmd = [_get_ffmpeg_path(), "-loglevel", "error", "-i", str(input_path), "-c", "copy", "-y", str(output_path)]
+    final_cmd = [get_ffmpeg(), "-loglevel", "error", "-i", str(input_path), "-c", "copy", "-y", str(output_path)]
     try:
         subprocess.run(final_cmd, capture_output=True, check=True, timeout=60)
     except subprocess.CalledProcessError:
