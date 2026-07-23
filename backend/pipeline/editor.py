@@ -133,10 +133,10 @@ def detect_silence_ffmpeg(
 
     cmd = [
         _get_ffmpeg_path(), "-loglevel", "info",
+        "-y",
         "-i", str(video_path),
         "-af", f"silencedetect=n={silence_threshold_db}dB:d={silence_duration}",
         "-f", "null", "-",
-        "-y"
     ]
 
     try:

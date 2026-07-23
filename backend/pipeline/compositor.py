@@ -62,27 +62,31 @@ def _run_ffmpeg(cmd: list, description: str, attempt: int = 1, max_attempts: int
         stderr_text = e.stderr.decode(errors="replace") if e.stderr else "(no stderr)"
         if attempt < max_attempts and "h264_nvenc" in " ".join(cmd) and os.environ.get("ALLOW_CPU_FFMPEG_FALLBACK") == "1":
             print(f"[WARN] NVENC failed for {description}, retrying with libx264: {stderr_text[:200]}")
-            # Rebuild command from scratch for CPU encoding (avoids arg patching bugs)
+            # Rebuild command from scratch for CPU encoding (avoids arg patching bugs).
+            # Extract only the encoder-agnostic args: -ss, -i, -t, -filter_complex, -map, -y
+            # and the output path (always last). Drop everything else (encoder opts, pix_fmt, etc.).
             new_cmd = [FFMPEG_PATH, "-loglevel", "error"]
             i = 1  # skip FFMPEG_PATH
-            while i < len(cmd):
+            output_path = cmd[-1] if cmd else None
+            while i < len(cmd) - 1:  # stop before last arg (output path)
                 arg = cmd[i]
-                if arg in ("-ss", "-i", "-t"):
+                if arg in ("-ss", "-i", "-t") and i + 1 < len(cmd) - 1:
+                    new_cmd.extend([arg, cmd[i + 1]]); i += 2
+                elif arg == "-filter_complex" and i + 1 < len(cmd) - 1:
+                    new_cmd.extend([arg, cmd[i + 1]]); i += 2
+                elif arg == "-map" and i + 1 < len(cmd) - 1:
                     new_cmd.extend([arg, cmd[i + 1]]); i += 2
                 elif arg in ("-y",):
                     new_cmd.append(arg); i += 1
-                elif arg == "-filter_complex":
-                    new_cmd.extend([arg, cmd[i + 1]]); i += 2
-                elif arg.startswith("[") and cmd[i + 1] == "-map" if i + 1 < len(cmd) else False:
-                    new_cmd.extend([arg, cmd[i + 1]]); i += 2
-                elif arg == "-map":
+                elif arg.startswith("[") and (i + 1 < len(cmd) - 1 and cmd[i + 1] == "-map"):
                     new_cmd.extend([arg, cmd[i + 1]]); i += 2
                 else:
-                    i += 1  # skip all encoder-specific args
+                    i += 1  # skip encoder-specific args
+            # Append CPU encoder opts, audio, movflags, and output
             new_cmd.extend(["-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "medium", "-crf", "23"])
             new_cmd.extend(["-c:a", "aac", "-b:a", "192k"])
             new_cmd.extend(["-movflags", "+faststart", "-avoid_negative_ts", "make_zero"])
-            new_cmd.extend(["-y", cmd[-1]])  # output path is last arg
+            new_cmd.extend(["-y", output_path])
             return _run_ffmpeg(new_cmd, description, attempt + 1, max_attempts, cwd=cwd)
         raise RuntimeError(f"{description} failed: {stderr_text[:1000]}") from e
 
@@ -287,7 +291,10 @@ def _build_ducking_filter_chain(
     if len(duck_terms) == 1:
         duck_expr = duck_terms[0]
     else:
-        duck_expr = f"max({','.join(duck_terms)})"
+        # FFmpeg max() only accepts 2 arguments — nest for 3+
+        duck_expr = duck_terms[0]
+        for term in duck_terms[1:]:
+            duck_expr = f"max({duck_expr},{term})"
 
     vol_expr = f"1.0-({duck_expr}*{DEPTH:.2f})"
     print(f"[INFO] VAD ducking: {len(duck_terms)} speech segments, "
@@ -686,8 +693,9 @@ def compose_group(
             "-i", str(narration_audio_output),
             "-filter_complex",
             f"{duck_chain};"
+            # Boost narration volume significantly — it must punch through the background
             f"[1:a]volume={NARRATION_VOLUME_BOOST}[narr];"
-            f"[ducked][narr]amix=inputs=2:duration=first:dropout_transition=0.1:normalize=0,"
+            f"[ducked][narr]amix=inputs=2:duration=longest:dropout_transition=0.1:normalize=0,"
             f"alimiter=limit={ALIMITER_LIMIT}:attack={ALIMITER_ATTACK_MS}:release={ALIMITER_RELEASE_MS}:level=disabled,"
             f"apad=whole_dur={target_duration:.2f},atrim=end={target_duration:.2f}[mixed]",
             "-map", "[mixed]",

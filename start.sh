@@ -13,7 +13,7 @@ else
 fi
 
 echo "=== Unhuman Clips Backend ==="
-PORT="${PORT:-8000}"
+PORT="${PORT:-9000}"
 HOST="${HOST:-127.0.0.1}"
 
 echo "Starting server on http://${HOST}:${PORT}"

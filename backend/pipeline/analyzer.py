@@ -278,10 +278,12 @@ Your PRIMARY constraint is TOTAL DURATION, not clip count.
 Duration math:
   total_clip_duration = sum of (source_end - source_start) for all clips
   total_narration_duration = sum of (reel_end - reel_start) for all narration events
-  estimated_duration = total_clip_duration + total_narration_duration + 2.0
+  NOTE: Narration OVERLAPS the video — it plays ON TOP of the clips, not after them.
+  Therefore: estimated_duration = total_clip_duration + 2.0 (narration does NOT add to duration)
 
 Target: estimated_duration should be {dur_min}-{dur_max} seconds.
-- Clips alone should sum to {dur_min - 5}s to {dur_max - 5}s (narration fills the rest)
+- Clips alone should sum to {dur_min - 5}s to {dur_max - 5}s.
+- DO NOT add narration duration to clip duration — narration is overlaid, not appended.
 - DO NOT pad clips to fill time. Pick the RIGHT clips, then calculate duration.
 - If your selection is under {dur_min}s, add more clips. If over {dur_max}s, remove clips.
 
@@ -350,7 +352,7 @@ Use contractions. Be conversational. Be specific.
 Before outputting, you MUST verify:
 1. total_clip_duration = sum of (source_end - source_start) for all clips
 2. total_narration_duration = sum of (reel_end - reel_start) for all narration events
-3. estimated_duration = total_clip_duration + total_narration_duration + 2.0
+3. estimated_duration = total_clip_duration + 2.0 (narration OVERLAPS clips, does NOT add to duration)
 4. estimated_duration >= {dur_min}? If NO: add more clips until YES.
 5. estimated_duration <= {dur_max}? If NO: remove clips or shorten clips until YES.
 6. Clips span early/middle/late zones? If NO: replace clips to fix coverage.
@@ -557,7 +559,7 @@ def select_reel_plan(
             try:
                 reel_plan = json.loads(raw_json)
             except json.JSONDecodeError:
-                repaired = _try_repair_truncated_json(raw_content_retry)
+                repaired = _try_repair_truncated_json(raw_json)
                 if repaired:
                     print(f"[INFO] Repaired malformed JSON from LLM retry")
                     reel_plan = json.loads(repaired)
@@ -625,6 +627,30 @@ def select_reel_plan(
         if usable_count == 0:
             print(f"[WARN] Group {i} has ZERO usable narration events after filtering — "
                   f"this group's final video will have NO narration audio.")
+
+        # === NARRATION DISTRIBUTION CHECK ===
+        # Ensure commentary events are spread across the reel, not clustered at the end.
+        # If all commentary events are in the last 40% of the reel, redistribute them.
+        est_dur = group.get("estimated_duration_seconds", 120)
+        commentary_events = [e for e in group["narration_events"]
+                           if str(e.get("event_type", "")).strip().lower() == "commentary"
+                           and e.get("reel_end", 0) - e.get("reel_start", 0) >= 0.3]
+        if len(commentary_events) >= 2:
+            last_40_start = est_dur * 0.6
+            all_in_tail = all(e.get("reel_start", 0) >= last_40_start for e in commentary_events)
+            if all_in_tail:
+                print(f"[WARN] Group {i}: ALL {len(commentary_events)} commentary events clustered in "
+                      f"last 40% of reel (after {last_40_start:.1f}s). Redistributing across reel...")
+                # Redistribute: place at 25%, 50%, 75% of reel duration
+                targets = [0.25, 0.50, 0.75]
+                for idx, event in enumerate(commentary_events):
+                    fraction = targets[idx % len(targets)]
+                    new_start = round(est_dur * fraction, 2)
+                    dur = event.get("reel_end", 0) - event.get("reel_start", 0)
+                    event["reel_start"] = new_start
+                    event["reel_end"] = round(new_start + dur, 2)
+                    print(f"[INFO]   Redistributed commentary {idx+1}: "
+                          f"reel_start={new_start:.2f}s, reel_end={event['reel_end']:.2f}s")
 
     # Soft log if group count differs from target — don't waste an LLM call
     # retrying, since the target is content-proportional and the LLM may have
@@ -712,17 +738,18 @@ def select_reel_plan(
         clips_total = sum(c.get("source_end", 0) - c.get("source_start", 0) for c in clips)
         nar_events = group.get("narration_events", [])
         nar_total = sum(e.get("reel_end", 0) - e.get("reel_start", 0) for e in nar_events)
-        actual_estimated = clips_total + nar_total + 2.0
+        # Narration OVERLAPS clips — it plays on top, not after. Do NOT add nar_total.
+        actual_estimated = clips_total + 2.0
 
         # Re-set estimated_duration_seconds to the computed actual if LLM estimate is too far off
         llm_estimate = group.get("estimated_duration_seconds", 0)
         if llm_estimate < min_reel_dur and source_duration >= min_reel_dur:
             print(f"[WARN] Group {i}: LLM estimated_duration_seconds={llm_estimate:.1f}s is below target {min_reel_dur}s. "
-                  f"Actual computed: {actual_estimated:.1f}s (clips={clips_total:.1f}s, narration={nar_total:.1f}s).")
+                  f"Actual computed: {actual_estimated:.1f}s (clips={clips_total:.1f}s, narration overlaid={nar_total:.1f}s).")
 
         # Bump estimated_duration_seconds to at least the computed actual
         if actual_estimated > llm_estimate:
-            print(f"[INFO] Group {i}: Raising estimated_duration_seconds from {llm_estimate:.1f}s to {actual_estimated:.1f}s (computed from {len(clips)} clips + {len(nar_events)} events + 2s pad)")
+            print(f"[INFO] Group {i}: Raising estimated_duration_seconds from {llm_estimate:.1f}s to {actual_estimated:.1f}s (computed from {len(clips)} clips + 2s pad, narration overlaid)")
             group["estimated_duration_seconds"] = round(actual_estimated, 1)
 
         # Log detailed per-group report

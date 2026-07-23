@@ -10,7 +10,6 @@ from backend.pipeline.clipper import cut_group_clips
 from backend.pipeline.tts import synthesize_commentary
 from backend.pipeline.captioner import generate_clip_ass, generate_commentary_ass
 from backend.pipeline.compositor import compose_group
-from backend.pipeline.sanitize import sanitize_text
 from backend.progress import ProgressReporter
 
 
@@ -527,10 +526,11 @@ class QueueManager:
                     f"Group {group_idx+1}: TTS for {event.event_type} ({i+1}/{total_narration})",
                     (i / total_narration) * 100 if total_narration > 0 else 100,
                 )
-                # Clean TTS text using shared sanitization
-                clean_text = sanitize_text(event.text)
+                # Text is already sanitized by analyzer.select_reel_plan();
+                # no need to sanitize again here (avoids double-escaping issues).
+                clean_text = event.text
                 if not clean_text:
-                    clean_text = event.text or "Notice this key moment."
+                    clean_text = "Notice this key moment."
                 event.text = clean_text
 
                 job.stage_data = {

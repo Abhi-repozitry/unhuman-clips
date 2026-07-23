@@ -1,6 +1,6 @@
 @echo off
 echo === Unhuman Clips Backend ===
-echo Starting server on http://127.0.0.1:8000
+echo Starting server on http://127.0.0.1:9000
 echo.
 
 REM Note:
@@ -14,10 +14,10 @@ set "BACKEND_DIR=%PROJECT_DIR%backend"
 
 REM Try venv Python first, fall back to system Python
 if exist "%BACKEND_DIR%\venv\Scripts\python.exe" (
-  "%BACKEND_DIR%\venv\Scripts\python.exe" -m uvicorn backend.main:app --reload --host 127.0.0.1 --port 8000 --app-dir "%PROJECT_DIR%"
+  "%BACKEND_DIR%\venv\Scripts\python.exe" -m uvicorn backend.main:app --reload --host 127.0.0.1 --port 9000 --app-dir "%PROJECT_DIR%"
 ) else (
   echo Warning: venv not found, using system Python
-  python -m uvicorn backend.main:app --reload --host 127.0.0.1 --port 8000 --app-dir "%PROJECT_DIR%"
+  python -m uvicorn backend.main:app --reload --host 127.0.0.1 --port 9000 --app-dir "%PROJECT_DIR%"
 )
 
 pause

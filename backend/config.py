@@ -30,7 +30,7 @@ WHISPER_COMPUTE_TYPE_CPU = os.environ.get("WHISPER_COMPUTE_TYPE_CPU", "int8")
 NVIDIA_API_KEY = os.environ.get("NVIDIA_API_KEY")
 NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
 NVIDIA_MODEL = os.environ.get("NVIDIA_MODEL", "stepfun-ai/step-3.7-flash")
-NVIDIA_MODEL_FALLBACK = os.environ.get("NVIDIA_MODEL_FALLBACK", "stepfun-ai/step-3.7-flash")
+NVIDIA_MODEL_FALLBACK = os.environ.get("NVIDIA_MODEL_FALLBACK", "openai/gpt-oss-120b")
 
 CLIP_COUNT_MIN = int(os.environ.get("CLIP_COUNT_MIN", "6"))
 CLIP_COUNT_MAX = int(os.environ.get("CLIP_COUNT_MAX", "12"))
@@ -63,8 +63,8 @@ VAD_SCURVE_RAMP_SECONDS = float(os.environ.get("VAD_SCURVE_RAMP_SECONDS", "0.15"
 VAD_DUCKING_DEPTH = float(os.environ.get("VAD_DUCKING_DEPTH", "0.97"))
 VAD_SILENCE_THRESHOLD = float(os.environ.get("VAD_SILENCE_THRESHOLD", "0.3"))
 
-# Audio mixing constants
-NARRATION_VOLUME_BOOST = float(os.environ.get("NARRATION_VOLUME_BOOST", "1.15"))
-ALIMITER_LIMIT = float(os.environ.get("ALIMITER_LIMIT", "0.90"))
+# Audio mixing constants — narration must be LOUD to be clearly audible over background
+NARRATION_VOLUME_BOOST = float(os.environ.get("NARRATION_VOLUME_BOOST", "2.5"))
+ALIMITER_LIMIT = float(os.environ.get("ALIMITER_LIMIT", "0.95"))
 ALIMITER_ATTACK_MS = int(os.environ.get("ALIMITER_ATTACK_MS", "3"))
 ALIMITER_RELEASE_MS = int(os.environ.get("ALIMITER_RELEASE_MS", "50"))

@@ -1,7 +1,7 @@
 providers:
   nvidia_nim:
     primary: stepfun-ai/step-3.7-flash
-    fallback: stepfun-ai/step-3.7-flash
+    fallback: openai/gpt-oss-120b
     base_url: https://integrate.api.nvidia.com/v1
     api_key_env: NVIDIA_API_KEY
 

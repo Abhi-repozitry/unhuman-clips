@@ -38,3 +38,9 @@ frontend/
 
 # Logs
 *.log
+
+# Temporary / debug files
+*.wav
+*.patch
+*.txt
+cookies.txt

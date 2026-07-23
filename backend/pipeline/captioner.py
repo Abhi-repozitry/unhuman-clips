@@ -1,14 +1,11 @@
-from backend.config import CAPTION_FONT, CAPTION_FONT_SIZE
-from typing import Callable, Optional, List, Dict, Any
-from backend.pipeline.ocr import detect_existing_captions
+from backend.config import CAPTION_FONT
+from typing import Callable, Optional
 from backend.pipeline.sanitize import sanitize_text
-from pathlib import Path
 
 
 # Caption sizes (9:16 portrait, 1080x1920)
 CLIP_CAPTION_SIZE = 56       # Larger than before (was 48 default)
 COMMENTARY_CAPTION_SIZE = 64  # Larger than before (was 48+8=56)
-NARRATION_CAPTION_SIZE = 62  # Top narration captions
 
 # Key words to highlight with color
 KEY_WORDS = {
@@ -97,9 +94,9 @@ def _highlight_key_words(text: str) -> str:
     """
     Wrap key words in ASS override tags to highlight them with a different color.
     Returns text with {\\c&Hxxxxxx&} tags around key words.
+    Text is already ASS-escaped — do NOT call _escape_ass_text here.
     """
-    escaped = _escape_ass_text(text)
-    words = escaped.split()
+    words = text.split()
     result_parts = []
     for word in words:
         # Strip ASS tags for checking
@@ -147,7 +144,8 @@ def generate_clip_ass(transcript: list, clip_start: float, clip_end: float,
 
     dialogues = []
     for entry in filtered:
-        wrapped = _wrap_text_ass(entry["text"], max_chars=22)  # Tighter wrap for larger font
+        escaped = _escape_ass_text(entry["text"])  # Escape BEFORE wrapping
+        wrapped = _wrap_text_ass(escaped, max_chars=22)  # Wrap adds \N line breaks
         highlighted = _highlight_key_words(wrapped)
         start_ts = _format_timestamp(entry["start"] + start_time)
         end_ts = _format_timestamp(entry["end"] + start_time)
@@ -178,7 +176,8 @@ def generate_commentary_ass(text: str, duration: float, out_path: str,
         progress_cb("Wrapping commentary text...", 30)
 
     text = sanitize_text(text)
-    wrapped = _wrap_text_ass(text, max_chars=22)  # Tighter for readability
+    escaped = _escape_ass_text(text)  # Escape BEFORE wrapping
+    wrapped = _wrap_text_ass(escaped, max_chars=22)  # Wrap adds \N line breaks
     highlighted = _highlight_key_words(wrapped)
 
     if progress_cb:
@@ -217,144 +216,3 @@ def generate_commentary_ass(text: str, duration: float, out_path: str,
     return out_path
 
 
-def generate_group_captions(
-    transcript: list,
-    source_clips: List[Dict[str, float]],
-    narration_events: List[Dict[str, Any]],
-    working_dir: str,
-    group_idx: int,
-    source_path: str,
-    progress_cb: Optional[Callable[[str, float], None]] = None,
-) -> Dict[str, List[str]]:
-    """
-    Generate all captions for a single reel group.
-    
-    Returns dict with:
-    - "clip_captions": list of paths (bottom zone)
-    - "narration_captions": list of paths (top zone)
-    - "has_existing_captions": list of bool per source_clip (from OCR)
-    
-    OCR Integration: Runs detect_existing_captions on source_clips.
-    Skips clip caption generation where has_captions=True.
-    """
-    working_dir = Path(working_dir)
-    working_dir.mkdir(parents=True, exist_ok=True)
-
-    if progress_cb:
-        progress_cb(f"Group {group_idx+1}: Checking for existing burned-in captions...", 10)
-
-    # OCR: detect existing captions on source clips
-    caption_results = detect_existing_captions(
-        video_path=source_path,
-        clip_windows=[{"start": c["source_start"], "end": c["source_end"]} for c in source_clips],
-        working_dir=str(working_dir / "ocr"),
-        progress_cb=lambda msg, p: progress_cb(f"OCR: {msg}", 10 + p * 0.2) if progress_cb else None,
-    )
-
-    has_existing = [r.get("has_captions", False) for r in caption_results]
-    skipped_count = sum(1 for h in has_existing if h)
-    if skipped_count:
-        print(f"[INFO] Group {group_idx}: Skipping clip caption generation for {skipped_count} clip(s) with existing captions")
-
-    # Clip captions (bottom zone) - only for clips WITHOUT existing captions
-    clip_caption_paths = []
-    for i, clip in enumerate(source_clips):
-        if has_existing[i]:
-            clip_caption_paths.append(None)  # placeholder for skipped
-            continue
-
-        out_path = working_dir / f"group_{group_idx}_clip_caption_{i}.ass"
-
-        if progress_cb:
-            progress_cb(f"Group {group_idx+1}: Generating clip caption {i+1}/{len(source_clips)}...", 
-                       30 + (i / len(source_clips)) * 30)
-
-        generate_clip_ass(
-            transcript,
-            clip["source_start"],
-            clip["source_end"],
-            str(out_path),
-            progress_cb=lambda msg, p: progress_cb(f"Clip {i+1} caption: {msg}", 30 + (i + p/100) / len(source_clips) * 30) if progress_cb else None,
-        )
-        clip_caption_paths.append(str(out_path))
-
-    # Narration captions (top zone) - reel-relative timing
-    narration_caption_paths = []
-    for i, event in enumerate(narration_events):
-        if event.get("event_type") not in ("hook", "commentary"):
-            continue
-
-        out_path = working_dir / f"group_{group_idx}_narr_caption_{i}.ass"
-
-        if progress_cb:
-            progress_cb(f"Group {group_idx+1}: Generating narration caption {i+1}/{len(narration_events)}...",
-                       60 + (i / len(narration_events)) * 30)
-
-        generate_narration_ass(
-            event["text"],
-            event["reel_end"] - event["reel_start"],
-            str(out_path),
-            progress_cb=lambda msg, p: progress_cb(f"Narr {i+1} caption: {msg}", 60 + (i + p/100) / len(narration_events) * 30) if progress_cb else None,
-        )
-        narration_caption_paths.append({
-            "event_type": event["event_type"],
-            "reel_start": event["reel_start"],
-            "reel_end": event["reel_end"],
-            "path": str(out_path),
-        })
-
-    if progress_cb:
-        progress_cb(f"Group {group_idx+1}: All captions generated", 100)
-
-    return {
-        "clip_captions": clip_caption_paths,
-        "narration_captions": narration_caption_paths,
-        "has_existing_captions": has_existing,
-    }
-
-
-def generate_narration_ass(text: str, duration: float, out_path: str,
-                           progress_cb: Optional[Callable[[str, float], None]] = None) -> str:
-    """Generate narration caption — TOP zone (alignment=8, margin_v=80).
-    Enhanced with larger font, key word highlighting, and better positioning."""
-    if progress_cb:
-        progress_cb("Wrapping narration text...", 30)
-
-    text = sanitize_text(text)
-    wrapped = _wrap_text_ass(text, max_chars=22)
-    highlighted = _highlight_key_words(wrapped)
-
-    if progress_cb:
-        progress_cb("Generating ASS format...", 70)
-
-    style_line = _make_style(
-        "NarrationCaption", CAPTION_FONT, NARRATION_CAPTION_SIZE,
-        alignment=8,     # top center
-        margin_v=80,     # 80px from top edge
-        outline=4, shadow=3,
-        bold=1,          # Bold for emphasis
-        primary="&H00FFFFFF",
-        back="&H80000000"
-    )
-
-    start_ts = _format_timestamp(0.0)
-    end_ts = _format_timestamp(duration)
-    text_escaped = highlighted
-
-    dialogue = (
-        f"Dialogue: 0,{start_ts},{end_ts},NarrationCaption,,0,0,0,,"
-        f"{{\\bord4\\shad3\\b1\\fn{CAPTION_FONT}}}{text_escaped}"
-    )
-
-    ass_content = _ass_header(style_line, dialogue)
-
-    try:
-        with open(out_path, "w", encoding="utf-8") as f:
-            f.write(ass_content)
-    except IOError as e:
-        raise RuntimeError(f"Failed to write ASS file: {e}") from e
-
-    if progress_cb:
-        progress_cb("Narration caption generated", 100)
-
-    return out_path
