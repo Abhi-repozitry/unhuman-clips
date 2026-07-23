@@ -90,7 +90,9 @@ def detect_silence_with_vad(
         silence_segments = []
         prev_end = 0.0
 
-        for speech_start, speech_end in speech_timestamps:
+        for ts in speech_timestamps:
+            speech_start = ts["start"]
+            speech_end = ts["end"]
             if speech_start > prev_end:
                 silence_duration = speech_start - prev_end
                 if silence_duration >= min_silence_duration:
@@ -177,8 +179,10 @@ def detect_silence(
     silence_duration: float = 0.3
 ) -> List[Dict[str, float]]:
     """Detect silent segments using Silero VAD (preferred) or ffmpeg fallback.
-    More aggressive defaults for tighter pacing."""
-    return detect_silence_with_vad(video_path, min_silence_duration=silence_duration)
+    Converts dB threshold to VAD probability threshold (0.0-1.0)."""
+    # Convert dB to VAD threshold: -35dB ≈ 0.5, -20dB ≈ 0.8, -50dB ≈ 0.2
+    vad_threshold = max(0.1, min(0.9, 10 ** (silence_threshold_db / 20.0)))
+    return detect_silence_with_vad(video_path, threshold=vad_threshold, min_silence_duration=silence_duration)
 
 
 def trim_silence(
@@ -279,6 +283,7 @@ def apply_edits(
     working_path.mkdir(parents=True, exist_ok=True)
 
     input_path_obj = Path(input_path)
+    original_input_path = input_path  # Save before trim modifies it
     output_path = working_path / f"edited_{input_path_obj.name}"
     temp_path = working_path / f"temp_trim_{input_path_obj.name}"
 
@@ -316,8 +321,8 @@ def apply_edits(
     try:
         subprocess.run(final_cmd, capture_output=True, check=True, timeout=60)
     except subprocess.CalledProcessError:
-        # Fallback: just copy original
-        output_path = Path(input_path)
+        # Fallback: just copy original untrimmed file
+        output_path = Path(original_input_path)
 
     final_duration = get_video_duration(str(output_path))
 

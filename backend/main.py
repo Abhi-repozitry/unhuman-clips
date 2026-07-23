@@ -4,6 +4,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
+from pydantic import BaseModel
 from backend.config import OUTPUTS_DIR
 from backend.models import VideoJob
 from backend.queue_manager import QueueManager
@@ -63,18 +64,26 @@ app.mount("/outputs", StaticFiles(directory=str(OUTPUTS_DIR)), name="outputs")
 FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend" / "renderer"
 
 
+class CreateJobRequest(BaseModel):
+    url: str
+
+
 @app.post("/jobs")
-async def create_job(body: dict):
-    url = body.get("url")
-    if not url:
-        return JSONResponse(status_code=400, content={"error": "url is required"})
-    job = queue_manager.add_job(url)
+async def create_job(body: CreateJobRequest):
+    job = queue_manager.add_job(body.url)
     return job
 
 
 @app.get("/jobs")
 async def list_jobs():
     return queue_manager.get_jobs()
+
+
+@app.delete("/jobs/{job_id}")
+async def delete_job(job_id: str):
+    if queue_manager.delete_job(job_id):
+        return {"ok": True}
+    return JSONResponse(status_code=404, content={"error": "job not found"})
 
 
 @app.websocket("/ws")

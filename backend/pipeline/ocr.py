@@ -5,13 +5,26 @@ from typing import Dict, List, Optional, Any, Tuple, Callable
 import subprocess
 import json
 import os
+from backend.config import FFMPEG_PATH
+
+# Module-level EasyOCR reader cache (expensive to instantiate)
+_easyocr_reader = None
+
+
+def _get_easyocr_reader():
+    """Get or create the EasyOCR reader (cached at module level)."""
+    global _easyocr_reader
+    if _easyocr_reader is None:
+        import easyocr
+        _easyocr_reader = easyocr.Reader(["en"])
+    return _easyocr_reader
 
 
 def _extract_frame(video_path: str, timestamp_seconds: float, output_path: str) -> bool:
     """Extract a single frame at timestamp from video using ffmpeg."""
     try:
         cmd = [
-            "ffmpeg", "-loglevel", "error",
+            FFMPEG_PATH, "-loglevel", "error",
             "-ss", str(timestamp_seconds),
             "-i", str(video_path),
             "-vframes", "1",
@@ -26,8 +39,7 @@ def _extract_frame(video_path: str, timestamp_seconds: float, output_path: str) 
 def _try_easyocr(image_path: str) -> List[Dict[str, Any]]:
     """Try to detect text using EasyOCR. Returns list of {text, confidence, bbox, language}."""
     try:
-        import easyocr
-        reader = easyocr.Reader(["en"])
+        reader = _get_easyocr_reader()
         result = reader.readtext(str(image_path), detail=1, paragraph=False)
         return [
             {
@@ -163,7 +175,7 @@ def detect_frame_text(
                         "clip_idx": clip_idx,
                         "frame_time": midpoint,
                         **r,
-                        "engine": "easyocr" if "easyocr" in str(_try_easyocr.__module__) else "pytesseract"
+                        "engine": "easyocr" if _easyocr_reader is not None else "pytesseract"
                     })
             else:
                 ocr_results.append({

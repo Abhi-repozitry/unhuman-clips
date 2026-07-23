@@ -50,7 +50,7 @@ DOWNLOAD_MAX_HEIGHT = int(os.environ.get("DOWNLOAD_MAX_HEIGHT", "1080"))
 FFMPEG_PATH = r"C:\Projects\unhuman-clips\ffmpeg\ffmpeg-8.1.2-full_build\bin\ffmpeg.exe"
 FFPROBE_PATH = r"C:\Projects\unhuman-clips\ffmpeg\ffmpeg-8.1.2-full_build\bin\ffprobe.exe"
 
-TTS_VOICE = "en-US-ChristopherNeural"
+TTS_VOICE = os.environ.get("TTS_VOICE", "en-US-ChristopherNeural")
 
 CAPTION_FONT_SIZE = 64
 CAPTION_FONT = "Arial"
@@ -62,3 +62,9 @@ VAD_POST_BUFFER_SECONDS = float(os.environ.get("VAD_POST_BUFFER_SECONDS", "0.25"
 VAD_SCURVE_RAMP_SECONDS = float(os.environ.get("VAD_SCURVE_RAMP_SECONDS", "0.15"))
 VAD_DUCKING_DEPTH = float(os.environ.get("VAD_DUCKING_DEPTH", "0.97"))
 VAD_SILENCE_THRESHOLD = float(os.environ.get("VAD_SILENCE_THRESHOLD", "0.3"))
+
+# Audio mixing constants
+NARRATION_VOLUME_BOOST = float(os.environ.get("NARRATION_VOLUME_BOOST", "1.15"))
+ALIMITER_LIMIT = float(os.environ.get("ALIMITER_LIMIT", "0.90"))
+ALIMITER_ATTACK_MS = int(os.environ.get("ALIMITER_ATTACK_MS", "3"))
+ALIMITER_RELEASE_MS = int(os.environ.get("ALIMITER_RELEASE_MS", "50"))

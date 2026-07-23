@@ -2,6 +2,7 @@ import json
 import re
 from backend.config import NVIDIA_API_KEY, NVIDIA_BASE_URL, NVIDIA_MODEL
 from backend.providers.llm import call_llm_sync
+from backend.pipeline.sanitize import sanitize_text
 from typing import Callable, Optional
 
 
@@ -18,7 +19,7 @@ def _call_llm(messages: list, progress_cb: Optional[Callable[[str, float], None]
             model=NVIDIA_MODEL,
             api_key=NVIDIA_API_KEY,
             base_url=NVIDIA_BASE_URL,
-            temperature=0.1,
+            temperature=0.3,
             max_tokens=4000,
         )
     except Exception as e:
@@ -107,8 +108,8 @@ def _fallback_commentary(clip_windows: list) -> list[dict]:
             insight = "The answer depends on what is happening below the surface."
         result.append({
             "clip_index": i,
-            "hook_text": hook,
-            "insight_text": insight,
+            "hook_text": sanitize_text(hook),
+            "insight_text": sanitize_text(insight),
         })
     return result
 
@@ -149,6 +150,7 @@ Rules:
 - Do NOT repeat or paraphrase the transcript.
 - Do NOT narrate what is visibly happening.
 - Do NOT use generic phrases like "watch this", "let's see", "this is interesting", or "here's why".
+- Do NOT use these characters: slash backslash pipe hash underscore angle brackets square brackets curly braces
 - Make each line specific to the video topic and selected moment.
 - Use curiosity, contrast, stakes, or interpretation.
 
@@ -189,10 +191,28 @@ The clip_index must match the order of clip_windows (0, 1, 2, ...)."""
 
         if not isinstance(clip_index, int):
             raise RuntimeError(f"clip_index must be an integer\nRaw: {raw_content}")
+
+        # Bounds check on clip_index
+        if not (0 <= clip_index < len(clip_windows)):
+            print(f"[WARN] clip_index {clip_index} out of range [0, {len(clip_windows)-1}], clamping to 0")
+            clip_index = 0
+
         if not hook_text or not insight_text:
             fallback = _fallback_commentary([clip_windows[clip_index]])[0]
             hook_text = hook_text or fallback["hook_text"]
             insight_text = insight_text or fallback["insight_text"]
+
+        # Sanitize text for ASS/TTS compatibility
+        hook_text = sanitize_text(hook_text)
+        insight_text = sanitize_text(insight_text)
+
+        # Word count validation: truncate if too long
+        hook_words = hook_text.split()
+        if len(hook_words) > 12:
+            hook_text = " ".join(hook_words[:12])
+        insight_words = insight_text.split()
+        if len(insight_words) > 16:
+            insight_text = " ".join(insight_words[:16])
 
         result.append({
             "clip_index": clip_index,

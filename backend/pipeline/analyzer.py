@@ -17,6 +17,7 @@ from backend.config import (
 )
 from backend.models import ReelPlan, LLMInteraction
 from backend.providers.llm import call_llm_sync
+from backend.pipeline.sanitize import sanitize_text
 from typing import Any, Callable, Optional, List
 
 
@@ -35,11 +36,6 @@ def _format_full_transcript(transcript: list) -> str:
     full_text = "\n".join(lines)
     print(f"[INFO] Passing 100% FULL transcript to LLM ({len(lines)} segments, {len(full_text)} chars — NO CHUNKING)")
     return full_text
-
-
-def _summarize_transcript_for_llm(transcript: list, max_total_chars: int = 1000000) -> str:
-    """Backward-compatible alias: passes full un-chunked transcript."""
-    return _format_full_transcript(transcript)
 
 
 def _call_llm(messages: list, progress_cb: Optional[Callable[[str, float], None]] = None,
@@ -214,9 +210,8 @@ def _build_reel_plan_prompt(video_title: str, video_description: str, transcript
                            source_duration: float = 0.0) -> str:
     """Build the full LLM prompt for reel_plan generation.
 
-    IMPROVED: Smart clip selection with quality hierarchy, VAD-aware narration placement,
-    and strict duration enforcement. The LLM must pick HIGH-IMPACT moments only.
-
+    Duration-driven clip selection with varied pacing. The LLM selects a MIX
+    of short, medium, and long clips to fill the target duration naturally.
     Deterministic by design: temperature=0.0, concrete specs.
     """
     reuse_note = ""
@@ -233,10 +228,6 @@ def _build_reel_plan_prompt(video_title: str, video_description: str, transcript
     except (IndexError, ValueError):
         dur_min, dur_max = 90, 150
 
-    # Build clip count targets that force enough content to fill the duration
-    recommended_clip_count = max(6, round(dur_min / 12))
-    max_recommended_clips = min(20, round(dur_max / 8) + 2)
-
     # Compute timeline coverage bins for spread enforcement
     if source_duration > 0:
         early_end = source_duration * 0.25
@@ -246,42 +237,61 @@ def _build_reel_plan_prompt(video_title: str, video_description: str, transcript
     else:
         early_end = mid_start = mid_end = late_start = 0
 
-    return f"""You are an elite short-form content strategist. Your SOLE job is to find the 5-8 highest-impact, most viral-worthy moments in this video and assemble them into a {dur_min}-{dur_max} second vertical reel that MAXIMIZES viewer retention.
+    return f"""You are an elite short-form content strategist. Your SOLE job is to assemble a {dur_min}-{dur_max} second vertical reel by selecting clips of VARIED lengths that create compelling pacing and maximize viewer retention.
 
-You are NOT a summarizer. You are a HUNTER — scanning for PEAK MOMENTS only. Every second must earn its place.
+You are NOT a summarizer. You are an EDITOR — cutting a reel with intentional rhythm. Every clip must earn its place through specific duration choice.
 
-===== CORE MISSION: FIND PEAK MOMENTS =====
-Scan the ENTIRE transcript for moments that make viewers STOP SCROLLING. These are:
+===== CORE MISSION: ASSEMBLE A REEL WITH VARIED PACING =====
+Select clips from the transcript and assemble them into a {dur_min}-{dur_max}s reel. Your KEY decision is the MIX of clip lengths — this determines pacing and energy.
 
-TIER 1 — HIGHEST VALUE (always include if present):
+CLIP DURATION CATEGORIES:
+- SHORT (3-5s): Punchy cuts, reactions, transitions, single-line punchlines, visual stingers.
+  Use 3-5 per reel. These CREATE ENERGY and rhythm. Short clips are your beat drops.
+- MEDIUM (6-15s): Dialogue exchanges, demonstrations, narrative beats, key reveals.
+  Use 3-5 per reel. These CARRY THE STORY. Medium clips are your backbone.
+- LONG (16-30s): Emotional moments, detailed explanations, transformations, sustained tension.
+  Use 1-3 per reel. These LET MOMENTS BREATHE. Long clips are your emotional anchors.
+
+CLIP SELECTION TIERS — which moments deserve which clip length:
+TIER 1 — HIGHEST VALUE (assign these to SHORT or MEDIUM clips):
 • Action climaxes: physical feats, reveals, demonstrations, transformations
 • Emotional peaks: shock, triumph, breakdown, laughter, tears, rage
 • Stakes moments: "if this fails...", ultimatums, gambles, high-consequence decisions
 • Viral hooks: outrageous claims, absurd situations, "did that just happen?" moments
 
-TIER 2 — HIGH VALUE (include 2-3 per group):
+TIER 2 — HIGH VALUE (assign these to MEDIUM or LONG clips):
 • Key payoffs: answers to built-up questions, before/after reveals, results
 • Surprising twists: plot turns, unexpected outcomes, contrarian takes
 • Humor peaks: the biggest laugh, funniest exchange, most absurd moment
 • Expert insights: specific numbers, data points, professional techniques
 
-TIER 3 — SUPPORTING (use to fill gaps or bridge TIER 1-2 moments):
+TIER 3 — SUPPORTING (use MEDIUM clips to bridge TIER 1-2 moments):
 • Setup context: necessary background that makes TIER 1-2 moments land
 • Transitional energy: moments that maintain momentum between peaks
 • Reactions: genuine audience/participant reactions to high moments
 
 EXCLUDE entirely: filler, greetings, repetitive explanations, low-energy passages, generic statements, transitions without substance.
 
-===== DURATION & STRUCTURE =====
-Each reel group: {dur_min}-{dur_max} seconds (HARD MINIMUM {dur_min}s).
-Total estimated duration = sum(clip durations) + sum(narration durations) + 2s padding.
-You MUST hit {dur_min}s minimum. If your first selection is short, ADD MORE HIGH-VALUE CLIPS.
+===== DURATION BUDGET (THE MOST IMPORTANT SECTION) =====
+Your PRIMARY constraint is TOTAL DURATION, not clip count.
 
-Clips per group: {clips_per_group} (8-25 seconds each)
-- SWEET SPOT: 12-18s for dialogue/exposition
-- Extended: 18-25s for demonstrations, stories, transformations
-- Quick cuts: 8-12s for reactions, punchlines, rapid-fire moments
-- NEVER select clips under 6s unless they are absolute gold-tier punchlines
+Duration math:
+  total_clip_duration = sum of (source_end - source_start) for all clips
+  total_narration_duration = sum of (reel_end - reel_start) for all narration events
+  estimated_duration = total_clip_duration + total_narration_duration + 2.0
+
+Target: estimated_duration should be {dur_min}-{dur_max} seconds.
+- Clips alone should sum to {dur_min - 5}s to {dur_max - 5}s (narration fills the rest)
+- DO NOT pad clips to fill time. Pick the RIGHT clips, then calculate duration.
+- If your selection is under {dur_min}s, add more clips. If over {dur_max}s, remove clips.
+
+PACING RULES (instead of rigid HOOK/BUILD/PAYOFF template):
+1. Open with energy: first 2 clips should be SHORT or MEDIUM — never start with a long clip.
+2. Vary rhythm: alternate between short and medium/long clips. NO back-to-back LONG clips.
+3. Place your single STRONGEST moment in the final 30% of the reel.
+4. The final clip should be MEDIUM or LONG — let the ending land, don't rush it.
+5. NO more than 3 SHORT clips in a row (feels choppy).
+6. At least one MEDIUM or LONG clip in the first half (establishes substance).
 
 ===== SOURCE VIDEO =====
 Title: {video_title}
@@ -298,15 +308,17 @@ Transcript (segment index [timestamp]):
   * Early zone: 0.0s - {early_end:.0f}s (at least 1-2 clips from here)
   * Middle zone: {mid_start:.0f}s - {mid_end:.0f}s (at least 2-3 clips from here)
   * Late zone: {late_start:.0f}s - {source_duration:.0f}s (at least 1-2 clips from here)
-- Every group needs a HOOK (opening 3s), BUILD (middle tension), and PAYOFF (final 5-8s).
+- Each group should have 6-15 clips of VARIED lengths (not all the same duration).
+- The group_reasoning field MUST include a duration breakdown showing SHORT/MEDIUM/LONG counts.
 
 ===== CLIP SELECTION RULES =====
 1. ONLY select moments from TIER 1 or TIER 2. Use TIER 3 sparingly.
 2. Each clip must have a CLEAR reason tied to the group's narrative arc.
 3. No filler. No "overview" clips. Every clip must deliver a specific emotional or informational payload.
-4. Prefer LONGER clips (12-25s) that let moments breathe over rapid-fire cuts.
-5. The final clip of each group must be the STRONGEST moment — the payoff.
+4. VARY clip lengths: mix SHORT + MEDIUM + LONG. A reel with all medium clips is boring.
+5. The final clip of each group must be the STRONGEST remaining moment.
 6. Do NOT include clips that merely mention the topic — include clips that DEMONSTRATE it.
+7. NEVER select a clip shorter than 3.0 seconds.
 
 ===== NARRATION RULES =====
 Hook (event_type: "hook"):
@@ -340,8 +352,11 @@ Before outputting, you MUST verify:
 2. total_narration_duration = sum of (reel_end - reel_start) for all narration events
 3. estimated_duration = total_clip_duration + total_narration_duration + 2.0
 4. estimated_duration >= {dur_min}? If NO: add more clips until YES.
-5. Clips span early/middle/late zones? If NO: replace clips to fix coverage.
-6. estimated_duration_seconds = estimated_duration from step 3.
+5. estimated_duration <= {dur_max}? If NO: remove clips or shorten clips until YES.
+6. Clips span early/middle/late zones? If NO: replace clips to fix coverage.
+7. Clip length mix: Are there SHORT + MEDIUM + LONG clips? (not all same length)
+8. Rhythm check: No back-to-back LONG clips? No 3+ SHORT clips in a row?
+9. estimated_duration_seconds = estimated_duration from step 3.
 
 ===== OUTPUT (STRICT JSON ONLY) =====
 Output ONLY valid JSON. No markdown. No explanation.
@@ -351,7 +366,7 @@ Use "source_start" and "source_end" for clip timestamps.
   "reel_groups": [
     {{
       "group_index": 0,
-      "group_reasoning": "Why these specific moments form a compelling arc. Include duration breakdown.",
+      "group_reasoning": "Why these specific moments form a compelling arc. MUST include: 'Short clips: N, Medium clips: N, Long clips: N' and duration breakdown.",
       "estimated_duration_seconds": {dur_min}.0,
       "reel_summary": {{
         "title": "Scroll-stopping title (max 60 chars)",
@@ -361,9 +376,13 @@ Use "source_start" and "source_end" for clip timestamps.
         "key_moment": "The single strongest moment in this group"
       }},
       "source_clips": [
-        {{"source_start": 0.0, "source_end": 15.0, "reason": "HOOK: Open with highest-impact visual/verbal moment"}},
-        {{"source_start": 45.0, "source_end": 60.0, "reason": "BUILD: Escalate tension with key dialogue"}},
-        {{"source_start": 120.0, "source_end": 138.0, "reason": "PAYOFF: The climactic reveal/transformation"}}
+        {{"source_start": 0.0, "source_end": 4.0, "reason": "SHORT: Punchy opening reaction/visual stinger"}},
+        {{"source_start": 12.0, "source_end": 25.0, "reason": "MEDIUM: Key dialogue exchange that establishes the story"}},
+        {{"source_start": 45.0, "source_end": 60.0, "reason": "MEDIUM: Building tension with specific details"}},
+        {{"source_start": 72.0, "source_end": 75.0, "reason": "SHORT: Quick reaction or punchline beat"}},
+        {{"source_start": 90.0, "source_end": 110.0, "reason": "LONG: Emotional peak — the moment that makes this video worth watching"}},
+        {{"source_start": 120.0, "source_end": 123.0, "reason": "SHORT: Final punchy beat before the payoff"}},
+        {{"source_start": 130.0, "source_end": 145.0, "reason": "MEDIUM: Payoff moment — the strongest remaining clip"}}
       ],
       "narration_events": [
         {{"event_type": "hook", "reel_start": 0.0, "reel_end": 3.0, "text": "Specific hook tied to this video...", "voice_id": null}},
@@ -374,6 +393,7 @@ Use "source_start" and "source_end" for clip timestamps.
     }}
   ]
 }}"""
+
 
 
 
@@ -454,14 +474,11 @@ def select_reel_plan(
     reel_dur_max = min(reel_dur_max, int(MAX_OUTPUT_DURATION))
     reel_duration_target = f"{reel_dur_min}-{reel_dur_max}"
     
-    # More clips: need 6-12 clips to fill 90-150s with 10-18s average clip length
-    # Compute clips range based on duration target
-    clips_min = max(3, math.floor(reel_dur_min / 18))  # fewest clips if all 18s
-    clips_max = max(clips_min + 2, math.ceil(reel_dur_max / 8))  # most clips if all 8s
-    # Clamp to reasonable range
+    # Wider clip range: LLM mixes SHORT (2-5s) + MEDIUM (6-15s) + LONG (16-30s) clips
+    # Low end assumes mostly LONG clips; high end assumes mostly SHORT clips
+    clips_min = max(5, math.floor(reel_dur_min / 20))   # fewest clips if all avg 20s
+    clips_max = min(18, math.ceil(reel_dur_max / 5))     # most clips if all avg 5s
     clips_min = min(clips_min, clips_max - 1)
-    clips_min = max(3, min(clips_min, 8))
-    clips_max = max(clips_min + 2, min(clips_max, 16))
     clips_per_group = f"{clips_min}-{clips_max}"
     
     # More narration: 3-6 events to fill narrative arc
@@ -471,7 +488,7 @@ def select_reel_plan(
     narr_max = max(4, min(narr_max, 8))
     narration_per_group = f"{narr_min}-{narr_max}"
 
-    print(f"[INFO] AGGRESSIVE TARGETS for {source_duration:.1f}s video: "
+    print(f"[INFO] DURATION-DRIVEN TARGETS for {source_duration:.1f}s video: "
           f"{min_groups}-{max_groups} groups, clips: {clips_per_group}, narration: {narration_per_group}, duration: {reel_duration_target}s (min {reel_dur_min}s per group)")
 
     prompt = _build_reel_plan_prompt(
@@ -653,9 +670,7 @@ def select_reel_plan(
         # Sanitize narration text
         for event in group.get("narration_events", []):
             if "text" in event and isinstance(event["text"], str):
-                cleaned_text = re.sub(r'[\*\#\_\[\]\{\}\/\\<>"]', '', event["text"]).strip()
-                cleaned_text = re.sub(r'\s+', ' ', cleaned_text)
-                event["text"] = cleaned_text
+                event["text"] = sanitize_text(event["text"])
 
         for clip in group.get("source_clips", []):
             s = clip.get("source_start", 0.0)

@@ -6,16 +6,16 @@ edge-tts's built-in SentenceBoundary handling provides natural pacing.
 """
 
 import asyncio
+import os
 import time
 import edge_tts
 import subprocess
-import os
 
 from typing import Callable, Optional
 from backend.config import TTS_VOICE, FFPROBE_PATH
 
-# Rate at which the TTS speaks (default 1.0, lower = slower, higher = faster)
-TTS_RATE = "+10%"  # Slightly faster for energetic delivery
+# TTS rate — configurable via environment variable
+TTS_RATE = os.environ.get("TTS_RATE", "+10%")
 
 # A successful edge-tts save should never be this small. Anything below this
 # is almost certainly a truncated/empty response from the service (network
@@ -29,9 +29,12 @@ MAX_TTS_ATTEMPTS = 3
 RETRY_BACKOFF_SECONDS = 1.5
 
 
-def synthesize_commentary(text: str, out_path: str, progress_cb: Optional[Callable[[str, float], None]] = None) -> float:
+def synthesize_commentary(text: str, out_path: str, progress_cb: Optional[Callable[[str, float], None]] = None,
+                          rate: Optional[str] = None) -> float:
     if not text or not text.strip():
         raise RuntimeError("synthesize_commentary called with empty text — refusing to synthesize silent audio.")
+
+    tts_rate = rate or TTS_RATE
 
     if progress_cb:
         progress_cb("Generating TTS audio...", 10)
@@ -44,7 +47,7 @@ def synthesize_commentary(text: str, out_path: str, progress_cb: Optional[Callab
     for attempt in range(1, MAX_TTS_ATTEMPTS + 1):
         try:
             async def _run_tts():
-                communicate = edge_tts.Communicate(text, TTS_VOICE, rate=TTS_RATE)
+                communicate = edge_tts.Communicate(text, TTS_VOICE, rate=tts_rate)
                 await communicate.save(out_path)
 
             asyncio.run(_run_tts())

@@ -1,6 +1,7 @@
 from backend.config import CAPTION_FONT, CAPTION_FONT_SIZE
 from typing import Callable, Optional, List, Dict, Any
 from backend.pipeline.ocr import detect_existing_captions
+from backend.pipeline.sanitize import sanitize_text
 from pathlib import Path
 
 
@@ -13,7 +14,7 @@ NARRATION_CAPTION_SIZE = 62  # Top narration captions
 KEY_WORDS = {
     "wait", "what", "why", "how", "never", "always", "secret", "hidden",
     "truth", "reveal", "shock", "insane", "crazy", "best", "worst",
-    "first", "last", "ever", "never", "impossible", "possible",
+    "first", "last", "ever", "impossible", "possible",
     "breakthrough", "discover", "invent", "create", "change",
     "amazing", "incredible", "unbelievable", "stunning", "remarkable",
     "win", "lose", "beat", "victory", "defeat", "champion",
@@ -131,7 +132,7 @@ def generate_clip_ass(transcript: list, clip_start: float, clip_end: float,
             filtered.append({
                 "start": adjusted_start,
                 "end": adjusted_end,
-                "text": entry["text"],
+                "text": sanitize_text(entry["text"]),
             })
 
     # Use larger clip caption size
@@ -176,6 +177,7 @@ def generate_commentary_ass(text: str, duration: float, out_path: str,
     if progress_cb:
         progress_cb("Wrapping commentary text...", 30)
 
+    text = sanitize_text(text)
     wrapped = _wrap_text_ass(text, max_chars=22)  # Tighter for readability
     highlighted = _highlight_key_words(wrapped)
 
@@ -318,6 +320,7 @@ def generate_narration_ass(text: str, duration: float, out_path: str,
     if progress_cb:
         progress_cb("Wrapping narration text...", 30)
 
+    text = sanitize_text(text)
     wrapped = _wrap_text_ass(text, max_chars=22)
     highlighted = _highlight_key_words(wrapped)
 

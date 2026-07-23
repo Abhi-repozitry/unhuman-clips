@@ -2,7 +2,9 @@ import subprocess
 import os
 from pathlib import Path
 from backend.config import (
-    HOOK_SECONDS, FFMPEG_PATH, FFPROBE_PATH,
+    FFMPEG_PATH, FFPROBE_PATH,
+    OUTPUT_WIDTH, OUTPUT_HEIGHT, OUTPUT_FPS,
+    NARRATION_VOLUME_BOOST, ALIMITER_LIMIT, ALIMITER_ATTACK_MS, ALIMITER_RELEASE_MS,
     VAD_THRESHOLD, VAD_PRE_BUFFER_SECONDS, VAD_POST_BUFFER_SECONDS,
     VAD_SCURVE_RAMP_SECONDS, VAD_DUCKING_DEPTH, VAD_SILENCE_THRESHOLD,
 )
@@ -60,25 +62,27 @@ def _run_ffmpeg(cmd: list, description: str, attempt: int = 1, max_attempts: int
         stderr_text = e.stderr.decode(errors="replace") if e.stderr else "(no stderr)"
         if attempt < max_attempts and "h264_nvenc" in " ".join(cmd) and os.environ.get("ALLOW_CPU_FFMPEG_FALLBACK") == "1":
             print(f"[WARN] NVENC failed for {description}, retrying with libx264: {stderr_text[:200]}")
-            new_cmd = []
-            skip_next = False
-            for j, arg in enumerate(cmd):
-                if skip_next:
-                    skip_next = False
-                    continue
-                if arg == "h264_nvenc":
-                    new_cmd.extend(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
-                    skip_next = True
-                elif arg in ("-preset", "-rc", "-cq"):
-                    skip_next = True
-                elif arg == "p7":
-                    pass
-                elif arg == "vbr":
-                    pass
-                elif arg == "23" and j > 0 and cmd[j-1] == "-cq":
-                    pass
+            # Rebuild command from scratch for CPU encoding (avoids arg patching bugs)
+            new_cmd = [FFMPEG_PATH, "-loglevel", "error"]
+            i = 1  # skip FFMPEG_PATH
+            while i < len(cmd):
+                arg = cmd[i]
+                if arg in ("-ss", "-i", "-t"):
+                    new_cmd.extend([arg, cmd[i + 1]]); i += 2
+                elif arg in ("-y",):
+                    new_cmd.append(arg); i += 1
+                elif arg == "-filter_complex":
+                    new_cmd.extend([arg, cmd[i + 1]]); i += 2
+                elif arg.startswith("[") and cmd[i + 1] == "-map" if i + 1 < len(cmd) else False:
+                    new_cmd.extend([arg, cmd[i + 1]]); i += 2
+                elif arg == "-map":
+                    new_cmd.extend([arg, cmd[i + 1]]); i += 2
                 else:
-                    new_cmd.append(arg)
+                    i += 1  # skip all encoder-specific args
+            new_cmd.extend(["-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "medium", "-crf", "23"])
+            new_cmd.extend(["-c:a", "aac", "-b:a", "192k"])
+            new_cmd.extend(["-movflags", "+faststart", "-avoid_negative_ts", "make_zero"])
+            new_cmd.extend(["-y", cmd[-1]])  # output path is last arg
             return _run_ffmpeg(new_cmd, description, attempt + 1, max_attempts, cwd=cwd)
         raise RuntimeError(f"{description} failed: {stderr_text[:1000]}") from e
 
@@ -283,7 +287,7 @@ def _build_ducking_filter_chain(
     if len(duck_terms) == 1:
         duck_expr = duck_terms[0]
     else:
-        duck_expr = f"min(1.0,{'+'.join(duck_terms)})"
+        duck_expr = f"max({','.join(duck_terms)})"
 
     vol_expr = f"1.0-({duck_expr}*{DEPTH:.2f})"
     print(f"[INFO] VAD ducking: {len(duck_terms)} speech segments, "
@@ -441,7 +445,7 @@ def compose_group(
         # Only drop narration events if they'd be lost beyond video+freeze end.
         # Previously we capped at total_clip_duration + allowed_pad, but now with
         # larger pad allowance we can accommodate more narration without dropping.
-        capped_limit = total_clip_duration + min(MAX_FREEZE_PAD, max(narration_tail, 3.0))
+        capped_limit = total_clip_duration + allowed_pad
         truncated_events = [
             nar for nar in narration_audio
             if nar.get("reel_end", 0) > capped_limit
@@ -481,7 +485,7 @@ def compose_group(
         video_filter_parts = []
         for i, p in enumerate(group_clip_paths):
             ffmpeg_video_inputs.extend(["-i", str(p)])
-            video_filter_parts.append(f"[{i}:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1[v{i}]")
+            video_filter_parts.append(f"[{i}:v]scale={OUTPUT_WIDTH}:{OUTPUT_HEIGHT}:force_original_aspect_ratio=increase,crop={OUTPUT_WIDTH}:{OUTPUT_HEIGHT},setsar=1[v{i}]")
         concat_inputs = "".join(f"[v{i}]" for i in range(n_clips))
         video_filter_parts.append(f"{concat_inputs}concat=n={n_clips}:v=1:a=0[base_v]")
     else:
@@ -491,7 +495,7 @@ def compose_group(
             start = clip["source_start"]
             end = clip["source_end"]
             video_filter_parts.append(
-                f"[0:v]trim=start={start}:end={end},setpts=PTS-STARTPTS,scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1[v{i}]"
+                f"[0:v]trim=start={start}:end={end},setpts=PTS-STARTPTS,scale={OUTPUT_WIDTH}:{OUTPUT_HEIGHT}:force_original_aspect_ratio=increase,crop={OUTPUT_WIDTH}:{OUTPUT_HEIGHT},setsar=1[v{i}]"
             )
         concat_inputs = "".join(f"[v{i}]" for i in range(n_clips))
         video_filter_parts.append(f"{concat_inputs}concat=n={n_clips}:v=1:a=0[base_v]")
@@ -534,7 +538,7 @@ def compose_group(
         "-filter_complex", video_filter,
         "-map", f"[{last_v}]",
     ] + encoder_opts + [
-        "-r", "30", "-y", str(video_output)
+        "-r", str(OUTPUT_FPS), "-y", str(video_output)
     ]
     if progress_cb:
         progress_cb(f"Group {group_idx+1}: Rendering video ({total_clip_duration:.0f}s+{pad_duration:.0f}s pad)...", 25)
@@ -682,9 +686,9 @@ def compose_group(
             "-i", str(narration_audio_output),
             "-filter_complex",
             f"{duck_chain};"
-            f"[1:a]volume=1.15[narr];"
+            f"[1:a]volume={NARRATION_VOLUME_BOOST}[narr];"
             f"[ducked][narr]amix=inputs=2:duration=first:dropout_transition=0.1:normalize=0,"
-            f"alimiter=limit=0.90:attack=3:release=50:level=disabled,"
+            f"alimiter=limit={ALIMITER_LIMIT}:attack={ALIMITER_ATTACK_MS}:release={ALIMITER_RELEASE_MS}:level=disabled,"
             f"apad=whole_dur={target_duration:.2f},atrim=end={target_duration:.2f}[mixed]",
             "-map", "[mixed]",
             "-c:a", "pcm_s16le", "-ar", "44100", "-ac", "2",

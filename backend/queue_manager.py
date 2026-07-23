@@ -10,6 +10,7 @@ from backend.pipeline.clipper import cut_group_clips
 from backend.pipeline.tts import synthesize_commentary
 from backend.pipeline.captioner import generate_clip_ass, generate_commentary_ass
 from backend.pipeline.compositor import compose_group
+from backend.pipeline.sanitize import sanitize_text
 from backend.progress import ProgressReporter
 
 
@@ -206,15 +207,6 @@ class QueueManager:
         self.loop = loop
 
     def add_job(self, url: str) -> VideoJob:
-        # Prune completed/terminal jobs only — NEVER drop a job that's still
-        # in-flight (QUEUED/DOWNLOADING/.../COMPOSITING/EDITING). The previous
-        # version kept only status == "DONE", which silently deleted any job
-        # still processing the moment a new job was submitted — it kept
-        # running in the background (the worker holds a direct object
-        # reference) but vanished from get_jobs()/lookup-by-id, making it
-        # look like the job or its output disappeared.
-        terminal = (JobStatus.DONE, JobStatus.ERROR)
-        self.jobs = {k: v for k, v in self.jobs.items() if v.status not in terminal}
         job = VideoJob(url=url)
         self.jobs[job.id] = job
         self.queue.put_nowait(job.id)
@@ -222,6 +214,12 @@ class QueueManager:
 
     def get_jobs(self) -> list[VideoJob]:
         return sorted(self.jobs.values(), key=lambda j: j.created_at)
+
+    def delete_job(self, job_id: str) -> bool:
+        if job_id in self.jobs:
+            del self.jobs[job_id]
+            return True
+        return False
 
     async def worker(self, broadcast_fn):
         while True:
@@ -529,20 +527,8 @@ class QueueManager:
                     f"Group {group_idx+1}: TTS for {event.event_type} ({i+1}/{total_narration})",
                     (i / total_narration) * 100 if total_narration > 0 else 100,
                 )
-                # Clean TTS text: remove all special characters that break captions/TTS
-                import re as _re
-                clean_text = event.text
-                # Remove all banned characters
-                for ch in ['/', '\\', '|', '*', '#', '_', '<', '>', '[', ']', '{', '}']:
-                    clean_text = clean_text.replace(ch, ' ')
-                # Normalize dashes to commas for natural TTS pauses
-                clean_text = clean_text.replace('--', ',').replace('\u2014', ',')
-                # Collapse multiple spaces and normalize whitespace
-                clean_text = _re.sub(r'\s+', ' ', clean_text).strip()
-                # Collapse repeated punctuation (e.g., "..." stays, but ",," becomes ",")
-                clean_text = _re.sub(r'([,!?;:]){2,}', r'\1', clean_text)
-                # Strip leading/trailing punctuation artifacts (but keep sentence-final punctuation)
-                clean_text = clean_text.strip(' ,-;:')
+                # Clean TTS text using shared sanitization
+                clean_text = sanitize_text(event.text)
                 if not clean_text:
                     clean_text = event.text or "Notice this key moment."
                 event.text = clean_text
@@ -582,7 +568,8 @@ class QueueManager:
             target_dur = max(total_clip_dur, max_nar_end, group.estimated_duration_seconds, float(MIN_OUTPUT_DURATION))
             target_dur = min(target_dur, float(MAX_OUTPUT_DURATION))
 
-            validate_and_adjust_narration_timings(
+            await asyncio.to_thread(
+                validate_and_adjust_narration_timings,
                 group_narration_audio=group_narration_audio,
                 source_clips=group.source_clips,
                 transcript=job.transcript,
@@ -789,7 +776,8 @@ class QueueManager:
 
     async def _probe_duration(self, path: str) -> float:
         import subprocess
-        probe = subprocess.run(
+        probe = await asyncio.to_thread(
+            subprocess.run,
             [FFPROBE_PATH, "-v", "error", "-show_entries", "format=duration",
              "-of", "default=noprint_wrappers=1:nokey=1", path],
             capture_output=True, text=True

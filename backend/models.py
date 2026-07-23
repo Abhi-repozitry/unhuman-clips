@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import StrEnum
 from typing import Optional, List, Any
 from pydantic import BaseModel, Field
@@ -88,7 +88,7 @@ class VideoJob(BaseModel):
     progress: float = 0.0
     title: Optional[str] = None
     error: Optional[str] = None
-    created_at: datetime = Field(default_factory=datetime.now)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     source_path: Optional[str] = None
     transcript: Optional[List[dict]] = None
     clip_windows: Optional[List[dict]] = None

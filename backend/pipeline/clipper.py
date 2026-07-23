@@ -22,6 +22,18 @@ def _get_encoder_opts() -> list[str]:
     raise RuntimeError("h264_nvenc encoder is not available. Install/configure NVIDIA ffmpeg support or set ALLOW_CPU_FFMPEG_FALLBACK=1.")
 
 
+def _validate_clip(source_path: str, start: float, end: float, source_duration: float = 0.0) -> None:
+    """Validate clip timestamps before cutting."""
+    if not os.path.isfile(source_path):
+        raise FileNotFoundError(f"Source video not found: {source_path}")
+    if start < 0:
+        raise ValueError(f"Clip start time {start}s is negative")
+    if end <= start:
+        raise ValueError(f"Clip end time {end}s must be after start time {start}s")
+    if source_duration > 0 and end > source_duration:
+        raise ValueError(f"Clip end time {end}s exceeds source duration {source_duration}s")
+
+
 def cut_clips(source_path: str, clip_windows: list, job_id: str,
               progress_cb: Optional[Callable[[str, float], None]] = None,
               reporter: Optional[Any] = None) -> list[str]:
@@ -42,14 +54,18 @@ def cut_clips(source_path: str, clip_windows: list, job_id: str,
 
         duration = max(0.1, end - start)
         cmd = [
-            FFMPEG_PATH, "-ss", str(start), "-i", source_path,
-            "-t", str(duration),
-        ] + encoder_opts + ["-c:a", "aac", "-y", out_path]
+            FFMPEG_PATH, "-ss", f"{start:.6f}", "-i", source_path,
+            "-t", f"{duration:.6f}",
+            "-movflags", "+faststart",
+            "-avoid_negative_ts", "make_zero",
+        ] + encoder_opts + ["-c:a", "aac", "-b:a", "192k", "-y", out_path]
 
         try:
-            subprocess.run(cmd, capture_output=True, check=True)
+            subprocess.run(cmd, capture_output=True, check=True, timeout=300)
         except subprocess.CalledProcessError as e:
-            raise RuntimeError(f"FFmpeg clip failed: {e.stderr.decode()}") from e
+            raise RuntimeError(f"FFmpeg clip failed: {e.stderr.decode('utf-8', errors='replace')}") from e
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(f"FFmpeg clip timed out after 300s for clip {i}")
 
         clip_paths.append(out_path)
         if reporter:
@@ -84,14 +100,18 @@ def cut_group_clips(source_path: str, source_clips: List[Dict[str, float]], job_
 
         duration = max(0.1, end - start)
         cmd = [
-            FFMPEG_PATH, "-ss", str(start), "-i", source_path,
-            "-t", str(duration),
-        ] + encoder_opts + ["-c:a", "aac", "-y", out_path]
+            FFMPEG_PATH, "-ss", f"{start:.6f}", "-i", source_path,
+            "-t", f"{duration:.6f}",
+            "-movflags", "+faststart",
+            "-avoid_negative_ts", "make_zero",
+        ] + encoder_opts + ["-c:a", "aac", "-b:a", "192k", "-y", out_path]
 
         try:
-            subprocess.run(cmd, capture_output=True, check=True)
+            subprocess.run(cmd, capture_output=True, check=True, timeout=300)
         except subprocess.CalledProcessError as e:
-            raise RuntimeError(f"FFmpeg clip failed: {e.stderr.decode()}") from e
+            raise RuntimeError(f"FFmpeg clip failed: {e.stderr.decode('utf-8', errors='replace')}") from e
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(f"FFmpeg clip timed out after 300s for group {group_idx} clip {i}")
 
         clip_paths.append(out_path)
         if reporter:
