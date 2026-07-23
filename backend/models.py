@@ -50,7 +50,60 @@ class ReelGroup(BaseModel):
 
 class ReelPlan(BaseModel):
     reel_groups: list[ReelGroup]
+    ranked_segments: list[RankedSegment] = Field(default_factory=list)
+    explanations: list[str] = Field(default_factory=list)
     is_fallback: bool = False
+
+
+class FFmpegMetrics(BaseModel):
+    """Structured FFmpeg-derived metrics for a timeline segment."""
+    volume_db: float | None = None
+    peak_db: float | None = None
+    brightness: float | None = None
+    black_frame: bool = False
+    freeze_detected: bool = False
+
+
+class RichTimelineSegment(BaseModel):
+    """A single segment in the Rich Timeline — the single source of truth.
+
+    Merges Whisper transcription, Silero VAD, OCR, and FFmpeg metrics
+    into one unified structure consumed by the LLM and downstream stages.
+    """
+    segment_id: int
+    start: float
+    end: float
+    duration: float
+    speech: str
+    words: list[dict] = Field(default_factory=list)
+    speech_confidence: float = 0.0
+    speech_energy: float = 0.0
+    speech_regions: list[dict] = Field(default_factory=list)
+    silence_before: bool = False
+    ocr: list[str] = Field(default_factory=list)
+    ocr_confidence: float = 0.0
+    metrics: FFmpegMetrics = Field(default_factory=FFmpegMetrics)
+
+
+class RichTimeline(BaseModel):
+    """Complete Rich Timeline — merged output of all analysis sources.
+
+    This is the single source of truth consumed by the LLM.
+    No downstream component should directly consume raw Whisper, OCR, VAD, or FFmpeg output.
+    """
+    segments: list[RichTimelineSegment] = Field(default_factory=list)
+    source_duration: float = 0.0
+    total_speech_duration: float = 0.0
+    total_silence_duration: float = 0.0
+    speech_region_count: int = 0
+    ocr_region_count: int = 0
+
+
+class RankedSegment(BaseModel):
+    """A segment ranked by the LLM with a score and reasoning."""
+    segment_id: int
+    score: int = 0
+    reason: str = ""
 
 
 class LLMInteraction(BaseModel):
@@ -73,6 +126,7 @@ class JobStatus(StrEnum):
     QUEUED = "QUEUED"
     DOWNLOADING = "DOWNLOADING"
     TRANSCRIBING = "TRANSCRIBING"
+    BUILDING_TIMELINE = "BUILDING_TIMELINE"
     ANALYZING = "ANALYZING"
     CLIPPING = "CLIPPING"
     VOICING = "VOICING"
@@ -105,12 +159,13 @@ class VideoJob(BaseModel):
     sub_stage: str | None = None
     sub_stage_progress: float = 0.0
     stage_index: int = 0
-    total_stages: int = 8
+    total_stages: int = 9
     logs: list[str] = Field(default_factory=list)
     clip_details: list[dict] | None = None
     download_stats: dict | None = None
     stage_data: dict = Field(default_factory=dict)
     reel_plan: ReelPlan | None = None
+    rich_timeline: RichTimeline | None = None
     narration_audio: list[dict] | None = None
     has_existing_captions: list[bool] | None = None
     audio_download_stats: dict | None = None

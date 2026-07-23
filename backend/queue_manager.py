@@ -17,6 +17,7 @@ from backend.pipeline.checkpoint import PipelineCheckpoint
 from backend.pipeline.downloader import download_video, validate_downloaded_video
 from backend.pipeline.analyzer import select_reel_plan
 from backend.pipeline.orchestrator import GroupOrchestrator
+from backend.pipeline.timeline_builder import build_rich_timeline
 from backend.pipeline.transcriber import transcribe_video
 from backend.progress import ProgressReporter
 
@@ -144,7 +145,7 @@ class QueueManager:
 
         # Stage 1: DOWNLOADING
         job.stage_index = 1
-        job.total_stages = 8
+        job.total_stages = 9
         job.stage_data = {
             "downloaded_bytes": 0, "total_bytes": 0,
             "speed": 0, "eta": 0, "status": "starting"
@@ -255,10 +256,41 @@ class QueueManager:
         job.stage_data = {"total_segments": len(job.transcript), "current_segment": len(job.transcript), "done": True}
         reporter.log_info(f"Transcribed {len(job.transcript)} segments")
 
-        # Stage 3: ANALYZING
+        # Stage 3: BUILDING RICH TIMELINE
         job.stage_index = 3
-        job.stage_data = {"status": "sending", "message": "Sending transcript to LLM..."}
-        reporter.update_stage(JobStatus.ANALYZING, "Sending transcript to LLM...", 0, 3)
+        job.total_stages = 9
+        job.stage_data = {"status": "building_timeline", "message": "Building Rich Timeline (VAD + OCR + FFmpeg metrics)..."}
+        reporter.update_stage(JobStatus.BUILDING_TIMELINE, "Building Rich Timeline...", 0, 3)
+
+        # Check for timeline checkpoint
+        timeline_ckpt = ckpt.load_stage("rich_timeline")
+        if timeline_ckpt and timeline_ckpt.get("segments"):
+            from backend.models import RichTimeline
+            job.rich_timeline = RichTimeline.model_validate(timeline_ckpt)
+            reporter.log_info(f"Resuming from checkpoint: Rich Timeline already built ({len(job.rich_timeline.segments)} segments)")
+        else:
+            def timeline_progress(msg: str, prog: float):
+                existing = job.stage_data if isinstance(job.stage_data, dict) else {}
+                job.stage_data = {**existing, "status": "building_timeline", "message": msg, "progress": prog}
+                reporter.progress_callback(msg, prog)
+
+            job.rich_timeline = await asyncio.to_thread(
+                build_rich_timeline, job.transcript, job.source_path,
+                timeline_progress, reporter
+            )
+            ckpt.save_stage("rich_timeline", job.rich_timeline.model_dump())
+
+        reporter.log_info(
+            f"Rich Timeline: {len(job.rich_timeline.segments)} segments, "
+            f"speech={job.rich_timeline.total_speech_duration:.1f}s, "
+            f"VAD_regions={job.rich_timeline.speech_region_count}, "
+            f"OCR_texts={job.rich_timeline.ocr_region_count}"
+        )
+
+        # Stage 4: ANALYZING
+        job.stage_index = 4
+        job.stage_data = {"status": "sending", "message": "Sending Rich Timeline to LLM..."}
+        reporter.update_stage(JobStatus.ANALYZING, "Sending Rich Timeline to LLM...", 0, 4)
 
         llm_interactions: list[LLMInteraction] = []
 
@@ -278,7 +310,8 @@ class QueueManager:
                 reel_plan = await asyncio.wait_for(
                     asyncio.to_thread(
                         select_reel_plan, job.transcript, job.title or "", video_description,
-                        analyzer_progress, reporter, llm_interactions
+                        analyzer_progress, reporter, llm_interactions,
+                        rich_timeline=job.rich_timeline,
                     ),
                     timeout=1200.0,
                 )
@@ -346,6 +379,6 @@ class QueueManager:
         job.status = JobStatus.DONE
         job.progress = 100.0
         job.stage_data = {"status": "done"}
-        reporter.update_stage(JobStatus.DONE, "All groups complete!", 100, 8)
+        reporter.update_stage(JobStatus.DONE, "All groups complete!", 100, 9)
         reporter.log_info(f"Job {job.id} complete with {job.num_output_groups} output(s)")
         self.enqueue_broadcast(job)

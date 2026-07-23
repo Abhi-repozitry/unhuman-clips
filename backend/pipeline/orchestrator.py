@@ -61,7 +61,7 @@ class GroupOrchestrator:
             reporter.log_info(f"Group {group_idx+1}: Resuming from checkpoint (clips already cut)")
             return checkpoint["clip_paths"]
 
-        self.job.stage_index = 4
+        self.job.stage_index = 5
         self.job.stage_data = {
             "status": "cutting",
             "group_index": group_idx,
@@ -69,7 +69,7 @@ class GroupOrchestrator:
             "total_clips": len(group.source_clips),
             "current_clip": 0,
         }
-        reporter.update_stage(JobStatus.CLIPPING, f"Group {group_idx+1}/{self.job.num_output_groups}: Cutting clips...", 0, 4)
+        reporter.update_stage(JobStatus.CLIPPING, f"Group {group_idx+1}/{self.job.num_output_groups}: Cutting clips...", 0, 5)
 
         def clipper_progress(msg: str, prog: float):
             self.job.stage_data = {
@@ -170,7 +170,7 @@ class GroupOrchestrator:
                 )
 
         total_narration = len(group_narration_events)
-        self.job.stage_index = 5
+        self.job.stage_index = 6
         self.job.stage_data = {
             "status": "voicing",
             "group_index": group_idx,
@@ -178,7 +178,7 @@ class GroupOrchestrator:
             "total": total_narration,
             "current": 0,
         }
-        reporter.update_stage(JobStatus.VOICING, f"Group {group_idx+1}/{self.job.num_output_groups}: Generating TTS...", 0, 5)
+        reporter.update_stage(JobStatus.VOICING, f"Group {group_idx+1}/{self.job.num_output_groups}: Generating TTS...", 0, 6)
 
         if checkpoint and "narration_audio" in checkpoint:
             reporter.log_info(f"Group {group_idx+1}: Resuming from checkpoint (TTS already generated)")
@@ -268,7 +268,7 @@ class GroupOrchestrator:
         ckpt_key = f"group_{group_idx}_captions"
         checkpoint = self.ckpt.load_stage(ckpt_key)
 
-        self.job.stage_index = 6
+        self.job.stage_index = 7
         self.job.stage_data = {
             "status": "captioning",
             "group_index": group_idx,
@@ -276,7 +276,7 @@ class GroupOrchestrator:
             "total_clips": len(group.source_clips),
             "current": 0,
         }
-        reporter.update_stage(JobStatus.CAPTIONING, f"Group {group_idx+1}/{self.job.num_output_groups}: Generating captions...", 0, 6)
+        reporter.update_stage(JobStatus.CAPTIONING, f"Group {group_idx+1}/{self.job.num_output_groups}: Generating captions...", 0, 7)
 
         if checkpoint and "clip_captions" in checkpoint:
             reporter.log_info(f"Group {group_idx+1}: Resuming from checkpoint (captions already generated)")
@@ -382,14 +382,14 @@ class GroupOrchestrator:
         ckpt_key = f"group_{group_idx}_composite"
         checkpoint = self.ckpt.load_stage(ckpt_key)
 
-        self.job.stage_index = 7
+        self.job.stage_index = 8
         self.job.stage_data = {
             "status": "compositing",
             "group_index": group_idx,
             "total_groups": self.job.num_output_groups,
             "message": "Building continuous video with overlay + ducking...",
         }
-        reporter.update_stage(JobStatus.COMPOSITING, f"Group {group_idx+1}/{self.job.num_output_groups}: Compositing...", 0, 7)
+        reporter.update_stage(JobStatus.COMPOSITING, f"Group {group_idx+1}/{self.job.num_output_groups}: Compositing...", 0, 8)
 
         if checkpoint and "output_path" in checkpoint:
             reporter.log_info(f"Group {group_idx+1}: Resuming from checkpoint (composite already done)")
@@ -463,13 +463,13 @@ class GroupOrchestrator:
         Returns:
             Tuple of (final_path, duration_seconds).
         """
-        self.job.stage_index = 8
+        self.job.stage_index = 9
         self.job.stage_data = {
             "status": "editing",
             "group_index": group_idx,
             "total_groups": self.job.num_output_groups,
         }
-        reporter.update_stage(JobStatus.EDITING, f"Group {group_idx+1}/{self.job.num_output_groups}: Final edit...", 0, 8)
+        reporter.update_stage(JobStatus.EDITING, f"Group {group_idx+1}/{self.job.num_output_groups}: Final edit...", 0, 9)
 
         final_path = await asyncio.to_thread(
             self.output_manager.final_edit_group,

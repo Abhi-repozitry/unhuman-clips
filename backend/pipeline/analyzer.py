@@ -1,6 +1,6 @@
 """Video analysis module — LLM-powered reel plan generation.
 
-Provides select_reel_plan() which uses an LLM to analyze transcripts
+Provides select_reel_plan() which uses a Rich Timeline to analyze content
 and produce structured reel group plans with clip selections and narration.
 """
 from __future__ import annotations
@@ -26,7 +26,8 @@ from backend.config import (
     NVIDIA_MODEL,
     NVIDIA_MODEL_FALLBACK,
 )
-from backend.models import LLMInteraction, ReelPlan
+from backend.models import LLMInteraction, ReelPlan, RichTimeline
+from backend.pipeline.plan_validator import finalize_edit
 from backend.pipeline.sanitize import sanitize_text
 from backend.providers.llm import call_llm_sync
 
@@ -49,6 +50,58 @@ def _format_full_transcript(transcript: list) -> str:
             lines.append(f"Seg {i} [{start:.1f}-{end:.1f}s]: {text}")
     full_text = "\n".join(lines)
     logger.info(f"Passing 100% FULL transcript to LLM ({len(lines)} segments, {len(full_text)} chars — NO CHUNKING)")
+    return full_text
+
+
+def _format_rich_timeline(timeline: RichTimeline) -> str:
+    """Format a Rich Timeline for LLM consumption.
+
+    Each segment includes speech text, words, speech energy, silence indicators,
+    OCR text, and FFmpeg metrics — all merged into a single structured format.
+    """
+    if not timeline.segments:
+        return ""
+
+    lines = []
+    for seg in timeline.segments:
+        # Build metric summary
+        metrics_parts = []
+        if seg.metrics.volume_db is not None:
+            metrics_parts.append(f"vol={seg.metrics.volume_db:.1f}dB")
+        if seg.metrics.brightness is not None:
+            metrics_parts.append(f"bright={seg.metrics.brightness:.2f}")
+        if seg.metrics.black_frame:
+            metrics_parts.append("BLACK_FRAME")
+        if seg.metrics.freeze_detected:
+            metrics_parts.append("FREEZE")
+        metrics_str = ", ".join(metrics_parts) if metrics_parts else "none"
+
+        # OCR text
+        ocr_str = " | OCR: " + "; ".join(seg.ocr) if seg.ocr else ""
+
+        # Silence indicator
+        silence_tag = " [SILENCE_BEFORE]" if seg.silence_before else ""
+
+        # Speech energy bar
+        energy_bar = "█" * int(seg.speech_energy * 10) + "░" * (10 - int(seg.speech_energy * 10))
+
+        line = (
+            f"Seg {seg.segment_id} [{seg.start:.1f}-{seg.end:.1f}s] "
+            f"energy={energy_bar}({seg.speech_energy:.2f}){silence_tag}: "
+            f"{seg.speech}"
+            f"{ocr_str} "
+            f"[metrics: {metrics_str}]"
+        )
+        lines.append(line)
+
+    full_text = "\n".join(lines)
+    logger.info(
+        f"Formatted Rich Timeline for LLM: {len(timeline.segments)} segments, "
+        f"{len(full_text)} chars, speech={timeline.total_speech_duration:.1f}s, "
+        f"silence={timeline.total_silence_duration:.1f}s, "
+        f"VAD_regions={timeline.speech_region_count}, "
+        f"OCR_texts={timeline.ocr_region_count}"
+    )
     return full_text
 
 
@@ -239,7 +292,8 @@ def _build_reel_plan_prompt(video_title: str, video_description: str, transcript
                            clips_per_group: str = "5-10",
                            narration_per_group: str = "3-6",
                            reel_duration_target: str = "90-150",
-                           source_duration: float = 0.0) -> str:
+                           source_duration: float = 0.0,
+                           has_rich_timeline: bool = False) -> str:
     """Build the full LLM prompt for reel_plan generation.
 
     Duration-driven clip selection with varied pacing. The LLM selects a MIX
@@ -395,8 +449,15 @@ Before outputting, you MUST verify:
 ===== OUTPUT (STRICT JSON ONLY) =====
 Output ONLY valid JSON. No markdown. No explanation.
 Use "source_start" and "source_end" for clip timestamps.
+If speech energy is available, use it to inform clip quality (high energy = clear speech, low energy = silence/background).
+If OCR text is available, consider it for context (on-screen text often indicates key moments).
+If metrics show BLACK_FRAME or FREEZE, avoid those segments unless they serve a narrative purpose.
 
 {{
+  "ranked_segments": [
+    {{"segment_id": 0, "score": 85, "reason": "Strong opening with high energy and clear speech."}},
+    {{"segment_id": 18, "score": 97, "reason": "Peak emotional moment with high volume and clear dialogue."}}
+  ],
   "reel_groups": [
     {{
       "group_index": 0,
@@ -425,6 +486,10 @@ Use "source_start" and "source_end" for clip timestamps.
         {{"event_type": "commentary", "reel_start": 80.0, "reel_end": 83.0, "text": "Payoff line that ties the story together.", "voice_id": null}}
       ]
     }}
+  ],
+  "explanations": [
+    "Why this reel plan works: brief reasoning about the overall strategy.",
+    "Key moments identified and why they were selected."
   ]
 }}"""
 
@@ -460,40 +525,51 @@ def select_reel_plan(
     progress_cb: Callable[[str, float], None] | None = None,
     reporter: Any = None,
     interactions: list[LLMInteraction] | None = None,
+    rich_timeline: RichTimeline | None = None,
 ) -> ReelPlan:
-    """Main entry: produce a ReelPlan from a transcript using LLM analysis.
+    """Main entry: produce a ReelPlan from a Rich Timeline using LLM analysis.
+
+    If a Rich Timeline is provided, it is the single source of truth for the LLM.
+    Falls back to raw transcript formatting if no Rich Timeline is available.
 
     If reporter and interactions are provided, collects structured LLMInteraction
     records during processing and broadcasts them live via set_stage_data_key.
 
     Args:
-        transcript: Full transcript list with start/end/text keys.
+        transcript: Full transcript list with start/end/text keys (fallback).
         video_title: Video title for context.
         video_description: Video description for context.
         progress_cb: Optional progress callback.
         reporter: Optional ProgressReporter.
         interactions: Optional list to append LLMInteraction records to.
+        rich_timeline: Optional Rich Timeline (preferred over raw transcript).
 
     Returns:
-        ReelPlan with reel_groups array.
+        ReelPlan with reel_groups, ranked_segments, and explanations.
 
     Raises:
         RuntimeError: On empty transcript or LLM failure.
     """
     if progress_cb:
-        progress_cb("Preparing transcript for reel analysis...", 10)
+        progress_cb("Preparing content for reel analysis...", 10)
 
     if not transcript:
         raise RuntimeError("Transcript is empty; cannot build reel plan.")
 
-    # Pass 100% full transcript without any chunking, compression, or truncation.
-    # openai/gpt-oss-120b has a large context window, easily fitting full long-form transcripts.
-    transcript_text = _format_full_transcript(transcript)
+    # Use Rich Timeline if available, fall back to raw transcript
+    if rich_timeline and rich_timeline.segments:
+        transcript_text = _format_rich_timeline(rich_timeline)
+        has_rich_timeline = True
+        logger.info("Using Rich Timeline as single source of truth for LLM")
+    else:
+        transcript_text = _format_full_transcript(transcript)
+        has_rich_timeline = False
+        logger.info("Falling back to raw transcript (no Rich Timeline available)")
 
     description = (video_description or "")[:10000]
 
     if progress_cb:
-        progress_cb("Sending transcript to LLM for reel planning...", 30)
+        progress_cb("Sending content to LLM for reel planning...", 30)
 
     source_duration = transcript[-1]["end"] if transcript else 0.0
     min_groups, max_groups = _compute_group_count_target(source_duration)
@@ -547,8 +623,9 @@ def select_reel_plan(
         narration_per_group=narration_per_group,
         reel_duration_target=reel_duration_target,
         source_duration=source_duration,
+        has_rich_timeline=has_rich_timeline,
     )
-    logger.debug(f"Prompt length: {len(prompt)} chars, full transcript: {len(transcript_text)} chars")
+    logger.debug(f"Prompt length: {len(prompt)} chars, timeline: {len(transcript_text)} chars")
 
     try:
         raw_content = _call_llm(
@@ -629,187 +706,37 @@ def select_reel_plan(
     for i, group in enumerate(groups):
         if not isinstance(group, dict):
             raise RuntimeError(f"LLM failed: Group {i} must be an object")
-
         if "source_clips" not in group or not isinstance(group["source_clips"], list) or len(group["source_clips"]) == 0:
             raise RuntimeError(f"LLM failed: Group {i} missing valid 'source_clips'")
-
         if "narration_events" not in group or not isinstance(group["narration_events"], list):
             raise RuntimeError(f"LLM failed: Group {i} missing valid 'narration_events'")
 
-        if group.get("estimated_duration_seconds", 0) > int(MAX_OUTPUT_DURATION):
-            logger.warning(f"Group {i} estimated duration {group['estimated_duration_seconds']}s exceeds {MAX_OUTPUT_DURATION}s cap")
-
-        logger.info(f"Group {i} Narration Events:")
-        usable_count = 0
-        hook_seen = False
-        for j, event in enumerate(group["narration_events"]):
-            ev_type = str(event.get("event_type", "unknown")).strip().lower()
-            if ev_type == "hook":
-                if hook_seen:
-                    logger.info(f"Group {i} has duplicate hook event {j}; converting to 'commentary'")
-                    event["event_type"] = "commentary"
-                    ev_type = "commentary"
-                else:
-                    hook_seen = True
-
-            text = event.get("text", "")
-            r_start = event.get("reel_start", 0.0)
-            r_end = event.get("reel_end", 0.0)
-            logger.info(f"  {j+1}. [{ev_type.upper()}] {r_start:.1f}s - {r_end:.1f}s: \"{text[:60]}...\"")
-
-            if ev_type not in ("hook", "commentary"):
-                logger.warning(f"Group {i} narration event {j} has unrecognized event_type "
-                               f"'{ev_type}' — this will be SILENTLY DROPPED before TTS "
-                               f"(only 'hook'/'commentary' are voiced).")
-            else:
-                usable_count += 1
-
-            if ev_type == "hook" and r_start != 0.0:
-                logger.warning(f"Group {i} hook must start at reel_start=0.0, got {r_start}")
-                event["reel_start"] = 0.0
-
-            if r_end > group.get("estimated_duration_seconds", 130):
-                logger.warning(f"Group {i} event ends at {r_end}s, which exceeds estimated duration {group.get('estimated_duration_seconds')}s")
-
-        if usable_count == 0:
-            logger.warning(f"Group {i} has ZERO usable narration events after filtering — "
-                           f"this group's final video will have NO narration audio.")
-
-        # === NARRATION DISTRIBUTION CHECK ===
-        # Ensure commentary events are spread across the reel, not clustered at the end.
-        # If all commentary events are in the last 40% of the reel, redistribute them.
-        est_dur = group.get("estimated_duration_seconds", 120)
-        commentary_events = [e for e in group["narration_events"]
-                           if str(e.get("event_type", "")).strip().lower() == "commentary"
-                           and e.get("reel_end", 0) - e.get("reel_start", 0) >= 0.3]
-        if len(commentary_events) >= 2:
-            last_40_start = est_dur * 0.6
-            all_in_tail = all(e.get("reel_start", 0) >= last_40_start for e in commentary_events)
-            if all_in_tail:
-                logger.warning(f"Group {i}: ALL {len(commentary_events)} commentary events clustered in "
-                               f"last 40% of reel (after {last_40_start:.1f}s). Redistributing across reel...")
-                # Redistribute: place at 25%, 50%, 75% of reel duration
-                targets = [0.25, 0.50, 0.75]
-                for idx, event in enumerate(commentary_events):
-                    fraction = targets[idx % len(targets)]
-                    new_start = round(est_dur * fraction, 2)
-                    dur = event.get("reel_end", 0) - event.get("reel_start", 0)
-                    event["reel_start"] = new_start
-                    event["reel_end"] = round(new_start + dur, 2)
-                    logger.info(f"  Redistributed commentary {idx+1}: "
-                                f"reel_start={new_start:.2f}s, reel_end={event['reel_end']:.2f}s")
-
-    # Soft log if group count differs from target — don't waste an LLM call
-    # retrying, since the target is content-proportional and the LLM may have
-    # legitimately decided the content warrants fewer/more groups.
+    # Soft log if group count differs from target
     if len(groups) < min_groups:
-        logger.info(f"LLM returned {len(groups)} groups (target was {min_groups}-{max_groups}). "
-                    f"Accepting — content may not support more distinct angles.")
+        logger.info(f"LLM returned {len(groups)} groups (target was {min_groups}-{max_groups}). Accepting.")
     elif len(groups) > max_groups:
-        logger.info(f"LLM returned {len(groups)} groups (target was {min_groups}-{max_groups}). "
-                    f"Accepting — more content available than expected.")
+        logger.info(f"LLM returned {len(groups)} groups (target was {min_groups}-{max_groups}). Accepting.")
 
-    # Code-level Quality & Distinctness Filter:
-    # Filter out empty/invalid groups or exact duplicates to maintain robust quality
-    filtered_groups = []
-    seen_clip_fingerprints = set()
-
-    for i, group in enumerate(groups):
-        clips = group.get("source_clips", [])
-        if not clips:
-            logger.warning(f"Pruning Group {i}: No source clips provided.")
-            continue
-
-        # Fingerprint clip ranges to prevent exact duplicate groups
-        fingerprint = tuple(sorted((round(c.get("source_start", 0.0), 1), round(c.get("source_end", 0.0), 1)) for c in clips))
-        if fingerprint in seen_clip_fingerprints and len(groups) > 1:
-            logger.warning(f"Pruning Group {i}: Exact duplicate clip selection of a previous group.")
-            continue
-
-        seen_clip_fingerprints.add(fingerprint)
-        filtered_groups.append(group)
-
-    if filtered_groups:
-        groups = filtered_groups
-        reel_plan["reel_groups"] = groups
-    else:
-        logger.warning("All groups filtered out! Keeping original primary group.")
-        groups = [groups[0]]
-        reel_plan["reel_groups"] = groups
-
-    # Clamp clip timestamps to actual source video bounds [0, source_duration] & enforce clip floor (>= 3.0s)
-    clamped_count = 0
-    for i, group in enumerate(groups):
-        # Sanitize narration text
-        for event in group.get("narration_events", []):
-            if "text" in event and isinstance(event["text"], str):
-                event["text"] = sanitize_text(event["text"])
-
-        for clip in group.get("source_clips", []):
-            s = clip.get("source_start", 0.0)
-            e = clip.get("source_end", 0.0)
-            new_s = max(0.0, min(s, source_duration))
-            new_e = max(0.0, min(e, source_duration))
-            # Enforce minimum clip duration floor of 3.0 seconds to prevent encoder issues
-            if new_e - new_s < 3.0 and source_duration >= 3.0:
-                new_e = min(source_duration, new_s + 3.0)
-                if new_e - new_s < 3.0:
-                    new_s = max(0.0, new_e - 3.0)
-
-            if new_s != s or new_e != e:
-                clamped_count += 1
-                clip["source_start"] = new_s
-                clip["source_end"] = new_e
-            # Ensure start < end
-            if clip["source_start"] >= clip["source_end"]:
-                clip["source_end"] = min(clip["source_start"] + 3.0, source_duration)
-    if clamped_count > 0:
-        logger.info(f"Adjusted/Clamped {clamped_count} clip timestamps (bounds: [0, {source_duration:.1f}s], min_duration: 3.0s)")
+    # ===== DETERMINISTIC VALIDATION (Python owns this) =====
+    # All clip bounds, timing, overlaps, narration, duration, and dedup validation
+    # is performed by plan_validator — the LLM is NOT responsible for any of this.
+    reel_plan = finalize_edit(reel_plan, source_duration)
 
     if progress_cb:
-        progress_cb(f"Built reel plan with {len(groups)} group(s)", 100)
+        progress_cb(f"Built reel plan with {len(reel_plan.reel_groups)} group(s)", 100)
 
     # Log key stats
-    total_clips = sum(len(g.get("source_clips", [])) for g in groups)
-    total_narrations = sum(len(g.get("narration_events", [])) for g in groups)
-    avg_duration = sum(g.get("estimated_duration_seconds", 0) for g in groups) / max(len(groups), 1)
-    logger.info(f"REEL PLAN STATS: {len(groups)} groups, {total_clips} total clips, "
+    total_clips = sum(len(g.source_clips) for g in reel_plan.reel_groups)
+    total_narrations = sum(len(g.narration_events) for g in reel_plan.reel_groups)
+    avg_duration = sum(g.estimated_duration_seconds for g in reel_plan.reel_groups) / max(len(reel_plan.reel_groups), 1)
+    logger.info(f"REEL PLAN STATS: {len(reel_plan.reel_groups)} groups, {total_clips} total clips, "
                 f"{total_narrations} total narrations, avg duration {avg_duration:.1f}s")
-
-    # ===== POST-PROCESSING DURATION ENFORCEMENT =====
-    # Ensure each group's total clip duration + narration + padding hits the minimum target
-    # If a group is too short, warn and log the shortfall (the compositor will have to pad)
-    min_reel_dur = reel_dur_min  # from above computation
-    for i, group in enumerate(groups):
-        clips = group.get("source_clips", [])
-        clips_total = sum(c.get("source_end", 0) - c.get("source_start", 0) for c in clips)
-        nar_events = group.get("narration_events", [])
-        nar_total = sum(e.get("reel_end", 0) - e.get("reel_start", 0) for e in nar_events)
-        # Narration OVERLAPS clips — it plays on top, not after. Do NOT add nar_total.
-        actual_estimated = clips_total + 2.0
-
-        # Re-set estimated_duration_seconds to the computed actual if LLM estimate is too far off
-        llm_estimate = group.get("estimated_duration_seconds", 0)
-        if llm_estimate < min_reel_dur and source_duration >= min_reel_dur:
-            logger.warning(f"Group {i}: LLM estimated_duration_seconds={llm_estimate:.1f}s is below target {min_reel_dur}s. "
-                           f"Actual computed: {actual_estimated:.1f}s (clips={clips_total:.1f}s, narration overlaid={nar_total:.1f}s).")
-
-        # Bump estimated_duration_seconds to at least the computed actual
-        if actual_estimated > llm_estimate:
-            logger.info(f"Group {i}: Raising estimated_duration_seconds from {llm_estimate:.1f}s to {actual_estimated:.1f}s (computed from {len(clips)} clips + 2s pad, narration overlaid)")
-            group["estimated_duration_seconds"] = round(actual_estimated, 1)
-
-        # Log detailed per-group report
-        logger.info(f"Group {i} DURATION REPORT: clips={clips_total:.1f}s ({len(clips)} clips), "
-                    f"narration={nar_total:.1f}s ({len(nar_events)} events), "
-                    f"estimated={group['estimated_duration_seconds']:.1f}s, "
-                    f"target_range={reel_duration_target}s")
 
     # Broadcast final interactions state
     if reporter and interactions is not None:
         reporter.set_stage_data_key("llm_interactions", [i.model_dump() for i in interactions])
 
-    return ReelPlan(**reel_plan)
+    return reel_plan
 
 
 def _normalize_clip_range(transcript: list, start_seg: int, end_seg: int) -> tuple[int, int]:
