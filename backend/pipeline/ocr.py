@@ -1,4 +1,5 @@
 import cv2
+import logging
 import numpy as np
 from pathlib import Path
 from typing import Dict, List, Optional, Any
@@ -6,6 +7,8 @@ import subprocess
 import json
 import os
 from backend.ffmpeg_utils import get_ffmpeg
+
+logger = logging.getLogger(__name__)
 
 # Module-level EasyOCR reader cache (expensive to instantiate)
 _easyocr_reader = None
@@ -49,7 +52,11 @@ def _try_easyocr(image_path: str) -> List[Dict[str, Any]]:
                 "language": "en",
             }
         ]
-    except (ImportError, Exception):
+    except ImportError:
+        logger.debug("EasyOCR not installed, skipping")
+        return []
+    except Exception as e:
+        logger.warning(f"EasyOCR failed on {image_path}: {type(e).__name__}: {e}")
         return []
 
 
@@ -62,8 +69,10 @@ def _try_pytesseract(image_path: str) -> List[Dict[str, Any]]:
         text = pytesseract.image_to_string(img)
         if text.strip():
             return [{"text": text.strip(), "confidence": 0.7, "bbox": [], "language": "en"}]
-    except (ImportError, Exception):
-        pass
+    except ImportError:
+        logger.debug("pytesseract not installed")
+    except Exception as e:
+        logger.warning(f"pytesseract failed on {image_path}: {type(e).__name__}: {e}")
     return []
 
 

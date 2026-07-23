@@ -6,9 +6,12 @@ from typing import Dict, List, Optional, Any, Tuple
 import os
 import re
 import shutil
-
+import tempfile
+import logging
 
 from backend.ffmpeg_utils import get_ffmpeg, get_ffprobe
+
+logger = logging.getLogger(__name__)
 
 
 def get_video_duration(video_path: str) -> float:
@@ -52,20 +55,39 @@ def detect_silence_with_vad(
     try:
         import torch
         import torchaudio
-        from silero_vad import get_speech_timestamps, read_audio, VADIterator
+        from silero_vad import get_speech_timestamps, load_silero_vad, read_audio, VADIterator
     except ImportError:
         print("[WARN] Silero VAD not available, falling back to ffmpeg silencedetect")
         return detect_silence_ffmpeg(video_path, -35.0, min_silence_duration)
 
+    # Extract audio to temp WAV — torchaudio can't read video containers on Windows
+    sampling_rate = 16000
+    tmp_wav = None
     try:
-        wav, sr = read_audio(video_path, sampling_rate=16000)
+        tmp_fd, tmp_wav = tempfile.mkstemp(suffix=".wav", prefix="editor_vad_")
+        os.close(tmp_fd)
+        ffmpeg = get_ffmpeg()
+        subprocess.run([
+            ffmpeg, "-y", "-loglevel", "error",
+            "-i", str(video_path),
+            "-vn", "-acodec", "pcm_s16le", "-ar", str(sampling_rate), "-ac", "1",
+            tmp_wav
+        ], capture_output=True, text=True, timeout=60)
+        if not os.path.exists(tmp_wav) or os.path.getsize(tmp_wav) == 0:
+            return detect_silence_ffmpeg(video_path, -35.0, min_silence_duration)
+
+        # read_audio returns a resampled mono tensor (not a tuple) in silero_vad v6+
+        wav = read_audio(tmp_wav, sampling_rate=sampling_rate)
+
+        # Load the Silero VAD model (required in silero_vad v6+)
+        model = load_silero_vad()
 
         speech_timestamps = get_speech_timestamps(
             wav,
-            sr,
+            model,
             threshold=threshold,
             min_silence_duration_ms=int(min_silence_duration * 1000),
-            window_size_samples=int(window_size * sr),
+            window_size_samples=int(window_size * sampling_rate),
             return_seconds=True
         )
 
@@ -88,7 +110,7 @@ def detect_silence_with_vad(
                     })
             prev_end = speech_end
 
-        total_duration = len(wav) / sr
+        total_duration = len(wav) / sampling_rate
         if total_duration > prev_end:
             silence_duration = total_duration - prev_end
             if silence_duration >= min_silence_duration:
@@ -101,8 +123,14 @@ def detect_silence_with_vad(
         return silence_segments
 
     except Exception as e:
-        print(f"[WARN] Silero VAD detection failed: {e}, falling back to ffmpeg")
+        logger.warning(f"Silero VAD detection failed: {type(e).__name__}: {e}, falling back to ffmpeg")
         return detect_silence_ffmpeg(video_path, -35.0, min_silence_duration)
+    finally:
+        if tmp_wav and os.path.exists(tmp_wav):
+            try:
+                os.unlink(tmp_wav)
+            except OSError:
+                pass
 
 
 def detect_silence_ffmpeg(
