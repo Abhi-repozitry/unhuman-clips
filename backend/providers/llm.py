@@ -64,11 +64,12 @@ def call_llm_sync(
     api_key: str,
     base_url: str = "https://integrate.api.nvidia.com/v1",
     temperature: float = 0.0,
-    max_tokens: int = 131072,
+    max_tokens: int = 16384,
     timeout: float = 480.0,
     reporter: Any = None,
     interactions: list[LLMInteraction] | None = None,
     stage_name: str = "reel_plan",
+    reasoning_effort: str = "high",
 ) -> str:
     """Synchronous LLM call with enhanced retry logic and exponential backoff.
 
@@ -79,6 +80,7 @@ def call_llm_sync(
     - Collects structured LLMInteraction records for UI display
     - Detailed logging via reporter.log_info/log_warn
     - temperature=0.0 for determinism where possible
+    - reasoning_effort controls model thinking depth ('low'/'medium'/'high')
     """
     from backend.config import NVIDIA_MODEL_FALLBACK
 
@@ -157,6 +159,7 @@ def call_llm_sync(
                     "max_tokens": max_tokens,
                     "timeout": timeout,
                     "seed": 42,
+                    "reasoning_effort": reasoning_effort,
                 }
                 # Only add response_format if the model supports it
                 try:
@@ -261,9 +264,9 @@ _LLM_CACHE_TTL = 300  # 5 minutes
 _llm_cache: dict[str, tuple[float, str]] = {}
 
 
-def _cache_key(messages: list, model: str) -> str:
-    """Deterministic cache key from messages + model."""
-    blob = json.dumps({"m": messages, "model": model}, sort_keys=True, default=str)
+def _cache_key(messages: list, model: str, reasoning_effort: str = "high") -> str:
+    """Deterministic cache key from messages + model + reasoning_effort."""
+    blob = json.dumps({"m": messages, "model": model, "re": reasoning_effort}, sort_keys=True, default=str)
     return hashlib.sha256(blob.encode()).hexdigest()[:16]
 
 
@@ -273,19 +276,21 @@ def cached_call_llm_sync(
     api_key: str,
     base_url: str = "https://integrate.api.nvidia.com/v1",
     temperature: float = 0.0,
-    max_tokens: int = 131072,
+    max_tokens: int = 16384,
     timeout: float = 480.0,
     reporter: Any = None,
     interactions: list[LLMInteraction] | None = None,
     stage_name: str = "reel_plan",
     use_cache: bool = True,
+    reasoning_effort: str = "high",
 ) -> str:
     """LLM call with TTL cache. Cached responses skip the API entirely."""
     if not use_cache or temperature != 0.0:
         return call_llm_sync(messages, model, api_key, base_url, temperature,
-                             max_tokens, timeout, reporter, interactions, stage_name)
+                             max_tokens, timeout, reporter, interactions,
+                             stage_name, reasoning_effort)
 
-    key = _cache_key(messages, model)
+    key = _cache_key(messages, model, reasoning_effort)
     now = time.monotonic()
 
     if key in _llm_cache:
@@ -310,7 +315,8 @@ def cached_call_llm_sync(
             del _llm_cache[key]
 
     result = call_llm_sync(messages, model, api_key, base_url, temperature,
-                           max_tokens, timeout, reporter, interactions, stage_name)
+                           max_tokens, timeout, reporter, interactions,
+                           stage_name, reasoning_effort)
     _llm_cache[key] = (now, result)
     return result
 

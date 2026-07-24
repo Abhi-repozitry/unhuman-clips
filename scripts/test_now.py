@@ -7,7 +7,7 @@ from pathlib import Path
 API = "http://127.0.0.1:9000"
 TEST_URL = "https://youtu.be/Ah_uuTwGOYU?si=pAu07P3P1y88giFu"
 
-REPO_ROOT = Path(r"C:\Projects\unhuman-clips")
+REPO_ROOT = Path(__file__).resolve().parent.parent
 LOGS_DIR = REPO_ROOT / "logs"
 LOGS_DIR.mkdir(exist_ok=True)
 REPORT_FILE = LOGS_DIR / "test_now_report.json"
@@ -57,7 +57,7 @@ def poll_all_jobs(job_id: str, timeout_s: int = 1800):
 def probe_duration(path: Path) -> float:
     try:
         import subprocess
-        ffprobe = Path(r"C:\Projects\unhuman-clips\ffmpeg\ffmpeg-8.1.2-full_build\bin\ffprobe.exe")
+        ffprobe = REPO_ROOT / "ffmpeg" / "ffmpeg-8.1.2-full_build" / "bin" / "ffprobe.exe"
         res = subprocess.run(
             [str(ffprobe), "-v", "error", "-show_entries", "format=duration",
              "-of", "default=noprint_wrappers=1:nokey=1", str(path)],

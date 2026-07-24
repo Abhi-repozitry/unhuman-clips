@@ -328,6 +328,14 @@ You are NOT a summarizer. You are an EDITOR — cutting a reel with intentional 
 ===== CORE MISSION: ASSEMBLE A REEL WITH VARIED PACING =====
 Select clips from the transcript and assemble them into a {dur_min}-{dur_max}s reel. Your KEY decision is the MIX of clip lengths — this determines pacing and energy.
 
+HOOK CLIP (MANDATORY — FIRST CLIP OF EVERY GROUP):
+- The VERY FIRST clip of every group MUST be a HOOK CLIP: 1-4 seconds from the EARLIEST part of the source video.
+- This hook clip grabs the audience with the source video's original audio (speech, sounds, energy).
+- Set "is_hook_clip": true for this clip. All other clips have "is_hook_clip": false.
+- The hook clip MUST be short (1-4s), high-energy, and immediately attention-grabbing.
+- The hook clip's original audio plays at full volume — no ducking is applied to it.
+- This is NOT the narration hook (TTS). The hook clip IS the source video playing.
+
 CLIP DURATION CATEGORIES:
 - SHORT (3-5s): Punchy cuts, reactions, transitions, single-line punchlines, visual stingers.
   Use 3-5 per reel. These CREATE ENERGY and rhythm. Short clips are your beat drops.
@@ -355,6 +363,25 @@ TIER 3 — SUPPORTING (use MEDIUM clips to bridge TIER 1-2 moments):
 • Reactions: genuine audience/participant reactions to high moments
 
 EXCLUDE entirely: filler, greetings, repetitive explanations, low-energy passages, generic statements, transitions without substance.
+
+===== STRICT GROUP SEPARATION (CRITICAL) =====
+DO NOT force the video into multiple output groups. If the entire video can be presented as ONE compelling reel for the audience, produce ONLY 1 group. Multiple groups are ONLY for videos with genuinely distinct, unrelated topics. One cohesive video = one group. Do NOT artificially split content.
+
+Each group MUST tell a COMPLETELY DIFFERENT STORY about a DIFFERENT TOPIC or ASPECT of the video. Groups are NOT interchangeable highlights — each has a unique narrative.
+
+HOW TO DETERIMINE GROUPS:
+- Identify the DISTINCT TOPICS or STORY ARCS in the video. A topic = a self-contained story, argument, demonstration, or theme.
+- If the video covers ONE cohesive topic, produce ONLY 1 group. Do NOT split one topic into multiple groups.
+- If the video covers 2 different topics, produce 2 groups. If 3 topics, 3 groups. And so on.
+- Each group should focus on ONE topic and tell its complete story (setup → conflict → payoff).
+- When in doubt, produce FEWER groups. One great reel beats two mediocre ones.
+
+CROSS-GROUP UNIQUENESS RULES:
+- Maximum 20% clip time overlap between any two groups.
+- If Group 1 uses a moment at 45.0-55.0s, Group 2 CANNOT use any clip overlapping that range UNLESS it's genuinely part of the same content moment.
+- Each group's narrative_angle MUST reference a DIFFERENT topic, theme, or aspect of the video.
+- Each group's key_moment MUST be from a DIFFERENT part of the video.
+- If two groups would naturally use the same clips, MERGE them into one group instead.
 
 ===== DURATION BUDGET (THE MOST IMPORTANT SECTION) =====
 Your PRIMARY constraint is TOTAL DURATION, not clip count.
@@ -388,7 +415,10 @@ Transcript (segment index [timestamp]):
 {transcript_text}
 
 ===== MANDATORY OUTPUT =====
-- Output {min_groups}-{max_groups} reel_groups. Each group tells a DIFFERENT story arc.
+- Output {min_groups}-{max_groups} reel_groups ONLY if the video has distinct topics that warrant separate reels.
+- If the video is one cohesive topic, output EXACTLY 1 group. Do NOT force multiple groups.
+- Each group tells a DIFFERENT story arc about a DIFFERENT topic.
+- When in doubt, produce FEWER groups. One great reel > two mediocre ones.
 - Groups MUST be spread across the FULL video timeline — NOT clustered in the first few minutes.
 - Timeline coverage is MANDATORY:
   * Early zone: 0.0s - {early_end:.0f}s (at least 1-2 clips from here)
@@ -407,16 +437,46 @@ Transcript (segment index [timestamp]):
 7. NEVER select a clip shorter than 3.0 seconds.
 
 ===== NARRATION RULES =====
+IMPORTANT: Total narration events per group: 1 HOOK + 0-1 COMMENTARY = MAX 2 total.
+Quality over quantity. A single powerful commentary line beats five generic ones.
+
 Hook (event_type: "hook"):
 - reel_start: 0.0 always. reel_end: 2.5-4.0 seconds.
 - 6-10 words. Specific to this video's content. Creates immediate curiosity.
 - BANNED: "Watch what happens", "You won't believe", "This is insane", "Wait for it"
 
 Commentary (event_type: "commentary"):
-- 8-14 words each. Adds SPECIFIC context the viewer cannot get from footage alone.
-- Use numbers, names, or concrete details. Never vague.
-- Distribute across the reel: one at 25-40%, one at 50-65%, one at 70-85%.
+- MAX 1 per group. 8-14 words. Makes the viewer FEEL something.
+- You MUST assign a persona to each commentary event (see PERSONA SYSTEM below).
+- Distribute: if 1 commentary, place at 40-60% of reel. If only hook, no commentary needed.
 - BANNED: "As you can see", "Notice how", "Check this out", "Pretty cool"
+
+PERSONA SYSTEM — assign ONE persona to each commentary event:
+Each persona changes the TONE and ANGLE of the commentary. Pick the one that fits the moment:
+
+- "roast" — Witty, playful criticism. Teasing the subject with humor.
+  Example: "Bro really thought that was a good take. It was not."
+  Example: "The confidence here is honestly impressive. The execution? Not so much."
+
+- "brutally_honest" — Raw unfiltered truth. No sugarcoating, direct and blunt.
+  Example: "Let's be real — this is terrible and here's why it matters."
+  Example: "Nobody wants to say it, but this approach fails every single time."
+
+- "friendly" — Warm, supportive, encouraging tone. Like a friend hyping you up.
+  Example: "Okay this is actually genius, and let me explain why."
+  Example: "No but seriously, this person deserves more credit for this."
+
+- "sarcastic" — Ironic understatement. Says the opposite of what's meant.
+  Example: "Oh wow, what a surprise — another bad decision."
+  Example: "Clearly nobody planned this. Shocking."
+
+- "hype" — High energy, intense excitement. Urgency and FOMO.
+  Example: "STOP SCROLLING. This changes everything."
+  Example: "This is the moment everyone's been waiting for."
+
+- "deadpan" — Emotionless delivery for maximum comedic contrast.
+  Example: "And then he fell. That happened."
+  Example: "This is fine. Everything is fine."
 
 The audio system uses AI-powered Voice Activity Detection for ducking — it only ducks when TTS narration is actually speaking. This means narration can be placed over dialogue; the ducking will only activate during actual TTS speech, leaving surrounding dialogue intact.
 
@@ -426,6 +486,7 @@ The audio system uses AI-powered Voice Activity Detection for ducking — it onl
 - The last 5-8 seconds of the reel should be FREE of narration — let the payoff land.
 - Total narration duration should be no more than 25% of total reel duration.
 - Narration events must NOT overlap each other.
+- MAXIMUM 2 narration events total (1 hook + 0-1 commentary). Fewer is often better.
 
 ===== TEXT RULES =====
 Allowed: letters, numbers, . , ! ? ' - — " : ;
@@ -434,15 +495,18 @@ Use contractions. Be conversational. Be specific.
 
 ===== SELF-VERIFICATION (MANDATORY) =====
 Before outputting, you MUST verify:
-1. total_clip_duration = sum of (source_end - source_start) for all clips
-2. total_narration_duration = sum of (reel_end - reel_start) for all narration events
+1. Are you FORCING multiple groups when the video is one topic? If YES: merge into 1 group.
+2. total_clip_duration = sum of (source_end - source_start) for all clips
 3. estimated_duration = total_clip_duration + 2.0 (narration OVERLAPS clips, does NOT add to duration)
 4. estimated_duration >= {dur_min}? If NO: add more clips until YES.
 5. estimated_duration <= {dur_max}? If NO: remove clips or shorten clips until YES.
 6. Clips span early/middle/late zones? If NO: replace clips to fix coverage.
 7. Clip length mix: Are there SHORT + MEDIUM + LONG clips? (not all same length)
 8. Rhythm check: No back-to-back LONG clips? No 3+ SHORT clips in a row?
-9. estimated_duration_seconds = estimated_duration from step 3.
+9. Maximum 2 narration events (1 hook + 0-1 commentary)? If more: REMOVE the weakest.
+10. Each commentary event has a persona assigned? If not: assign one from the PERSONA SYSTEM.
+11. First clip has "is_hook_clip": true and is 1-4 seconds? If not: FIX IT.
+12. estimated_duration_seconds = estimated_duration from step 3.
 
 ===== OUTPUT (STRICT JSON ONLY) =====
 Output ONLY valid JSON. No markdown. No explanation.
@@ -469,19 +533,17 @@ If metrics show BLACK_FRAME or FREEZE, avoid those segments unless they serve a 
         "key_moment": "The single strongest moment in this group"
       }},
       "source_clips": [
-        {{"source_start": 0.0, "source_end": 4.0, "reason": "SHORT: Punchy opening reaction/visual stinger"}},
-        {{"source_start": 12.0, "source_end": 25.0, "reason": "MEDIUM: Key dialogue exchange that establishes the story"}},
-        {{"source_start": 45.0, "source_end": 60.0, "reason": "MEDIUM: Building tension with specific details"}},
-        {{"source_start": 72.0, "source_end": 75.0, "reason": "SHORT: Quick reaction or punchline beat"}},
-        {{"source_start": 90.0, "source_end": 110.0, "reason": "LONG: Emotional peak — the moment that makes this video worth watching"}},
-        {{"source_start": 120.0, "source_end": 123.0, "reason": "SHORT: Final punchy beat before the payoff"}},
-        {{"source_start": 130.0, "source_end": 145.0, "reason": "MEDIUM: Payoff moment — the strongest remaining clip"}}
+        {{"source_start": 0.0, "source_end": 3.5, "reason": "HOOK CLIP: High-energy opening moment — original audio grabs audience", "is_hook_clip": true}},
+        {{"source_start": 12.0, "source_end": 25.0, "reason": "MEDIUM: Key dialogue exchange that establishes the story", "is_hook_clip": false}},
+        {{"source_start": 45.0, "source_end": 60.0, "reason": "MEDIUM: Building tension with specific details", "is_hook_clip": false}},
+        {{"source_start": 72.0, "source_end": 75.0, "reason": "SHORT: Quick reaction or punchline beat", "is_hook_clip": false}},
+        {{"source_start": 90.0, "source_end": 110.0, "reason": "LONG: Emotional peak — the moment that makes this video worth watching", "is_hook_clip": false}},
+        {{"source_start": 120.0, "source_end": 123.0, "reason": "SHORT: Final punchy beat before the payoff", "is_hook_clip": false}},
+        {{"source_start": 130.0, "source_end": 145.0, "reason": "MEDIUM: Payoff moment — the strongest remaining clip", "is_hook_clip": false}}
       ],
       "narration_events": [
-        {{"event_type": "hook", "reel_start": 0.0, "reel_end": 3.0, "text": "Specific hook tied to this video...", "voice_id": null}},
-        {{"event_type": "commentary", "reel_start": 25.0, "reel_end": 28.0, "text": "Specific context with numbers or details.", "voice_id": null}},
-        {{"event_type": "commentary", "reel_start": 55.0, "reel_end": 58.0, "text": "Expert insight the footage alone doesn't convey.", "voice_id": null}},
-        {{"event_type": "commentary", "reel_start": 80.0, "reel_end": 83.0, "text": "Payoff line that ties the story together.", "voice_id": null}}
+        {{"event_type": "hook", "reel_start": 0.0, "reel_end": 3.0, "text": "Specific hook tied to this video...", "persona": null, "voice_id": null}},
+        {{"event_type": "commentary", "reel_start": 25.0, "reel_end": 28.0, "text": "Witty roast about this moment.", "persona": "roast", "voice_id": null}}
       ]
     }}
   ],
@@ -604,11 +666,9 @@ def select_reel_plan(
     clips_min = min(clips_min, clips_max - 1)
     clips_per_group = f"{clips_min}-{clips_max}"
     
-    # More narration: 3-6 events to fill narrative arc
-    narr_min = max(3, math.ceil(reel_dur_min / 30))
-    narr_max = max(narr_min + 1, math.ceil(reel_dur_max / 25))
-    narr_min = min(narr_min, 4)
-    narr_max = max(4, min(narr_max, 8))
+    # More narration: 1-2 events (1 hook + 0-1 commentary) — quality over quantity
+    narr_min = 1
+    narr_max = 2
     narration_per_group = f"{narr_min}-{narr_max}"
 
     logger.info(f"DURATION-DRIVEN TARGETS for {source_duration:.1f}s video: "

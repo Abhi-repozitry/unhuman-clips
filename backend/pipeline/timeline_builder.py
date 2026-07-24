@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import subprocess
 import tempfile
 from typing import Any, Callable
@@ -181,7 +182,6 @@ def _compute_ffmpeg_metrics(
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         stderr = result.stderr
 
-        import re
         mean_match = re.search(r"mean_volume:\s*([-\d.]+)\s*dB", stderr)
         if mean_match:
             metrics.volume_db = float(mean_match.group(1))
@@ -455,6 +455,14 @@ def build_rich_timeline(
 
         metrics = segment_metrics.get(i, FFmpegMetrics())
 
+        # Richer feature computation
+        speech_text = seg.get("text", "").strip()
+        word_count = len([w for w in speech_text.split() if w.strip()]) if speech_text else 0
+        word_density = word_count / duration if duration > 0 else 0.0
+        has_question = "?" in speech_text
+        has_exclamation = "!" in speech_text
+        has_emphasis = bool(re.search(r"\b[A-Z]{3,}\b", speech_text)) if speech_text else False
+
         segment = RichTimelineSegment(
             segment_id=i,
             start=round(start, 3),
@@ -469,6 +477,10 @@ def build_rich_timeline(
             ocr=ocr_texts,
             ocr_confidence=round(ocr_confidence, 3),
             metrics=metrics,
+            word_density=round(word_density, 3),
+            has_question=has_question,
+            has_exclamation=has_exclamation,
+            has_emphasis=has_emphasis,
         )
         segments.append(segment)
 

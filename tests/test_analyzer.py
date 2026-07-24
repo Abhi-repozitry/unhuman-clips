@@ -1,15 +1,15 @@
-"""Tests for backend.pipeline.analyzer — reel plan prompt building, JSON extraction/repair, group logic."""
+"""Tests for backend.pipeline.analyzer — original planner prompt, JSON extraction/repair, transcript formatting."""
 from __future__ import annotations
 
 import json
-from unittest.mock import MagicMock, patch
 
 import pytest
 
+from backend.models import FFmpegMetrics, RichTimeline, RichTimelineSegment
 from backend.pipeline.analyzer import (
-    _compute_group_count_target,
     _extract_json_object,
     _format_full_transcript,
+    _format_rich_timeline,
     _normalize_clip_range,
     _try_repair_truncated_json,
 )
@@ -42,6 +42,67 @@ class TestFormatFullTranscript:
         assert "Seg 0" not in result
         assert "Seg 1" not in result
         assert "Seg 2" in result
+
+
+class TestFormatRichTimeline:
+    """Test _format_rich_timeline metadata formatting."""
+
+    def test_empty_timeline(self):
+        timeline = RichTimeline()
+        assert _format_rich_timeline(timeline) == ""
+
+    def test_includes_energy(self):
+        timeline = RichTimeline(
+            segments=[
+                RichTimelineSegment(
+                    segment_id=0, start=0.0, end=5.0, duration=5.0,
+                    speech="Hello world", speech_energy=0.8,
+                ),
+            ],
+        )
+        result = _format_rich_timeline(timeline)
+        assert "energy=" in result
+        assert "Hello world" in result
+
+    def test_includes_ocr(self):
+        timeline = RichTimeline(
+            segments=[
+                RichTimelineSegment(
+                    segment_id=0, start=0.0, end=5.0, duration=5.0,
+                    speech="test", speech_energy=0.5,
+                    ocr=["BANNER TEXT"],
+                ),
+            ],
+        )
+        result = _format_rich_timeline(timeline)
+        assert "OCR: BANNER TEXT" in result
+
+    def test_includes_metrics(self):
+        timeline = RichTimeline(
+            segments=[
+                RichTimelineSegment(
+                    segment_id=0, start=0.0, end=5.0, duration=5.0,
+                    speech="test", speech_energy=0.5,
+                    metrics=FFmpegMetrics(volume_db=-10.0, black_frame=True),
+                ),
+            ],
+        )
+        result = _format_rich_timeline(timeline)
+        assert "vol=-10.0dB" in result
+        assert "BLACK_FRAME" in result
+
+    def test_includes_silence_before(self):
+        timeline = RichTimeline(
+            segments=[
+                RichTimelineSegment(
+                    segment_id=0, start=0.0, end=5.0, duration=5.0,
+                    speech="test", speech_energy=0.5,
+                    silence_before=True,
+                ),
+            ],
+        )
+        result = _format_rich_timeline(timeline)
+        assert "[SILENCE_BEFORE]" in result
 
 
 class TestExtractJsonObject:
@@ -130,38 +191,8 @@ class TestTryRepairTruncatedJson:
         assert _try_repair_truncated_json("") == ""
 
     def test_returns_empty_for_unrepairable(self):
-        # Totally random text with no JSON structure
         result = _try_repair_truncated_json("not json at all !!!")
-        # May or may not find something, but should not crash
         assert isinstance(result, str)
-
-
-class TestComputeGroupCountTarget:
-    """Test _compute_group_count_target duration-based scaling."""
-
-    def test_short_video(self):
-        assert _compute_group_count_target(120) == (1, 4)  # < 300s
-
-    def test_boundary_300s(self):
-        assert _compute_group_count_target(300) == (1, 4)
-
-    def test_medium_video(self):
-        assert _compute_group_count_target(450) == (3, 6)  # 300-600s
-
-    def test_boundary_600s(self):
-        assert _compute_group_count_target(600) == (3, 6)
-
-    def test_long_video(self):
-        assert _compute_group_count_target(900) == (4, 8)  # 600-1200s
-
-    def test_boundary_1200s(self):
-        assert _compute_group_count_target(1200) == (4, 8)
-
-    def test_very_long_video(self):
-        assert _compute_group_count_target(2400) == (5, 12)  # > 1200s
-
-    def test_zero_duration(self):
-        assert _compute_group_count_target(0) == (1, 4)
 
 
 class TestNormalizeClipRange:
@@ -183,7 +214,6 @@ class TestNormalizeClipRange:
             {"start": 1.0, "end": 2.0, "text": "b"},
             {"start": 2.0, "end": 3.0, "text": "c"},
         ]
-        # CLIP_DURATION_SOFT_MIN = 10s, but transcript is only 3s total
         start, end = _normalize_clip_range(transcript, 1, 1)
         assert end >= start  # should have expanded
 
@@ -192,7 +222,6 @@ class TestNormalizeClipRange:
             {"start": 0.0, "end": 5.0, "text": "a"},
             {"start": 5.0, "end": 10.0, "text": "b"},
         ]
-        # Negative indices should be clamped
         start, end = _normalize_clip_range(transcript, -5, 100)
         assert start >= 0
         assert end <= len(transcript) - 1

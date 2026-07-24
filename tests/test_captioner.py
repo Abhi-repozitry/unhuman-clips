@@ -73,14 +73,14 @@ class TestFormatTimestamp:
 
 
 class TestWrapTextAss:
-    """Test _wrap_text_ass word wrapping for 9:16 portrait."""
+    """Test _wrap_text_ass word wrapping for 4:5 (1080x1350)."""
 
     def test_short_text_no_wrap(self):
         assert _wrap_text_ass("Hello") == "Hello"
 
     def test_exact_boundary(self):
-        # 24 chars exactly
-        text = "a" * 24
+        # 28 chars exactly (default max_chars for 4:5)
+        text = "a" * 28
         assert _wrap_text_ass(text) == text
 
     def test_wraps_at_boundary(self):

@@ -153,10 +153,12 @@ class TestPipelineIntegration:
         from backend.progress import ProgressReporter
 
         job = VideoJob(url="https://test.com")
-        loop = asyncio.new_event_loop()
-        broadcast = AsyncMock()
+        broadcast_queue = []
 
-        reporter = ProgressReporter(job, broadcast, loop)
+        def enqueue_broadcast(j):
+            broadcast_queue.append(j)
+
+        reporter = ProgressReporter(job, enqueue_broadcast)
 
         def update():
             for _ in range(10):

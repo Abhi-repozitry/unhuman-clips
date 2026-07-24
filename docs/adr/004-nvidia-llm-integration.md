@@ -25,7 +25,7 @@ Use NVIDIA's API (integrate.api.nvidia.com) as the primary LLM provider, with a 
 | `NVIDIA_API_KEY` | *(required)* | API authentication |
 | `NVIDIA_BASE_URL` | `https://integrate.api.nvidia.com/v1` | API endpoint |
 | `NVIDIA_MODEL` | `openai/gpt-oss-120b` | Primary model |
-| `NVIDIA_MODEL_FALLBACK` | `nvidia/llama-3.3-nemotron-super-49b-v1.5` | Fallback on primary failure |
+| `NVIDIA_MODEL_FALLBACK` | `openai/gpt-oss-120b` | Fallback on primary failure |
 
 **Retry strategy:**
 1. Try primary model first

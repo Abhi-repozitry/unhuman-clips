@@ -9,7 +9,6 @@ This does NOT require ffmpeg, GPU, or network access.
 from __future__ import annotations
 
 import sys
-import time
 from pathlib import Path
 
 # Add project root to path so backend package is importable
@@ -75,10 +74,10 @@ def main() -> int:
     check("extract_json", lambda: _assert('"key": "value"' in _extract_json_object('{"key": "value"}')))
 
     print("\n[5/5] Models validation...")
-    from backend.models import VideoJob, ReelPlan, JobStatus
+    from backend.models import VideoJob, JobStatus
     job = VideoJob(url="https://test.com")
     check("VideoJob creation", lambda: _assert(job.status == JobStatus.QUEUED))
-    check("JobStatus enum", lambda: _assert(len(list(JobStatus)) == 11))
+    check("JobStatus enum", lambda: _assert(len(list(JobStatus)) == 12))
 
     # --- Summary ---
     print(f"\n{'='*40}")

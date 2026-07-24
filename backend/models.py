@@ -29,6 +29,8 @@ class SourceClip(BaseModel):
     source_start: float
     source_end: float
     reason: str
+    is_hook_clip: bool = False
+    segment_end: float = 0.0  # Rich Timeline segment boundary at/after source_end (0 = unknown)
 
 
 class NarrationEvent(BaseModel):
@@ -36,6 +38,7 @@ class NarrationEvent(BaseModel):
     reel_start: float
     reel_end: float
     text: str
+    persona: str | None = None
     voice_id: str | None = None
 
 
@@ -82,6 +85,12 @@ class RichTimelineSegment(BaseModel):
     ocr: list[str] = Field(default_factory=list)
     ocr_confidence: float = 0.0
     metrics: FFmpegMetrics = Field(default_factory=FFmpegMetrics)
+    word_density: float = 0.0
+    has_question: bool = False
+    has_exclamation: bool = False
+    has_emphasis: bool = False
+    keyword_match_score: float = 0.0
+    quality_score: float = 0.0
 
 
 class RichTimeline(BaseModel):

@@ -83,7 +83,7 @@ class TestNarrationValidator:
         # Should be shifted away from speech
         # The exact position depends on gap finding, but it should NOT be at 2.0
         # if speech covers 0-10s entirely
-        assert narration[0]["reel_start"] != 2.0 or narration[0]["reel_end"] <= 10.0
+        assert narration[0]["reel_start"] > 2.0
 
     def test_narration_capped_at_target_duration(self):
         """Narration exceeding target_duration should be capped."""

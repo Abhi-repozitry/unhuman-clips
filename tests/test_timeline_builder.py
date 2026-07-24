@@ -4,7 +4,6 @@ from __future__ import annotations
 import pytest
 
 from backend.models import FFmpegMetrics, RichTimeline, RichTimelineSegment
-from backend.pipeline.analyzer import _format_rich_timeline
 from backend.pipeline.timeline_builder import (
     _check_silence_before,
     _compute_speech_energy,
@@ -64,80 +63,6 @@ class TestCheckSilenceBefore:
     def test_speech_after_segment(self):
         regions = [{"start": 6.0, "end": 10.0}]
         assert _check_silence_before(5.0, regions, min_silence=0.3) is False
-
-
-class TestFormatRichTimeline:
-    """Test _format_rich_timeline formatting for LLM consumption."""
-
-    def test_empty_timeline(self):
-        timeline = RichTimeline()
-        assert _format_rich_timeline(timeline) == ""
-
-    def test_basic_segment_formatting(self):
-        timeline = RichTimeline(
-            segments=[
-                RichTimelineSegment(
-                    segment_id=0, start=0.0, end=5.0, duration=5.0,
-                    speech="Hello world", speech_energy=0.8,
-                ),
-            ],
-            source_duration=5.0,
-        )
-        result = _format_rich_timeline(timeline)
-        assert "Seg 0" in result
-        assert "[0.0-5.0s]" in result
-        assert "Hello world" in result
-        assert "energy=" in result
-
-    def test_ocr_included(self):
-        timeline = RichTimeline(
-            segments=[
-                RichTimelineSegment(
-                    segment_id=0, start=0.0, end=5.0, duration=5.0,
-                    speech="Test", ocr=["ON SCREEN TEXT"],
-                ),
-            ],
-        )
-        result = _format_rich_timeline(timeline)
-        assert "OCR: ON SCREEN TEXT" in result
-
-    def test_metrics_included(self):
-        timeline = RichTimeline(
-            segments=[
-                RichTimelineSegment(
-                    segment_id=0, start=0.0, end=5.0, duration=5.0,
-                    speech="Test",
-                    metrics=FFmpegMetrics(volume_db=-12.5),
-                ),
-            ],
-        )
-        result = _format_rich_timeline(timeline)
-        assert "vol=-12.5dB" in result
-
-    def test_silence_before_tag(self):
-        timeline = RichTimeline(
-            segments=[
-                RichTimelineSegment(
-                    segment_id=0, start=0.0, end=5.0, duration=5.0,
-                    speech="Test", silence_before=True,
-                ),
-            ],
-        )
-        result = _format_rich_timeline(timeline)
-        assert "SILENCE_BEFORE" in result
-
-    def test_black_frame_tag(self):
-        timeline = RichTimeline(
-            segments=[
-                RichTimelineSegment(
-                    segment_id=0, start=0.0, end=5.0, duration=5.0,
-                    speech="Test",
-                    metrics=FFmpegMetrics(black_frame=True),
-                ),
-            ],
-        )
-        result = _format_rich_timeline(timeline)
-        assert "BLACK_FRAME" in result
 
 
 class TestRichTimelineModels:

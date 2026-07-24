@@ -1,10 +1,9 @@
 import requests
-import json
 import time
 
 job_id = '29043868-1aa2-4e29-bf98-99a1701ecd77'
 for i in range(120):
-    response = requests.get(f'http://127.0.0.1:9000/jobs/{job_id}')
+    response = requests.get(f'http://127.0.0.1:9000/jobs/{job_id}', timeout=10)
     job = response.json()
     stage = job.get('current_stage')
     status = job.get('status')

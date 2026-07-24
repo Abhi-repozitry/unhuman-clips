@@ -9,7 +9,6 @@ import asyncio
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Any
 
 from backend.ffmpeg_utils import get_ffmpeg, get_ffprobe
 

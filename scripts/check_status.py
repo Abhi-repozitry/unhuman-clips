@@ -1,5 +1,4 @@
 import requests
-import time
 
 BASE = 'http://127.0.0.1:9000'
 r = requests.get(f'{BASE}/jobs', timeout=30)

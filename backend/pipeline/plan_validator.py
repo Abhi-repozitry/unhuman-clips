@@ -17,7 +17,6 @@ from __future__ import annotations
 import json
 import logging
 import re
-from typing import Any
 
 from backend.config import MAX_OUTPUT_DURATION, MIN_OUTPUT_DURATION
 from backend.models import ReelPlan
@@ -31,6 +30,7 @@ __all__ = [
     "validate_narration",
     "verify_duration",
     "verify_captions",
+    "validate_clip_diversity",
     "finalize_edit",
 ]
 
@@ -299,6 +299,25 @@ def validate_narration(groups: list[dict]) -> None:
         if usable_count == 0:
             logger.warning(f"Group {i}: ZERO usable narration events — reel will have NO narration")
 
+        # Cap at 2 narration events (1 hook + 0-1 commentary)
+        usable_events = [
+            e for e in group.get("narration_events", [])
+            if str(e.get("event_type", "")).strip().lower() in ("hook", "commentary")
+        ]
+        if len(usable_events) > 2:
+            # Keep hook + first commentary, drop the rest
+            hook = next((e for e in usable_events if e.get("event_type") == "hook"), None)
+            commentary = [e for e in usable_events if e.get("event_type") == "commentary"]
+            keep_events = ([hook] if hook else []) + commentary[:1]
+            drop_events = [e for e in usable_events if e not in keep_events]
+            for e in drop_events:
+                group.get("narration_events", []).remove(e)
+            if drop_events:
+                logger.info(
+                    f"Group {i}: Capped narration from {len(usable_events)} to "
+                    f"{len(keep_events)} events (max 2 allowed)"
+                )
+
         # Distribution check: ensure commentary is spread across the reel
         est_dur = group.get("estimated_duration_seconds", 120)
         commentary_events = [
@@ -374,41 +393,178 @@ def verify_captions(groups: list[dict]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Clip Diversity Validation
+# ---------------------------------------------------------------------------
+
+MIN_TEMPORAL_GAP = 1.0
+MIN_TIMELINE_SPREAD_FRACTION = 0.15
+
+
+def validate_clip_diversity(groups: list[dict], source_duration: float) -> None:
+    """Check clip diversity within each group and log warnings for poor diversity.
+
+    Checks:
+    1. Temporal gaps — clips too close together (< MIN_TEMPORAL_GAP) get flagged
+    2. Timeline spread — all clips clustered in a small fraction of source duration
+    3. Duration variety — all clips the same approximate length
+
+    This is a soft check (warnings only). Actual enforcement happens in the
+    assemble stage and overlap removal.
+    """
+    for i, group in enumerate(groups):
+        clips = group.get("source_clips", [])
+        if len(clips) < 3:
+            continue
+
+        # Sort by start time
+        sorted_clips = sorted(clips, key=lambda c: c.get("source_start", 0))
+
+        # 1. Temporal gap checks
+        tight_pairs = 0
+        for j in range(1, len(sorted_clips)):
+            gap = sorted_clips[j]["source_start"] - sorted_clips[j - 1]["source_end"]
+            if gap < MIN_TEMPORAL_GAP:
+                tight_pairs += 1
+
+        if tight_pairs > len(sorted_clips) // 2:
+            logger.info(
+                f"Group {i}: {tight_pairs}/{len(sorted_clips)-1} clip pairs have "
+                f"<{MIN_TEMPORAL_GAP}s gap — consider more temporal spread"
+            )
+
+        # 2. Timeline spread
+        first_start = sorted_clips[0]["source_start"]
+        last_end = sorted_clips[-1]["source_end"]
+        span = last_end - first_start
+        if source_duration > 30 and span < source_duration * MIN_TIMELINE_SPREAD_FRACTION:
+            logger.info(
+                f"Group {i}: clips span only {span:.0f}s/{source_duration:.0f}s "
+                f"({span/source_duration*100:.0f}%) — consider wider timeline spread"
+            )
+
+        # 3. Duration variety
+        durations = [c["source_end"] - c["source_start"] for c in sorted_clips]
+        avg_dur = sum(durations) / len(durations)
+        uniform = all(abs(d - avg_dur) < 3.0 for d in durations)
+        if uniform and len(durations) >= 4:
+            logger.info(
+                f"Group {i}: all {len(durations)} clips are ~{avg_dur:.0f}s — "
+                f"consider mixing SHORT/MEDIUM/LONG clip lengths"
+            )
+
+
+# ---------------------------------------------------------------------------
 # Deduplication
 # ---------------------------------------------------------------------------
 
+def _compute_clip_overlap_ratio(group_a: dict, group_b: dict) -> float:
+    """Compute what fraction of clip timeline overlaps between two groups.
+
+    Uses total overlapping seconds / total unique seconds to measure similarity.
+    A ratio of 0.0 means no overlap; 1.0 means identical clip coverage.
+    """
+    clips_a = group_a.get("source_clips", [])
+    clips_b = group_b.get("source_clips", [])
+    if not clips_a or not clips_b:
+        return 0.0
+
+    # Collect all clip intervals
+    intervals_a = sorted(
+        [(c.get("source_start", 0), c.get("source_end", 0)) for c in clips_a]
+    )
+    intervals_b = sorted(
+        [(c.get("source_start", 0), c.get("source_end", 0)) for c in clips_b]
+    )
+
+    total_overlap = 0.0
+    for sa, ea in intervals_a:
+        for sb, eb in intervals_b:
+            overlap_start = max(sa, sb)
+            overlap_end = min(ea, eb)
+            if overlap_end > overlap_start:
+                total_overlap += overlap_end - overlap_start
+
+    total_a = sum(e - s for s, e in intervals_a)
+    total_b = sum(e - s for s, e in intervals_b)
+    total_unique = total_a + total_b - total_overlap
+
+    if total_unique <= 0:
+        return 0.0
+
+    # Return overlap relative to the smaller group (how much of it is duplicated)
+    min_total = min(total_a, total_b)
+    return total_overlap / min_total if min_total > 0 else 0.0
+
+
 def deduplicate_groups(groups: list[dict]) -> list[dict]:
-    """Remove duplicate groups by clip fingerprint."""
+    """Remove groups that are too similar based on clip timeline overlap.
+
+    Uses fuzzy overlap scoring: if two groups share more than
+    GROUP_OVERLAP_THRESHOLD of their clip time, the weaker one is pruned.
+    """
+    from backend.config import GROUP_OVERLAP_THRESHOLD
+
     if len(groups) <= 1:
         return groups
 
-    filtered = []
-    seen_fingerprints = set()
-
+    # Remove empty groups first
+    valid = []
     for i, group in enumerate(groups):
         clips = group.get("source_clips", [])
         if not clips:
             logger.warning(f"Pruning Group {i}: No source clips")
             continue
+        valid.append(group)
 
-        fingerprint = tuple(
-            sorted(
-                (round(c.get("source_start", 0.0), 1), round(c.get("source_end", 0.0), 1))
-                for c in clips
-            )
-        )
-        if fingerprint in seen_fingerprints:
-            logger.warning(f"Pruning Group {i}: Duplicate clip selection")
-            continue
-
-        seen_fingerprints.add(fingerprint)
-        filtered.append(group)
-
-    if not filtered:
+    if not valid:
         logger.warning("All groups filtered out! Keeping first group.")
         return [groups[0]]
 
-    return filtered
+    # Pairwise overlap check — keep the stronger group when similarity is high
+    keep = []
+    pruned_indices = set()
+
+    for i in range(len(valid)):
+        if i in pruned_indices:
+            continue
+        for j in range(i + 1, len(valid)):
+            if j in pruned_indices:
+                continue
+            ratio = _compute_clip_overlap_ratio(valid[i], valid[j])
+            if ratio > GROUP_OVERLAP_THRESHOLD:
+                # Prune the weaker group (fewer clips, or shorter estimated duration)
+                wi = len(valid[i].get("source_clips", []))
+                wj = len(valid[j].get("source_clips", []))
+                di = valid[i].get("estimated_duration_seconds", 0)
+                dj = valid[j].get("estimated_duration_seconds", 0)
+
+                if (wi, di) >= (wj, dj):
+                    pruned_indices.add(j)
+                    logger.warning(
+                        f"Pruning Group {j} ({wj} clips, {dj:.0f}s): "
+                        f"{ratio*100:.0f}% overlap with Group {i}"
+                    )
+                else:
+                    pruned_indices.add(i)
+                    logger.warning(
+                        f"Pruning Group {i} ({wi} clips, {di:.0f}s): "
+                        f"{ratio*100:.0f}% overlap with Group {j}"
+                    )
+                    break  # Group i is gone, no need to check more
+
+    keep = [g for idx, g in enumerate(valid) if idx not in pruned_indices]
+
+    if not keep:
+        logger.warning("All groups filtered out by overlap check! Keeping first group.")
+        return [valid[0]]
+
+    if len(keep) < len(valid):
+        logger.info(
+            f"Group dedup: {len(valid)} -> {len(keep)} groups "
+            f"(threshold={GROUP_OVERLAP_THRESHOLD*100:.0f}%)"
+        )
+
+    return keep
 
 
 # ---------------------------------------------------------------------------
@@ -446,11 +602,14 @@ def finalize_edit(plan_dict: dict, source_duration: float) -> ReelPlan:
     # 6. Caption verification
     verify_captions(groups)
 
-    # 7. Deduplication
+    # 7. Clip diversity validation (soft checks — warnings only)
+    validate_clip_diversity(groups, source_duration)
+
+    # 8. Deduplication
     deduplicated = deduplicate_groups(groups)
     plan_dict["reel_groups"] = deduplicated
 
-    # 8. Log summary
+    # 9. Log summary
     total_clips = sum(len(g.get("source_clips", [])) for g in deduplicated)
     total_narrations = sum(len(g.get("narration_events", [])) for g in deduplicated)
     avg_duration = sum(g.get("estimated_duration_seconds", 0) for g in deduplicated) / max(len(deduplicated), 1)

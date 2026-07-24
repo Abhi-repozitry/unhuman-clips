@@ -10,7 +10,7 @@ os.chdir(SCRIPT_DIR)
 from backend.config import get_job_working_dir
 from backend.pipeline.downloader import download_video
 from backend.pipeline.transcriber import transcribe_video
-from backend.pipeline.analyzer import select_reel_plan, _summarize_transcript_for_llm, _try_repair_truncated_json
+from backend.pipeline.analyzer import select_reel_plan
 from backend.models import ReelPlan
 import json
 import traceback
@@ -60,13 +60,8 @@ try:
     total_chars_raw = sum(len(e["text"]) for e in transcript)
     print(f"  Video duration: {total_dur:.0f}s, raw text: {total_chars_raw} chars")
 
-    # Stage 3: Test summarization
-    print("\n--- STAGE 3: TRANSCRIPT SUMMARIZATION ---")
-    summarized = _summarize_transcript_for_llm(transcript, max_total_chars=10000)
-    print(f"  Summarized length: {len(summarized)} chars")
-
-    # Stage 4: Build reel plan
-    print("\n--- STAGE 4: SELECT REEL PLAN ---")
+    # Stage 3: Build reel plan
+    print("\n--- STAGE 3: SELECT REEL PLAN ---")
     video_title = result.get("title", "")
     video_desc = result.get("description", "")
 

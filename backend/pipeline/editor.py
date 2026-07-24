@@ -1,13 +1,12 @@
-import subprocess
-import json
-import numpy as np
-from pathlib import Path
-from typing import Dict, List, Optional, Any, Tuple
+from __future__ import annotations
+
+import logging
 import os
 import re
-import shutil
+import subprocess
 import tempfile
-import logging
+from pathlib import Path
+from typing import Any
 
 from backend.ffmpeg_utils import get_ffmpeg, get_ffprobe
 
@@ -46,7 +45,7 @@ def detect_silence_with_vad(
     threshold: float = 0.5,
     min_silence_duration: float = 0.3,
     window_size: float = 0.1
-) -> List[Dict[str, float]]:
+) -> list[dict[str, float]]:
     """Detect silent segments using Silero VAD.
 
     Returns list of {start, end, duration} for non-speech (silent) sections.
@@ -141,12 +140,11 @@ def detect_silence_ffmpeg(
     video_path: str,
     silence_threshold_db: float = -35.0,
     silence_duration: float = 0.3
-) -> List[Dict[str, float]]:
+) -> list[dict[str, float]]:
     """
     Detect silent segments using ffmpeg silencedetect filter.
     Parses stateful start/end lines from FFmpeg output.
     """
-    import re
 
     cmd = [
         get_ffmpeg(), "-loglevel", "info",
@@ -194,7 +192,7 @@ def detect_silence(
     video_path: str,
     silence_threshold_db: float = -35.0,
     silence_duration: float = 0.3
-) -> List[Dict[str, float]]:
+) -> list[dict[str, float]]:
     """Detect silent segments using Silero VAD (preferred) or ffmpeg fallback.
     Converts dB threshold to VAD probability threshold (0.0-1.0)."""
     # Convert dB to VAD threshold: -35dB ≈ 0.5, -20dB ≈ 0.8, -50dB ≈ 0.2
@@ -205,9 +203,9 @@ def detect_silence(
 def trim_silence(
     input_path: str,
     output_path: str,
-    silence_segments: List[Dict[str, float]],
+    silence_segments: list[dict[str, float]],
     min_audio_gap: float = 0.2  # Reduced from 0.3 to trim more aggressively
-) -> Tuple[bool, float]:
+) -> tuple[bool, float]:
     """
     Trim silence from video. Returns (success, time_saved_seconds).
     Strategy: remove silent segments shorter than min_audio_gap at clip boundaries.
@@ -278,8 +276,8 @@ def trim_silence(
 def apply_edits(
     input_path: str,
     working_dir: str,
-    config: Optional[Dict[str, Any]] = None
-) -> Dict[str, Any]:
+    config: dict[str, Any] | None = None
+) -> dict[str, Any]:
     """
     Apply editing operations to a video.
     Returns dict with output_path, edits_applied, time_saved_seconds, durations.
@@ -359,7 +357,7 @@ def apply_edits(
     }
 
 
-def edit_final_video(video_path: str, job_id: str) -> Dict[str, Any]:
+def edit_final_video(video_path: str, job_id: str) -> dict[str, Any]:
     """Edit the final composed video: trim silence, subtle speed up, finalize.
 
     This is the entry point called by queue_manager.py.

@@ -14,7 +14,7 @@ API = "http://127.0.0.1:9000"
 TEST_URL = "https://youtu.be/fKoAOWQHP0o?si=uQAapu4aqASoGdUE"
 
 COOKIE_PATH = Path(os.environ["APPDATA"]) / "unhuman-clips" / "cookies.txt"
-REPO_ROOT = Path(r"C:\Projects\unhuman-clips")
+REPO_ROOT = Path(__file__).resolve().parent.parent
 LOGS_DIR = REPO_ROOT / "logs"
 LOGS_DIR.mkdir(exist_ok=True)
 
@@ -112,7 +112,7 @@ def collect_evidence(job_id: str) -> dict:
 def probe_duration(path: Path) -> float:
     try:
         import subprocess
-        ffmpeg = Path(r"C:\Users\starr\.vscode\extensions\kilocode.kilo-code-7.4.11-win32-x64\bin\ffmpeg.exe")
+        ffmpeg = REPO_ROOT / "ffmpeg" / "ffmpeg-8.1.2-full_build" / "bin" / "ffmpeg.exe"
         if not ffmpeg.exists():
             ffmpeg = Path("ffmpeg")
         res = subprocess.run(

@@ -6,12 +6,9 @@ temporary file system fixtures used across all test modules.
 from __future__ import annotations
 
 import json
-import os
 import subprocess
-import tempfile
 from pathlib import Path
-from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -22,7 +19,7 @@ import pytest
 
 @pytest.fixture(autouse=True)
 def _isolated_tmp(tmp_path: Path):
-    """Ensure every test runs with a fresh temp directory as CWD side-effect free."""
+    """Provide a fresh temp directory for each test (returned for use, not as CWD)."""
     return tmp_path
 
 

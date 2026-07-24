@@ -16,6 +16,7 @@ __all__ = [
     "get_job_working_dir", "validate_config", "cleanup_stale_files",
     "FFMPEG_PATH", "FFPROBE_PATH",
     "NVIDIA_API_KEY", "NVIDIA_BASE_URL", "NVIDIA_MODEL", "NVIDIA_MODEL_FALLBACK",
+    "MAX_INPUT_TOKENS", "MAX_OUTPUT_TOKENS",
     "WHISPER_MODEL_SIZE", "WHISPER_COMPUTE_TYPE_CUDA", "WHISPER_COMPUTE_TYPE_CPU",
     "TTS_VOICE",
 ]
@@ -50,7 +51,10 @@ WHISPER_COMPUTE_TYPE_CPU = os.environ.get("WHISPER_COMPUTE_TYPE_CPU", "int8")
 NVIDIA_API_KEY = os.environ.get("NVIDIA_API_KEY")
 NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
 NVIDIA_MODEL = os.environ.get("NVIDIA_MODEL", "openai/gpt-oss-120b")
-NVIDIA_MODEL_FALLBACK = os.environ.get("NVIDIA_MODEL_FALLBACK", "nvidia/llama-3.3-nemotron-super-49b-v1.5")
+NVIDIA_MODEL_FALLBACK = os.environ.get("NVIDIA_MODEL_FALLBACK", "openai/gpt-oss-120b")
+MAX_INPUT_TOKENS = int(os.environ.get("MAX_INPUT_TOKENS", "80000"))
+MAX_OUTPUT_TOKENS = int(os.environ.get("MAX_OUTPUT_TOKENS", "16384"))
+REASONING_EFFORT = os.environ.get("REASONING_EFFORT", "high")
 
 CLIP_COUNT_MIN = int(os.environ.get("CLIP_COUNT_MIN", "6"))
 CLIP_COUNT_MAX = int(os.environ.get("CLIP_COUNT_MAX", "12"))
@@ -62,7 +66,7 @@ MIN_OUTPUT_DURATION = int(os.environ.get("MIN_OUTPUT_DURATION", "90"))
 MAX_OUTPUT_DURATION = int(os.environ.get("MAX_OUTPUT_DURATION", "180"))
 
 OUTPUT_WIDTH = 1080
-OUTPUT_HEIGHT = 1920
+OUTPUT_HEIGHT = 1350
 OUTPUT_FPS = 30
 
 DOWNLOAD_MAX_HEIGHT = int(os.environ.get("DOWNLOAD_MAX_HEIGHT", "1080"))
@@ -93,6 +97,10 @@ ALIMITER_RELEASE_MS = int(os.environ.get("ALIMITER_RELEASE_MS", "50"))
 MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "2"))
 GPU_SEMAPHORE_SIZE = int(os.environ.get("GPU_SEMAPHORE_SIZE", "1"))
 MAX_GROUP_RETRIES = int(os.environ.get("MAX_GROUP_RETRIES", "2"))
+
+# Group deduplication: if two groups share more than this fraction of clip
+# timeline overlap, the weaker group is pruned
+GROUP_OVERLAP_THRESHOLD = float(os.environ.get("GROUP_OVERLAP_THRESHOLD", "0.5"))
 
 # Fast mode: skip expensive operations for faster iteration during development
 FAST_MODE = os.environ.get("FAST_MODE", "0") == "1"

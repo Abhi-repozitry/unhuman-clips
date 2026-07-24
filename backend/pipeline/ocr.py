@@ -1,11 +1,13 @@
-import cv2
+from __future__ import annotations
+
 import logging
-import numpy as np
-from pathlib import Path
-from typing import Dict, List, Optional, Any
-import subprocess
-import json
 import os
+import subprocess
+from typing import Any
+
+import cv2
+import numpy as np
+
 from backend.ffmpeg_utils import get_ffmpeg
 
 logger = logging.getLogger(__name__)
@@ -33,13 +35,13 @@ def _extract_frame(video_path: str, timestamp_seconds: float, output_path: str) 
             "-vframes", "1",
             "-y", str(output_path)
         ]
-        result = subprocess.run(cmd, capture_output=True, check=True, timeout=30)
+        subprocess.run(cmd, capture_output=True, check=True, timeout=30)
         return True
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
         return False
 
 
-def _try_easyocr(image_path: str) -> List[Dict[str, Any]]:
+def _try_easyocr(image_path: str) -> list[dict[str, Any]]:
     """Try to detect text using EasyOCR. Returns list of {text, confidence, bbox, language}."""
     try:
         reader = _get_easyocr_reader()
@@ -60,7 +62,7 @@ def _try_easyocr(image_path: str) -> List[Dict[str, Any]]:
         return []
 
 
-def _try_pytesseract(image_path: str) -> List[Dict[str, Any]]:
+def _try_pytesseract(image_path: str) -> list[dict[str, Any]]:
     """Try to detect text using pytesseract. Returns list of {text, confidence, bbox, language}."""
     try:
         import pytesseract
@@ -76,7 +78,7 @@ def _try_pytesseract(image_path: str) -> List[Dict[str, Any]]:
     return []
 
 
-def _try_ocr_engine(image_path: str) -> List[Dict[str, Any]]:
+def _try_ocr_engine(image_path: str) -> list[dict[str, Any]]:
     """Try OCR engines in order: EasyOCR -> pytesseract -> empty."""
     results = _try_easyocr(image_path)
     if results:

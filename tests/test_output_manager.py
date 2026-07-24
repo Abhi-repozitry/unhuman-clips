@@ -21,8 +21,10 @@ class TestOutputManager:
         fake_file = tmp_path / "test.mp4"
         fake_file.write_bytes(b"\x00" * 100)
 
+        mock_ffprobe = MagicMock(return_value="/usr/bin/ffprobe")
         mock_result = MagicMock(returncode=0, stdout="120.5\n")
-        with patch("backend.output_manager.subprocess.run", return_value=mock_result):
+        with patch("backend.output_manager.subprocess.run", return_value=mock_result), \
+             patch("backend.output_manager.get_ffprobe", mock_ffprobe):
             duration = manager._probe_duration_sync(str(fake_file))
             assert duration == pytest.approx(120.5)
 
@@ -30,8 +32,10 @@ class TestOutputManager:
         fake_file = tmp_path / "bad.mp4"
         fake_file.write_bytes(b"\x00" * 100)
 
+        mock_ffprobe = MagicMock(return_value="/usr/bin/ffprobe")
         mock_result = MagicMock(returncode=1, stdout="")
-        with patch("backend.output_manager.subprocess.run", return_value=mock_result):
+        with patch("backend.output_manager.subprocess.run", return_value=mock_result), \
+             patch("backend.output_manager.get_ffprobe", mock_ffprobe):
             duration = manager._probe_duration_sync(str(fake_file))
             assert duration == 0.0
 
@@ -39,8 +43,10 @@ class TestOutputManager:
         fake_file = tmp_path / "weird.mp4"
         fake_file.write_bytes(b"\x00" * 100)
 
+        mock_ffprobe = MagicMock(return_value="/usr/bin/ffprobe")
         mock_result = MagicMock(returncode=0, stdout="not_a_number\n")
-        with patch("backend.output_manager.subprocess.run", return_value=mock_result):
+        with patch("backend.output_manager.subprocess.run", return_value=mock_result), \
+             patch("backend.output_manager.get_ffprobe", mock_ffprobe):
             duration = manager._probe_duration_sync(str(fake_file))
             assert duration == 0.0
 
@@ -49,8 +55,10 @@ class TestOutputManager:
         fake_file = tmp_path / "async.mp4"
         fake_file.write_bytes(b"\x00" * 100)
 
+        mock_ffprobe = MagicMock(return_value="/usr/bin/ffprobe")
         mock_result = MagicMock(returncode=0, stdout="90.0\n")
-        with patch("backend.output_manager.subprocess.run", return_value=mock_result):
+        with patch("backend.output_manager.subprocess.run", return_value=mock_result), \
+             patch("backend.output_manager.get_ffprobe", mock_ffprobe):
             duration = await manager.probe_duration(str(fake_file))
             assert duration == pytest.approx(90.0)
 

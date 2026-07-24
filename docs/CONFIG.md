@@ -130,7 +130,7 @@ FFMPEG_PATH=C:\ffmpeg\bin\ffmpeg.exe
 
 # LLM
 NVIDIA_MODEL=openai/gpt-oss-120b
-NVIDIA_MODEL_FALLBACK=nvidia/llama-3.3-nemotron-super-49b-v1.5
+NVIDIA_MODEL_FALLBACK=openai/gpt-oss-120b
 
 # Video
 DOWNLOAD_MAX_HEIGHT=1080

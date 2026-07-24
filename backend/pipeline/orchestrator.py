@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from backend.config import (
-    HOOK_SECONDS, MAX_GROUP_RETRIES, MAX_OUTPUT_DURATION,
+    MAX_OUTPUT_DURATION,
     MIN_OUTPUT_DURATION, get_job_working_dir,
 )
 from backend.models import JobStatus, NarrationEvent, ReelGroup, VideoJob
@@ -99,7 +99,7 @@ class GroupOrchestrator:
                 f"actual clip duration {actual_clip_dur:.1f}s is less than 70% of "
                 f"estimated {group.estimated_duration_seconds:.1f}s "
                 f"({actual_clip_dur / group.estimated_duration_seconds * 100:.0f}%). "
-                f"This will trigger freeze-pad capping in the compositor."
+                f"Compositor will extend final clip into remaining source footage."
             )
 
         self.ckpt.save_stage(ckpt_key, {"clip_paths": group_clip_paths})
@@ -128,8 +128,17 @@ class GroupOrchestrator:
         raw_narration_events = list(group.narration_events)
         group_narration_events = []
         dropped = []
+
+        # Check if group has a hook clip — if so, skip TTS hook narration
+        # (the source video's original audio serves as the hook)
+        has_hook_clip = any(c.is_hook_clip for c in group.source_clips)
+
         for e in raw_narration_events:
             if e.event_type.strip().lower() in ("hook", "commentary"):
+                # Skip hook narration if hook clip provides original audio
+                if has_hook_clip and e.event_type.strip().lower() == "hook":
+                    dropped.append(e)
+                    continue
                 group_narration_events.append(e)
             else:
                 dropped.append(e)
@@ -140,7 +149,7 @@ class GroupOrchestrator:
                 f"(only 'hook'/'commentary' are voiced)."
             )
 
-        if not group_narration_events:
+        if not group_narration_events and not has_hook_clip:
             fallback_text = (
                 group.reel_summary.short_description or group.reel_summary.title or ""
             ).strip()

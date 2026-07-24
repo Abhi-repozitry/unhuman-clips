@@ -13,7 +13,7 @@ from backend.pipeline.sanitize import sanitize_text
 __all__ = ["generate_clip_ass", "generate_commentary_ass"]
 
 
-# Caption sizes (9:16 portrait, 1080x1920)
+# Caption sizes (4:5, 1080x1350)
 CLIP_CAPTION_SIZE = 56       # Larger than before (was 48 default)
 COMMENTARY_CAPTION_SIZE = 64  # Larger than before (was 48+8=56)
 
@@ -54,8 +54,8 @@ def _format_timestamp(seconds: float) -> str:
     return f"{hours}:{minutes:02d}:{secs:02d}.{centis:02d}"
 
 
-def _wrap_text_ass(text: str, max_chars: int = 24) -> str:
-    """Wrap text for 9:16 portrait — narrower lines for readability. Was 28, tightened to 24 for larger font."""
+def _wrap_text_ass(text: str, max_chars: int = 28) -> str:
+    """Wrap text for 4:5 (1080x1350) — wider frame allows more chars per line."""
     words = text.split()
     lines = []
     current_line = ""
@@ -77,7 +77,7 @@ Title: Unhuman Clips Captions
 ScriptType: v4.00+
 Collisions: Normal
 PlayResX: 1080
-PlayResY: 1920
+PlayResY: 1350
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
@@ -164,7 +164,7 @@ def generate_clip_ass(
     style_line = _make_style(
         "ClipCaption", CAPTION_FONT, CLIP_CAPTION_SIZE,
         alignment=2,   # bottom center
-        margin_v=100,  # 100px from bottom edge (more breathing room for mobile)
+        margin_v=120,  # 120px from bottom edge (safe for Instagram/TikTok UI overlays)
         outline=4, shadow=3,  # thicker outline for readability
         bold=1,  # bold for clip captions too
         primary="&H00FFFFFF", back="&H80000000"
@@ -173,7 +173,7 @@ def generate_clip_ass(
     dialogues = []
     for entry in filtered:
         escaped = _escape_ass_text(entry["text"])  # Escape BEFORE wrapping
-        wrapped = _wrap_text_ass(escaped, max_chars=22)  # Wrap adds \N line breaks
+        wrapped = _wrap_text_ass(escaped, max_chars=28)  # Wrap adds \N line breaks
         highlighted = _highlight_key_words(wrapped)
         start_ts = _format_timestamp(entry["start"] + start_time)
         end_ts = _format_timestamp(entry["end"] + start_time)
@@ -222,7 +222,7 @@ def generate_commentary_ass(
 
     text = sanitize_text(text)
     escaped = _escape_ass_text(text)  # Escape BEFORE wrapping
-    wrapped = _wrap_text_ass(escaped, max_chars=22)  # Wrap adds \N line breaks
+    wrapped = _wrap_text_ass(escaped, max_chars=28)  # Wrap adds \N line breaks
     highlighted = _highlight_key_words(wrapped)
 
     if progress_cb:
@@ -231,7 +231,7 @@ def generate_commentary_ass(
     style_line = _make_style(
         "CommentaryCaption", CAPTION_FONT, COMMENTARY_CAPTION_SIZE,
         alignment=8,     # top center
-        margin_v=60,     # 60px from top
+        margin_v=80,     # 80px from top (safe for Instagram/TikTok UI overlays)
         outline=4, shadow=3,
         bold=1,          # Bold for emphasis
         primary="&H00FFFFFF",

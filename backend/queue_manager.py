@@ -8,11 +8,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import queue
-import time
 from typing import Any, Callable
 
 from backend.config import GPU_SEMAPHORE_SIZE, get_job_working_dir
-from backend.models import JobStatus, LLMInteraction, NarrationEvent, OutputReel, ReelGroup, ReelPlan, VideoJob
+from backend.models import JobStatus, LLMInteraction, OutputReel, ReelPlan, VideoJob
 from backend.pipeline.checkpoint import PipelineCheckpoint
 from backend.pipeline.downloader import download_video, validate_downloaded_video
 from backend.pipeline.analyzer import select_reel_plan
