@@ -54,13 +54,16 @@ def detect_silence_with_vad(
     """
     try:
         import torch
-        import torchaudio
-        from silero_vad import get_speech_timestamps, load_silero_vad, read_audio, VADIterator
+        import soundfile as sf
+        from silero_vad import get_speech_timestamps, load_silero_vad
     except ImportError:
         print("[WARN] Silero VAD not available, falling back to ffmpeg silencedetect")
         return detect_silence_ffmpeg(video_path, -35.0, min_silence_duration)
 
-    # Extract audio to temp WAV — torchaudio can't read video containers on Windows
+    # Extract audio to temp WAV, then load with soundfile.
+    # silero_vad.read_audio() wraps torchaudio.load() which fails on
+    # torchaudio >=2.9 without torchcodec. FFmpeg already produces a valid
+    # 16kHz mono WAV, so soundfile is the most reliable loader.
     sampling_rate = 16000
     tmp_wav = None
     try:
@@ -76,8 +79,9 @@ def detect_silence_with_vad(
         if not os.path.exists(tmp_wav) or os.path.getsize(tmp_wav) == 0:
             return detect_silence_ffmpeg(video_path, -35.0, min_silence_duration)
 
-        # read_audio returns a resampled mono tensor (not a tuple) in silero_vad v6+
-        wav = read_audio(tmp_wav, sampling_rate=sampling_rate)
+        # Load WAV directly with soundfile — no torchaudio dependency
+        wav_np, _ = sf.read(tmp_wav, dtype='float32')
+        wav = torch.from_numpy(wav_np)
 
         # Load the Silero VAD model (required in silero_vad v6+)
         model = load_silero_vad()

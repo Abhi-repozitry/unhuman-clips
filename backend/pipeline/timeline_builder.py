@@ -73,18 +73,21 @@ def _run_vad_on_source(
     """
     try:
         import torch
-        import torchaudio
-        from silero_vad import get_speech_timestamps, load_silero_vad, read_audio
+        import soundfile as sf
+        from silero_vad import get_speech_timestamps, load_silero_vad
     except ImportError:
         logger.error(
-            "silero-vad/torchaudio/torch not importable — "
-            "install silero-vad, torch, and torchaudio. Returning empty speech regions."
+            "silero-vad/torch/soundfile not importable — "
+            "install silero-vad, torch, and soundfile. Returning empty speech regions."
         )
         return []
 
     logger.info(f"Silero VAD: extracting audio from {os.path.basename(video_path)}")
 
-    # Extract audio to a temporary WAV file — torchaudio cannot read video containers
+    # Extract audio to a temporary WAV file, then load with soundfile.
+    # We do NOT use silero_vad.read_audio() because it wraps torchaudio.load()
+    # which fails on torchaudio >=2.9 without torchcodec. Since FFmpeg already
+    # produces a valid 16kHz mono WAV, soundfile is the most reliable loader.
     tmp_wav = None
     try:
         tmp_fd, tmp_wav = tempfile.mkstemp(suffix=".wav", prefix="vad_audio_")
@@ -97,15 +100,18 @@ def _run_vad_on_source(
         wav_size = os.path.getsize(tmp_wav)
         logger.info(f"Silero VAD: extracted audio to WAV ({wav_size} bytes)")
 
-        # read_audio returns a resampled mono tensor (not a tuple) in silero_vad v6+
-        # We request 16kHz so we know the sample rate
+        # Load WAV directly with soundfile — no torchaudio dependency
         sampling_rate = 16000
-        wav = read_audio(tmp_wav, sampling_rate=sampling_rate)
+        wav_np, file_sr = sf.read(tmp_wav, dtype='float32')
+        wav = torch.from_numpy(wav_np)
         if len(wav) == 0:
-            logger.warning("Silero VAD: read_audio returned empty tensor")
+            logger.warning("Silero VAD: soundfile loaded empty audio")
             return []
 
-        logger.info(f"Silero VAD: audio loaded, {len(wav)} samples at {sampling_rate}Hz ({len(wav)/sampling_rate:.1f}s)")
+        if file_sr != sampling_rate:
+            logger.warning(f"Silero VAD: expected {sampling_rate}Hz, got {file_sr}Hz from FFmpeg extraction")
+
+        logger.info(f"Silero VAD: audio loaded, {len(wav)} samples at {file_sr}Hz ({len(wav)/file_sr:.1f}s)")
 
         # Load the Silero VAD model (required in silero_vad v6+)
         model = load_silero_vad()

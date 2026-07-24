@@ -48,7 +48,7 @@ def _try_easyocr(image_path: str) -> List[Dict[str, Any]]:
             {
                 "text": " ".join([r[1] for r in result]),
                 "confidence": np.mean([r[2] for r in result]) if result else 0.0,
-                "bbox": [r[0].tolist() for r in result] if result else [],
+                "bbox": [r[0].tolist() if hasattr(r[0], 'tolist') else r[0] for r in result] if result else [],
                 "language": "en",
             }
         ]

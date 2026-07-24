@@ -214,17 +214,18 @@ def get_speech_timestamps_from_narration(
 
     try:
         import torch
-        import torchaudio
-        from silero_vad import get_speech_timestamps, load_silero_vad, read_audio
+        import soundfile as sf
+        from silero_vad import get_speech_timestamps, load_silero_vad
     except ImportError:
         logger.warning(f"silero-vad or torch not available, using full-window fallback for {Path(narration_path).name}")
         return fallback
 
     try:
-        # read_audio returns a resampled mono tensor (not a tuple) in silero_vad v6+
-        # Narration files are already WAV, so direct read works
+        # Load WAV directly with soundfile — silero_vad.read_audio() wraps
+        # torchaudio.load() which fails on torchaudio >=2.9 without torchcodec.
         sampling_rate = 16000
-        wav = read_audio(narration_path, sampling_rate=sampling_rate)
+        wav_np, file_sr = sf.read(narration_path, dtype='float32')
+        wav = torch.from_numpy(wav_np)
 
         if len(wav) == 0:
             return fallback
