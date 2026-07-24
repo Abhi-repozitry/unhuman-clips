@@ -216,8 +216,8 @@ def get_speech_timestamps_from_narration(
         import torch
         import soundfile as sf
         from silero_vad import get_speech_timestamps, load_silero_vad
-    except ImportError:
-        logger.warning(f"silero-vad or torch not available, using full-window fallback for {Path(narration_path).name}")
+    except ImportError as e:
+        logger.warning(f"silero-vad/soundfile import failed: {type(e).__name__}: {e}, using full-window fallback for {Path(narration_path).name}")
         return fallback
 
     try:

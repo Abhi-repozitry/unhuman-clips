@@ -68,8 +68,6 @@ def _format_rich_timeline(timeline: RichTimeline) -> str:
         metrics_parts = []
         if seg.metrics.volume_db is not None:
             metrics_parts.append(f"vol={seg.metrics.volume_db:.1f}dB")
-        if seg.metrics.brightness is not None:
-            metrics_parts.append(f"bright={seg.metrics.brightness:.2f}")
         if seg.metrics.black_frame:
             metrics_parts.append("BLACK_FRAME")
         if seg.metrics.freeze_detected:

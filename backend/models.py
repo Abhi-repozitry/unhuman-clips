@@ -59,7 +59,6 @@ class FFmpegMetrics(BaseModel):
     """Structured FFmpeg-derived metrics for a timeline segment."""
     volume_db: float | None = None
     peak_db: float | None = None
-    brightness: float | None = None
     black_frame: bool = False
     freeze_detected: bool = False
 

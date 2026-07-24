@@ -12,7 +12,7 @@ import tempfile
 from typing import Any, Callable
 
 from backend.config import VAD_THRESHOLD
-from backend.ffmpeg_utils import get_ffmpeg, get_ffprobe
+from backend.ffmpeg_utils import get_ffmpeg
 from backend.models import FFmpegMetrics, RichTimeline, RichTimelineSegment
 
 __all__ = ["build_rich_timeline"]
@@ -75,9 +75,9 @@ def _run_vad_on_source(
         import torch
         import soundfile as sf
         from silero_vad import get_speech_timestamps, load_silero_vad
-    except ImportError:
+    except ImportError as e:
         logger.error(
-            "silero-vad/torch/soundfile not importable — "
+            f"Silero VAD imports failed: {type(e).__name__}: {e} — "
             "install silero-vad, torch, and soundfile. Returning empty speech regions."
         )
         return []
@@ -144,7 +144,7 @@ def _run_vad_on_source(
 
 
 # ---------------------------------------------------------------------------
-# FFmpeg metrics — volume, brightness, black frame, freeze detection
+# FFmpeg metrics — volume, black frame, freeze detection
 # ---------------------------------------------------------------------------
 
 def _compute_ffmpeg_metrics(
@@ -154,22 +154,25 @@ def _compute_ffmpeg_metrics(
 ) -> FFmpegMetrics:
     """Compute FFmpeg-derived metrics for a time range in the source video.
 
-    Metrics: average volume (dB), peak volume (dB), brightness estimate,
-    black frame detection, freeze detection.
+    Metrics: average volume (dB), peak volume (dB), black frame detection,
+    freeze detection.
+
+    Uses 2 FFmpeg invocations:
+      1. volumedetect (audio filter)
+      2. blackdetect + freezedetect combined (video filters)
     """
     duration = end - start
     if duration <= 0:
         return FFmpegMetrics()
 
     ffmpeg = get_ffmpeg()
-    ffprobe = get_ffprobe()
 
     metrics = FFmpegMetrics()
 
-    # --- Volume metrics via volumedetect ---
+    # --- 1. Volume metrics via volumedetect ---
     try:
         cmd = [
-            ffmpeg, "-loglevel", "error",
+            ffmpeg, "-loglevel", "info",
             "-ss", str(start), "-t", str(duration),
             "-i", str(video_path),
             "-af", "volumedetect",
@@ -189,56 +192,22 @@ def _compute_ffmpeg_metrics(
     except Exception as e:
         logger.debug(f"Volume detection failed for [{start:.1f}-{end:.1f}]: {e}")
 
-    # --- Brightness via signalstats (sample first frame) ---
+    # --- 2. Black frame + freeze detection (combined filter chain) ---
     try:
         cmd = [
-            ffmpeg, "-loglevel", "error",
-            "-ss", str(start + duration / 2),
-            "-i", str(video_path),
-            "-vf", "signalstats=stat=tout+vrep+brng",
-            "-frames:v", "1",
-            "-f", "null", "-",
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-        stderr = result.stderr
-
-        import re
-        yav_match = re.search(r"YAVG:(\d+\.?\d*)", stderr)
-        if yav_match:
-            # YAVG is 0-255, normalize to 0.0-1.0
-            metrics.brightness = float(yav_match.group(1)) / 255.0
-    except Exception as e:
-        logger.debug(f"Brightness detection failed for [{start:.1f}-{end:.1f}]: {e}")
-
-    # --- Black frame detection ---
-    try:
-        cmd = [
-            ffmpeg, "-loglevel", "error",
+            ffmpeg, "-loglevel", "info",
             "-ss", str(start), "-t", str(min(duration, 5.0)),
             "-i", str(video_path),
-            "-vf", "blackdetect=d=0.5:pix_th=0.10",
+            "-vf", "blackdetect=d=0.5:pix_th=0.10,freezedetect=n=-60dB:d=1.0",
             "-an", "-f", "null", "-",
         ]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
         if "black_start" in result.stderr:
             metrics.black_frame = True
-    except Exception as e:
-        logger.debug(f"Black frame detection failed for [{start:.1f}-{end:.1f}]: {e}")
-
-    # --- Freeze detection ---
-    try:
-        cmd = [
-            ffmpeg, "-loglevel", "error",
-            "-ss", str(start), "-t", str(min(duration, 10.0)),
-            "-i", str(video_path),
-            "-vf", "freezedetect=n=-60dB:d=1.0",
-            "-an", "-f", "null", "-",
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
         if "freeze_start" in result.stderr:
             metrics.freeze_detected = True
     except Exception as e:
-        logger.debug(f"Freeze detection failed for [{start:.1f}-{end:.1f}]: {e}")
+        logger.debug(f"Black/freeze detection failed for [{start:.1f}-{end:.1f}]: {e}")
 
     return metrics
 

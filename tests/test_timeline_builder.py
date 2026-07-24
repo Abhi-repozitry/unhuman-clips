@@ -107,13 +107,12 @@ class TestFormatRichTimeline:
                 RichTimelineSegment(
                     segment_id=0, start=0.0, end=5.0, duration=5.0,
                     speech="Test",
-                    metrics=FFmpegMetrics(volume_db=-12.5, brightness=0.65),
+                    metrics=FFmpegMetrics(volume_db=-12.5),
                 ),
             ],
         )
         result = _format_rich_timeline(timeline)
         assert "vol=-12.5dB" in result
-        assert "bright=0.65" in result
 
     def test_silence_before_tag(self):
         timeline = RichTimeline(
