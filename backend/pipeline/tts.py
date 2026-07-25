@@ -41,6 +41,7 @@ def synthesize_commentary(
     out_path: str,
     progress_cb: Callable[[str, float], None] | None = None,
     rate: str | None = None,
+    voice: str | None = None,
 ) -> float:
     """Synthesize text to speech using edge-tts with retry logic.
 
@@ -49,6 +50,7 @@ def synthesize_commentary(
         out_path: Output WAV file path.
         progress_cb: Optional progress callback.
         rate: TTS rate override (e.g., '+10%'). Defaults to TTS_RATE env var.
+        voice: TTS voice override (e.g., 'en-US-GuyNeural'). Falls back to TTS_VOICE if None/empty.
 
     Returns:
         Duration of the generated audio in seconds.
@@ -60,6 +62,7 @@ def synthesize_commentary(
         raise RuntimeError("synthesize_commentary called with empty text — refusing to synthesize silent audio.")
 
     tts_rate = rate or TTS_RATE
+    tts_voice = voice or TTS_VOICE
 
     if progress_cb:
         progress_cb("Generating TTS audio...", 10)
@@ -72,7 +75,7 @@ def synthesize_commentary(
     for attempt in range(1, MAX_TTS_ATTEMPTS + 1):
         try:
             async def _run_tts():
-                communicate = edge_tts.Communicate(text, TTS_VOICE, rate=tts_rate)
+                communicate = edge_tts.Communicate(text, tts_voice, rate=tts_rate)
                 await communicate.save(out_path)
 
             asyncio.run(_run_tts())

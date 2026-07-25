@@ -217,7 +217,8 @@ class GroupOrchestrator:
 
             out_path = working_dir / f"group_{group_idx}_narration_{i}.wav"
             duration = await asyncio.to_thread(
-                synthesize_commentary, event.text, str(out_path), tts_progress
+                synthesize_commentary, event.text, str(out_path), tts_progress,
+                voice=event.voice_id,
             )
             actual_reel_end = event.reel_start + duration
             group_narration_audio.append({

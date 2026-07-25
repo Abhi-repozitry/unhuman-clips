@@ -407,18 +407,21 @@ def _parse_json_response(raw: str) -> dict:
 def _compute_group_count_ceiling(source_duration_seconds: float) -> int:
     """Hard ceiling only. Content decides the actual count.
 
-    Targets 4-8 groups when content supports it. The ceiling allows
-    the LLM to find strong standalone stories without being artificially
-    limited, but prevents excessive fragmentation.
+    Duration-based ceilings:
+    - <6 min   → 1 group (single Short)
+    - 7-10 min → 2 groups max
+    - 11-25 min → 7 groups max
+    - 26-35 min → 8 groups max
+    - >35 min  → 10 groups max
     """
     minutes = source_duration_seconds / 60.0
-    if minutes <= 2:
-        return 2
-    if minutes <= 5:
-        return 4
+    if minutes < 6:
+        return 1
     if minutes <= 10:
-        return 6
-    if minutes <= 20:
+        return 2
+    if minutes <= 25:
+        return 7
+    if minutes <= 35:
         return 8
     return 10
 
@@ -446,7 +449,7 @@ SOURCE
 Title: {video_title}
 Description: {video_description[:4000]}
 Duration: {source_duration:.1f}s
-Max groups allowed: {max_groups} (this is a CEILING, not a goal — target 4-8 if content supports it)
+Max groups allowed: {max_groups} (this is a CEILING, not a goal — produce up to {max_groups} strong standalone stories)
 
 SEMANTIC BLOCKS (pre-scored by Python — imp=importance 0-100):
 {blocks_text}
@@ -478,7 +481,7 @@ GROUPING RULES
 7. Would someone watch this as a standalone Short? If not, merge it.
 8. Avoid groups that are just "introduction" or "setup" with no payoff.
 9. The max groups ({max_groups}) is a hard limit. Fewer strong groups always beats more weak ones.
-10. Target 4-8 groups when content quality supports it. ALWAYS produce at least 1 group.
+10. Produce up to {max_groups} groups if content supports it. ALWAYS produce at least 1 group.
 
 THINK INTERNALLY about each unit's arc before outputting. Only output the final boundaries.
 

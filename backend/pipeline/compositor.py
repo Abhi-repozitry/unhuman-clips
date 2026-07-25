@@ -716,7 +716,7 @@ def compose_group(
         concat_audio_inputs = "".join(f"[a{i}]" for i in range(n_clips))
         audio_filter_parts.append(
             f"{concat_audio_inputs}concat=n={n_clips}:v=0:a=1[raw_audio];"
-            f"[raw_audio]apad=whole_dur={target_duration:.2f},atrim=end={target_duration:.2f}[clip_audio]"
+            f"[raw_audio]volume=0.05,apad=whole_dur={target_duration:.2f},atrim=end={target_duration:.2f}[clip_audio]"
         )
         audio_filter = ";".join(audio_filter_parts)
 
