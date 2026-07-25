@@ -189,3 +189,12 @@ class TestFinalizeEdit:
         sample_reel_plan_dict["another_random"] = 42
         plan = finalize_edit(sample_reel_plan_dict, source_duration=60.0)
         assert isinstance(plan, ReelPlan)
+
+    def test_floor_enforcement_passes_when_enough_groups(self, sample_reel_plan_dict):
+        plan = finalize_edit(sample_reel_plan_dict, source_duration=60.0, min_groups=1)
+        assert isinstance(plan, ReelPlan)
+        assert len(plan.reel_groups) >= 1
+
+    def test_floor_enforcement_fails_when_below_minimum(self, sample_reel_plan_dict):
+        with pytest.raises(RuntimeError, match="fell below minimum"):
+            finalize_edit(sample_reel_plan_dict, source_duration=60.0, min_groups=99)

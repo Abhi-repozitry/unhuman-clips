@@ -8,6 +8,7 @@ import pytest
 from backend.models import FFmpegMetrics, RichTimeline, RichTimelineSegment
 from backend.pipeline.analyzer import (
     _compute_group_count_ceiling,
+    _compute_group_count_floor,
     _compute_importance,
     _extract_json_object,
     _format_blocks_for_llm,
@@ -89,8 +90,8 @@ class TestComputeGroupCountCeiling:
     def test_8min_video_returns_2(self):
         assert _compute_group_count_ceiling(480.0) == 2  # 8 min
 
-    def test_15min_video_returns_7(self):
-        assert _compute_group_count_ceiling(900.0) == 7  # 15 min
+    def test_15min_video_returns_6(self):
+        assert _compute_group_count_ceiling(900.0) == 6  # 15 min
 
     def test_30min_video_returns_8(self):
         assert _compute_group_count_ceiling(1800.0) == 8  # 30 min
@@ -105,10 +106,47 @@ class TestComputeGroupCountCeiling:
         assert _compute_group_count_ceiling(600.0) == 2  # exactly 10 min
 
     def test_boundary_25min(self):
-        assert _compute_group_count_ceiling(1500.0) == 7  # exactly 25 min
+        assert _compute_group_count_ceiling(1500.0) == 6  # exactly 25 min
 
     def test_boundary_35min(self):
         assert _compute_group_count_ceiling(2100.0) == 8  # exactly 35 min
+
+    def test_40min_video_returns_10(self):
+        assert _compute_group_count_ceiling(2400.0) == 10  # 40 min
+
+
+class TestComputeGroupCountFloor:
+    """Test group count floor based on source duration."""
+
+    def test_short_video_returns_1(self):
+        assert _compute_group_count_floor(90.0) == 1  # 1.5 min
+
+    def test_5min_video_returns_1(self):
+        assert _compute_group_count_floor(300.0) == 1  # 5 min
+
+    def test_8min_video_returns_1(self):
+        assert _compute_group_count_floor(480.0) == 1  # 8 min
+
+    def test_15min_video_returns_3(self):
+        assert _compute_group_count_floor(900.0) == 3  # 15 min
+
+    def test_30min_video_returns_4(self):
+        assert _compute_group_count_floor(1800.0) == 4  # 30 min
+
+    def test_boundary_6min(self):
+        assert _compute_group_count_floor(360.0) == 1  # exactly 6 min
+
+    def test_boundary_10min(self):
+        assert _compute_group_count_floor(600.0) == 1  # exactly 10 min
+
+    def test_boundary_25min(self):
+        assert _compute_group_count_floor(1500.0) == 3  # exactly 25 min
+
+    def test_boundary_35min(self):
+        assert _compute_group_count_floor(2100.0) == 4  # exactly 35 min
+
+    def test_40min_video_returns_5(self):
+        assert _compute_group_count_floor(2400.0) == 5  # 40 min
 
 
 class TestFormatBlocksForLlm:

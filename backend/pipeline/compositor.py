@@ -271,7 +271,6 @@ def _build_ducking_filter_chain(
     input_label: str = "0:a",
     output_label: str = "ducked",
     target_duration: float = 0.0,
-    key_moment_end: float = 0.0,
 ) -> str:
     """Build a VAD-driven ducking filter chain using Silero VAD speech timestamps.
 
@@ -284,7 +283,7 @@ def _build_ducking_filter_chain(
     - VAD-precise ducking: only ducks during detected speech, not silence
     - S-curve ramps: smooth 3x²-2x³ Hermite transitions (no clicks)
     - Pre/post buffers: tight 0.4s pre, 0.25s post around each speech segment
-    - Payoff zone protection: skips ducking for the final 8s key moment
+    - Payoff zone protection: skips ducking for the final 3s key moment
     - Depth: ducks original audio to ~3% (configurable via VAD_DUCKING_DEPTH)
     """
     if not narration_events:
@@ -306,8 +305,10 @@ def _build_ducking_filter_chain(
     if not valid_events:
         return f"[{input_label}]anull[{output_label}]"
 
-    # Payoff zone: the final 8s of the reel or after key_moment_end
-    payoff_start = max(0.0, (key_moment_end if key_moment_end > 0 else target_duration) - 8.0)
+    # Payoff zone: only the final 3s of the reel (the visual climax)
+    # Must use target_duration, NOT key_moment_end — otherwise when narration
+    # ends early (e.g. hook at 3s), payoff_start becomes 0 and ALL ducking is skipped.
+    payoff_start = max(0.0, target_duration - 3.0)
 
     PRE_BUF = VAD_PRE_BUFFER_SECONDS
     POST_BUF = VAD_POST_BUFFER_SECONDS
@@ -716,7 +717,7 @@ def compose_group(
         concat_audio_inputs = "".join(f"[a{i}]" for i in range(n_clips))
         audio_filter_parts.append(
             f"{concat_audio_inputs}concat=n={n_clips}:v=0:a=1[raw_audio];"
-            f"[raw_audio]volume=0.05,apad=whole_dur={target_duration:.2f},atrim=end={target_duration:.2f}[clip_audio]"
+            f"[raw_audio]volume=0.02,apad=whole_dur={target_duration:.2f},atrim=end={target_duration:.2f}[clip_audio]"
         )
         audio_filter = ";".join(audio_filter_parts)
 
@@ -809,19 +810,12 @@ def compose_group(
         if progress_cb:
             progress_cb(f"Group {group_idx+1}: Applying VAD-driven audio ducking...", 70)
 
-        # Identify the payoff moment (last narration event's end) so ducking skips it
-        key_moment_end = 0.0
-        if narration_audio:
-            # Use the final narration event's reel_end as the key moment boundary
-            key_moment_end = max(nar.get("reel_end", 0) for nar in narration_audio)
-        
         duck_chain = _build_ducking_filter_chain(
             narration_audio,
             narration_vad_timestamps=narration_vad_timestamps,
             input_label="0:a",
             output_label="ducked",
             target_duration=target_duration,
-            key_moment_end=key_moment_end
         )
 
         mixed_audio_output = working_dir / f"group_{group_idx}_mixed_audio.wav"

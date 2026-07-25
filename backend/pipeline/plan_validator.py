@@ -299,23 +299,23 @@ def validate_narration(groups: list[dict]) -> None:
         if usable_count == 0:
             logger.warning(f"Group {i}: ZERO usable narration events — reel will have NO narration")
 
-        # Cap at 2 narration events (1 hook + 0-1 commentary)
+        # Cap at 3 narration events (1 hook + 2 commentaries)
         usable_events = [
             e for e in group.get("narration_events", [])
             if str(e.get("event_type", "")).strip().lower() in ("hook", "commentary")
         ]
-        if len(usable_events) > 2:
-            # Keep hook + first commentary, drop the rest
+        if len(usable_events) > 3:
+            # Keep hook + first 2 commentaries, drop the rest
             hook = next((e for e in usable_events if e.get("event_type") == "hook"), None)
             commentary = [e for e in usable_events if e.get("event_type") == "commentary"]
-            keep_events = ([hook] if hook else []) + commentary[:1]
+            keep_events = ([hook] if hook else []) + commentary[:2]
             drop_events = [e for e in usable_events if e not in keep_events]
             for e in drop_events:
                 group.get("narration_events", []).remove(e)
             if drop_events:
                 logger.info(
                     f"Group {i}: Capped narration from {len(usable_events)} to "
-                    f"{len(keep_events)} events (max 2 allowed)"
+                    f"{len(keep_events)} events (max 3 allowed)"
                 )
 
         # Distribution check: ensure commentary is spread across the reel
@@ -333,7 +333,7 @@ def validate_narration(groups: list[dict]) -> None:
                     f"Group {i}: ALL {len(commentary_events)} commentary events clustered in "
                     f"last 40%. Redistributing..."
                 )
-                targets = [0.25, 0.50, 0.75]
+                targets = [0.40, 0.75]
                 for idx, event in enumerate(commentary_events):
                     fraction = targets[idx % len(targets)]
                     new_start = round(est_dur * fraction, 2)
@@ -571,7 +571,7 @@ def deduplicate_groups(groups: list[dict]) -> list[dict]:
 # Final Integrity Validation
 # ---------------------------------------------------------------------------
 
-def finalize_edit(plan_dict: dict, source_duration: float) -> ReelPlan:
+def finalize_edit(plan_dict: dict, source_duration: float, min_groups: int = 1) -> ReelPlan:
     """Run all validation steps and return a validated ReelPlan.
 
     This is the single entry point for post-LLM validation.
@@ -609,7 +609,14 @@ def finalize_edit(plan_dict: dict, source_duration: float) -> ReelPlan:
     deduplicated = deduplicate_groups(groups)
     plan_dict["reel_groups"] = deduplicated
 
-    # 9. Log summary
+    # 9. Floor enforcement — fail if dedup dropped below minimum
+    if len(deduplicated) < min_groups:
+        raise RuntimeError(
+            f"Group count ({len(deduplicated)}) fell below minimum ({min_groups}) "
+            f"after deduplication. Need at least {min_groups} standalone groups."
+        )
+
+    # 10. Log summary
     total_clips = sum(len(g.get("source_clips", [])) for g in deduplicated)
     total_narrations = sum(len(g.get("narration_events", [])) for g in deduplicated)
     avg_duration = sum(g.get("estimated_duration_seconds", 0) for g in deduplicated) / max(len(deduplicated), 1)

@@ -66,11 +66,14 @@ def main() -> int:
 
     print("\n[4/5] Analyzer helpers...")
     from backend.pipeline.analyzer import (
-        _compute_group_count_target,
+        _compute_group_count_ceiling,
+        _compute_group_count_floor,
         _extract_json_object,
     )
-    check("group_count short", lambda: _assert(_compute_group_count_target(120) == (1, 4)))
-    check("group_count long", lambda: _assert(_compute_group_count_target(2400) == (5, 12)))
+    check("group_count ceiling short", lambda: _assert(_compute_group_count_ceiling(120) == 1))
+    check("group_count ceiling long", lambda: _assert(_compute_group_count_ceiling(2400) == 10))
+    check("group_count floor short", lambda: _assert(_compute_group_count_floor(120) == 1))
+    check("group_count floor long", lambda: _assert(_compute_group_count_floor(2400) == 5))
     check("extract_json", lambda: _assert('"key": "value"' in _extract_json_object('{"key": "value"}')))
 
     print("\n[5/5] Models validation...")

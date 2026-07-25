@@ -408,11 +408,11 @@ def _compute_group_count_ceiling(source_duration_seconds: float) -> int:
     """Hard ceiling only. Content decides the actual count.
 
     Duration-based ceilings:
-    - <6 min   → 1 group (single Short)
-    - 7-10 min → 2 groups max
-    - 11-25 min → 7 groups max
+    - <6 min    → 1 group (single Short)
+    - 6-10 min  → 2 groups max
+    - 11-25 min → 6 groups max
     - 26-35 min → 8 groups max
-    - >35 min  → 10 groups max
+    - >35 min   → 10 groups max
     """
     minutes = source_duration_seconds / 60.0
     if minutes < 6:
@@ -420,10 +420,32 @@ def _compute_group_count_ceiling(source_duration_seconds: float) -> int:
     if minutes <= 10:
         return 2
     if minutes <= 25:
-        return 7
+        return 6
     if minutes <= 35:
         return 8
     return 10
+
+
+def _compute_group_count_floor(source_duration_seconds: float) -> int:
+    """Minimum groups the LLM must produce.
+
+    Duration-based floors:
+    - <6 min    → 1 group
+    - 6-10 min  → 1 group
+    - 11-25 min → 3 groups
+    - 26-35 min → 4 groups
+    - >35 min   → 5 groups
+    """
+    minutes = source_duration_seconds / 60.0
+    if minutes < 6:
+        return 1
+    if minutes <= 10:
+        return 1
+    if minutes <= 25:
+        return 3
+    if minutes <= 35:
+        return 4
+    return 5
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -435,6 +457,7 @@ def _prompt_structure_planner(
     video_description: str,
     blocks_text: str,
     source_duration: float,
+    min_groups: int,
     max_groups: int,
     block_usable_hints: str,
 ) -> str:
@@ -449,7 +472,7 @@ SOURCE
 Title: {video_title}
 Description: {video_description[:4000]}
 Duration: {source_duration:.1f}s
-Max groups allowed: {max_groups} (this is a CEILING, not a goal — produce up to {max_groups} strong standalone stories)
+Max groups allowed: {max_groups} (this is a CEILING, not a goal — produce {min_groups}-{max_groups} strong standalone stories)
 
 SEMANTIC BLOCKS (pre-scored by Python — imp=importance 0-100):
 {blocks_text}
@@ -481,7 +504,7 @@ GROUPING RULES
 7. Would someone watch this as a standalone Short? If not, merge it.
 8. Avoid groups that are just "introduction" or "setup" with no payoff.
 9. The max groups ({max_groups}) is a hard limit. Fewer strong groups always beats more weak ones.
-10. Produce up to {max_groups} groups if content supports it. ALWAYS produce at least 1 group.
+10. Produce {min_groups}-{max_groups} groups if content supports it. ALWAYS produce at least {min_groups} group(s).
 
 THINK INTERNALLY about each unit's arc before outputting. Only output the final boundaries.
 
@@ -635,13 +658,14 @@ GROUPS (clips already locked):
 {groups_json}
 
 RULES
-- Max 2 events per group: 1 hook + optional 1 commentary.
+- Max 3 events per group: 1 hook + up to 2 commentaries.
 - Hook: reel_start=0.0, reel_end=2.5-4.0, 6-10 words, specific curiosity.
   BANNED: "Watch what happens", "You won't believe", "This is insane", "Wait for it"
-- Commentary (optional): 8-14 words, must have persona:
-  roast | brutally_honest | friendly | sarcastic | hype | deadpan
-  Place at ~40-60% of estimated_duration. BANNED filler phrases.
-- ≥0.8s gap between events. Never cover key_moment. Last 5-8s free of narration.
+- Commentary 1 (middle): 8-14 words, place at ~35-45% of estimated_duration. Must have persona.
+- Commentary 2 (end): 8-14 words, place at ~70-80% of estimated_duration. Must have persona.
+  Personas: roast | brutally_honest | friendly | sarcastic | hype | deadpan
+  BANNED filler phrases for both commentaries.
+- ≥0.8s gap between events. Never cover key_moment. Last 3-5s free of narration.
 - Allowed chars: letters numbers . , ! ? ' - — " : ;
 
 OUTPUT — STRICT JSON ONLY
@@ -651,7 +675,8 @@ OUTPUT — STRICT JSON ONLY
       "group_index": 0,
       "narration_events": [
         {{"event_type": "hook", "reel_start": 0.0, "reel_end": 3.0, "text": "...", "persona": null, "voice_id": null}},
-        {{"event_type": "commentary", "reel_start": 45.0, "reel_end": 48.0, "text": "...", "persona": "roast", "voice_id": null}}
+        {{"event_type": "commentary", "reel_start": 35.0, "reel_end": 38.0, "text": "...", "persona": "roast", "voice_id": null}},
+        {{"event_type": "commentary", "reel_start": 70.0, "reel_end": 73.0, "text": "...", "persona": "hype", "voice_id": null}}
       ]
     }}
   ]
@@ -705,6 +730,7 @@ def select_reel_plan(
 
     source_duration = float(transcript[-1]["end"]) if transcript else 0.0
     max_groups = _compute_group_count_ceiling(source_duration)
+    min_groups = _compute_group_count_floor(source_duration)
 
     # Duration targets
     if source_duration < 90:
@@ -740,7 +766,7 @@ def select_reel_plan(
 
     description = (video_description or "")[:10000]
     logger.info(
-        f"MULTI-STAGE PLAN source={source_duration:.1f}s max_groups={max_groups} "
+        f"MULTI-STAGE PLAN source={source_duration:.1f}s groups={min_groups}-{max_groups} "
         f"blocks={len(blocks)} duration_target={reel_dur_min}-{reel_dur_max}s"
     )
 
@@ -751,7 +777,7 @@ def select_reel_plan(
         [
             {"role": "system", "content": "Respond with ONLY valid JSON."},
             {"role": "user", "content": _prompt_structure_planner(
-                video_title, description, blocks_text, source_duration, max_groups, usable_hints
+                video_title, description, blocks_text, source_duration, min_groups, max_groups, usable_hints
             )},
         ],
         progress_cb, reporter, interactions, stage_name="structure_planner",
@@ -825,11 +851,21 @@ def select_reel_plan(
                 progress_cb, reporter, interactions, stage_name="critic",
             )
             revised = _parse_json_response(raw4)
-            if isinstance(revised.get("reel_groups"), list) and revised["reel_groups"]:
-                draft = revised
-                if "structure_analysis" not in draft:
-                    draft["structure_analysis"] = sa
-                logger.info("Critic applied revisions")
+            revised_groups = revised.get("reel_groups", [])
+            if isinstance(revised_groups, list) and revised_groups:
+                # Validate Critic didn't change group count
+                original_count = len(groups)
+                revised_count = len(revised_groups)
+                if revised_count != original_count:
+                    logger.warning(
+                        f"Critic changed group count {original_count} -> {revised_count}, "
+                        f"keeping original draft"
+                    )
+                else:
+                    draft = revised
+                    if "structure_analysis" not in draft:
+                        draft["structure_analysis"] = sa
+                    logger.info("Critic applied revisions")
             else:
                 logger.info("Critic returned empty groups — keeping draft")
         except Exception as e:
@@ -856,7 +892,7 @@ def select_reel_plan(
     # ── Python validator owns final numbers ──
     if progress_cb:
         progress_cb("Validating plan...", 90)
-    reel_plan = finalize_edit(draft, source_duration)
+    reel_plan = finalize_edit(draft, source_duration, min_groups=min_groups)
 
     if progress_cb:
         progress_cb(f"Built reel plan with {len(reel_plan.reel_groups)} group(s)", 100)
