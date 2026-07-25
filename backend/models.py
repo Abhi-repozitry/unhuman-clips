@@ -55,6 +55,7 @@ class ReelPlan(BaseModel):
     reel_groups: list[ReelGroup]
     ranked_segments: list[RankedSegment] = Field(default_factory=list)
     explanations: list[str] = Field(default_factory=list)
+    structure_analysis: StructureAnalysis | None = None
     is_fallback: bool = False
 
 
@@ -105,6 +106,14 @@ class RichTimeline(BaseModel):
     total_silence_duration: float = 0.0
     speech_region_count: int = 0
     ocr_region_count: int = 0
+
+
+class StructureAnalysis(BaseModel):
+    """Output of the structure_planner LLM stage."""
+    video_type: str = "other"
+    identified_units: list[dict] = Field(default_factory=list)
+    final_group_count: int = 1
+    reasoning: str = ""
 
 
 class RankedSegment(BaseModel):

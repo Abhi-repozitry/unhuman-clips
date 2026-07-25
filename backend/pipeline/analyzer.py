@@ -1,8 +1,23 @@
-"""Video analysis module — LLM-powered reel plan generation.
+"""Video analysis module — multi-stage LLM reel plan generation.
 
-Provides select_reel_plan() which uses a Rich Timeline to analyze content
-and produce structured reel group plans with clip selections and narration.
+Architecture:
+  Rich Timeline
+       ↓
+  Semantic Block Builder (Python) + Importance Scoring (Python)
+       ↓
+  LLM #1  Structure Planner
+       ↓
+  LLM #2  Clip Planner
+       ↓
+  LLM #3  Narration Writer
+       ↓
+  LLM #4  Critic (optional revision)
+       ↓
+  Python Validator (finalize_edit)
+       ↓
+  Final ReelPlan
 """
+
 from __future__ import annotations
 
 import json
@@ -10,6 +25,7 @@ import logging
 import math
 import re
 import time
+from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from backend.config import (
@@ -36,72 +52,222 @@ __all__ = ["select_reel_plan", "select_clips"]
 logger = logging.getLogger(__name__)
 
 
-def _format_full_transcript(transcript: list) -> str:
-    """Pass the 100% full, un-chunked transcript directly to the LLM.
-    The primary LLM has a 128k+ token context window; full transcripts fit with ease."""
-    if not transcript:
-        return ""
-    lines = []
-    for i, entry in enumerate(transcript):
-        start = entry.get("start", 0.0)
-        end = entry.get("end", 0.0)
-        text = entry.get("text", "").strip()
-        if text:
-            lines.append(f"Seg {i} [{start:.1f}-{end:.1f}s]: {text}")
-    full_text = "\n".join(lines)
-    logger.info(f"Passing 100% FULL transcript to LLM ({len(lines)} segments, {len(full_text)} chars — NO CHUNKING)")
-    return full_text
+# ─────────────────────────────────────────────────────────────────────────────
+# Semantic blocks + importance scoring (Python owns the numbers)
+# ─────────────────────────────────────────────────────────────────────────────
 
+@dataclass
+class SemanticBlock:
+    block_id: int
+    start: float
+    end: float
+    text: str
+    speech_energy: float
+    volume_db: float | None
+    ocr: list[str]
+    silence_before: bool
+    black_frame: bool
+    freeze: bool
+    importance: float
+    peak_offset: float  # seconds from block start to peak energy moment
+    segment_ids: list[int] = field(default_factory=list)
 
-def _format_rich_timeline(timeline: RichTimeline) -> str:
-    """Format a Rich Timeline for LLM consumption.
+    @property
+    def duration(self) -> float:
+        return max(0.0, self.end - self.start)
 
-    Each segment includes speech text, words, speech energy, silence indicators,
-    OCR text, and FFmpeg metrics — all merged into a single structured format.
-    """
-    if not timeline.segments:
-        return ""
-
-    lines = []
-    for seg in timeline.segments:
-        # Build metric summary
-        metrics_parts = []
-        if seg.metrics.volume_db is not None:
-            metrics_parts.append(f"vol={seg.metrics.volume_db:.1f}dB")
-        if seg.metrics.black_frame:
-            metrics_parts.append("BLACK_FRAME")
-        if seg.metrics.freeze_detected:
-            metrics_parts.append("FREEZE")
-        metrics_str = ", ".join(metrics_parts) if metrics_parts else "none"
-
-        # OCR text
-        ocr_str = " | OCR: " + "; ".join(seg.ocr) if seg.ocr else ""
-
-        # Silence indicator
-        silence_tag = " [SILENCE_BEFORE]" if seg.silence_before else ""
-
-        # Speech energy bar
-        energy_bar = "█" * int(seg.speech_energy * 10) + "░" * (10 - int(seg.speech_energy * 10))
-
-        line = (
-            f"Seg {seg.segment_id} [{seg.start:.1f}-{seg.end:.1f}s] "
-            f"energy={energy_bar}({seg.speech_energy:.2f}){silence_tag}: "
-            f"{seg.speech}"
-            f"{ocr_str} "
-            f"[metrics: {metrics_str}]"
+    def summary_line(self) -> str:
+        energy_bar = "█" * int(self.speech_energy * 10) + "░" * (10 - int(self.speech_energy * 10))
+        ocr_str = f" | OCR: {'; '.join(self.ocr[:3])}" if self.ocr else ""
+        flags = []
+        if self.silence_before:
+            flags.append("SILENCE_BEFORE")
+        if self.black_frame:
+            flags.append("BLACK")
+        if self.freeze:
+            flags.append("FREEZE")
+        flag_str = f" [{', '.join(flags)}]" if flags else ""
+        vol = f" vol={self.volume_db:.1f}dB" if self.volume_db is not None else ""
+        return (
+            f"Block {self.block_id} [{self.start:.1f}-{self.end:.1f}s] "
+            f"imp={self.importance:.0f} energy={energy_bar}({self.speech_energy:.2f})"
+            f"{vol} peak=+{self.peak_offset:.1f}s{flag_str}: "
+            f"{self.text[:220]}{ocr_str}"
         )
-        lines.append(line)
 
-    full_text = "\n".join(lines)
+
+def _compute_importance(
+    energy: float,
+    volume_db: float | None,
+    has_ocr: bool,
+    silence_before: bool,
+    black: bool,
+    freeze: bool,
+) -> float:
+    """Deterministic importance 0–100. Python calculates; LLM only ranks editorially."""
+    score = 0.0
+    # Speech energy (0–40)
+    score += min(40.0, energy * 40.0)
+    # Volume relative boost (0–15) — louder than -25 dB helps
+    if volume_db is not None:
+        # typical speech ~-20 to -10; map roughly
+        vol_norm = max(0.0, min(1.0, (volume_db + 40) / 30.0))
+        score += vol_norm * 15.0
+    # OCR = strong key-moment signal (0–15)
+    if has_ocr:
+        score += 15.0
+    # Natural cut point (0–10)
+    if silence_before:
+        score += 10.0
+    # Penalties
+    if black:
+        score -= 25.0
+    if freeze:
+        score -= 20.0
+    return max(0.0, min(100.0, score))
+
+
+def _build_semantic_blocks(
+    rich_timeline: RichTimeline | None,
+    transcript: list[dict],
+    max_block_seconds: float = 28.0,
+    min_block_seconds: float = 4.0,
+) -> list[SemanticBlock]:
+    """
+    Collapse fine-grained segments into coherent semantic blocks.
+    Target ~120–180 blocks for a long video instead of 500+ tiny segments.
+    """
+    if rich_timeline and rich_timeline.segments:
+        segs = rich_timeline.segments
+        items = []
+        for seg in segs:
+            items.append({
+                "id": seg.segment_id,
+                "start": seg.start,
+                "end": seg.end,
+                "text": (seg.speech or "").strip(),
+                "energy": float(getattr(seg, "speech_energy", 0.0) or 0.0),
+                "volume_db": getattr(seg.metrics, "volume_db", None) if hasattr(seg, "metrics") else None,
+                "ocr": list(seg.ocr) if getattr(seg, "ocr", None) else [],
+                "silence_before": bool(getattr(seg, "silence_before", False)),
+                "black": bool(getattr(seg.metrics, "black_frame", False)) if hasattr(seg, "metrics") else False,
+                "freeze": bool(getattr(seg.metrics, "freeze_detected", False)) if hasattr(seg, "metrics") else False,
+            })
+    else:
+        items = []
+        for i, entry in enumerate(transcript):
+            items.append({
+                "id": i,
+                "start": float(entry.get("start", 0.0)),
+                "end": float(entry.get("end", 0.0)),
+                "text": (entry.get("text") or "").strip(),
+                "energy": 0.5,
+                "volume_db": None,
+                "ocr": [],
+                "silence_before": False,
+                "black": False,
+                "freeze": False,
+            })
+
+    if not items:
+        return []
+
+    blocks: list[SemanticBlock] = []
+    cur: list[dict] = [items[0]]
+
+    def _flush(group: list[dict]) -> None:
+        if not group:
+            return
+        start = group[0]["start"]
+        end = group[-1]["end"]
+        text = " ".join(g["text"] for g in group if g["text"]).strip()
+        energies = [g["energy"] for g in group]
+        avg_energy = sum(energies) / len(energies)
+        # peak offset = midpoint of highest-energy segment relative to block start
+        peak_seg = max(group, key=lambda g: g["energy"])
+        peak_offset = max(0.0, (peak_seg["start"] + peak_seg["end"]) / 2.0 - start)
+        vols = [g["volume_db"] for g in group if g["volume_db"] is not None]
+        volume_db = sum(vols) / len(vols) if vols else None
+        ocr: list[str] = []
+        for g in group:
+            for t in g["ocr"]:
+                if t and t not in ocr:
+                    ocr.append(t)
+        silence_before = group[0]["silence_before"]
+        black = any(g["black"] for g in group)
+        freeze = any(g["freeze"] for g in group)
+        importance = _compute_importance(
+            avg_energy, volume_db, bool(ocr), silence_before, black, freeze
+        )
+        blocks.append(SemanticBlock(
+            block_id=len(blocks),
+            start=start,
+            end=end,
+            text=text,
+            speech_energy=avg_energy,
+            volume_db=volume_db,
+            ocr=ocr[:5],
+            silence_before=silence_before,
+            black_frame=black,
+            freeze=freeze,
+            importance=importance,
+            peak_offset=peak_offset,
+            segment_ids=[g["id"] for g in group],
+        ))
+
+    for item in items[1:]:
+        cur_dur = cur[-1]["end"] - cur[0]["start"]
+        gap = item["start"] - cur[-1]["end"]
+        # Split on silence boundary or when block gets long
+        should_split = (
+            item["silence_before"]
+            or gap > 0.8
+            or cur_dur >= max_block_seconds
+        )
+        if should_split and (cur[-1]["end"] - cur[0]["start"]) >= min_block_seconds:
+            _flush(cur)
+            cur = [item]
+        else:
+            cur.append(item)
+    _flush(cur)
+
     logger.info(
-        f"Formatted Rich Timeline for LLM: {len(timeline.segments)} segments, "
-        f"{len(full_text)} chars, speech={timeline.total_speech_duration:.1f}s, "
-        f"silence={timeline.total_silence_duration:.1f}s, "
-        f"VAD_regions={timeline.speech_region_count}, "
-        f"OCR_texts={timeline.ocr_region_count}"
+        f"Semantic blocks: {len(blocks)} blocks from {len(items)} segments "
+        f"(avg {sum(b.duration for b in blocks)/max(len(blocks),1):.1f}s)"
     )
-    return full_text
+    return blocks
 
+
+def _format_blocks_for_llm(blocks: list[SemanticBlock], top_n: int | None = None) -> str:
+    """Compact block list for LLM. Optionally emphasize top importance blocks."""
+    if not blocks:
+        return ""
+    lines = [b.summary_line() for b in blocks]
+    if top_n and len(blocks) > top_n:
+        ranked = sorted(blocks, key=lambda b: b.importance, reverse=True)[:top_n]
+        top_ids = {b.block_id for b in ranked}
+        header = f"TOP-{top_n} importance block_ids: {sorted(top_ids)}\n"
+        return header + "\n".join(lines)
+    return "\n".join(lines)
+
+
+def _usable_duration(blocks: list[SemanticBlock], start: float, end: float) -> float:
+    """Deterministic usable seconds inside [start, end] (excludes black/freeze/low-importance)."""
+    total = 0.0
+    for b in blocks:
+        if b.end <= start or b.start >= end:
+            continue
+        if b.black_frame or b.freeze or b.importance < 25:
+            continue
+        overlap_start = max(b.start, start)
+        overlap_end = min(b.end, end)
+        total += max(0.0, overlap_end - overlap_start)
+    return total
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LLM plumbing
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _call_llm(
     messages: list[dict[str, Any]],
@@ -110,24 +276,6 @@ def _call_llm(
     interactions: list[LLMInteraction] | None = None,
     stage_name: str = "reel_plan",
 ) -> str:
-    """Call NVIDIA LLM with primary model, retry with fallback on failure.
-
-    Uses exponential backoff between retries. Collects LLMInteraction records
-    for rich UI display and logs via reporter.
-
-    Args:
-        messages: Chat completion message list.
-        progress_cb: Optional progress callback.
-        reporter: Optional ProgressReporter.
-        interactions: Optional list to append LLMInteraction records to.
-        stage_name: Label for this LLM call in interaction logs.
-
-    Returns:
-        Raw LLM response string.
-
-    Raises:
-        RuntimeError: If all models fail after retries.
-    """
     if not NVIDIA_API_KEY:
         raise RuntimeError(
             "NVIDIA_API_KEY is not set. Skipping LLM analysis and using local fallback."
@@ -137,12 +285,10 @@ def _call_llm(
     if NVIDIA_MODEL_FALLBACK and NVIDIA_MODEL_FALLBACK != NVIDIA_MODEL:
         models_to_try.append(NVIDIA_MODEL_FALLBACK)
 
-    logger.debug(f"Resolved models_to_try at runtime: {models_to_try}")
-
     last_error = None
-    for attempt, model in enumerate(models_to_try):
+    for model in models_to_try:
         try:
-            logger.info(f"Calling LLM with model: {model}")
+            logger.info(f"Calling LLM ({stage_name}) model={model}")
             raw_content = call_llm_sync(
                 messages=messages,
                 model=model,
@@ -155,64 +301,44 @@ def _call_llm(
                 interactions=interactions,
                 stage_name=stage_name,
             )
-            truncated = raw_content[:300] + "..." if len(raw_content) > 300 else raw_content
-            logger.debug(f"LLM response preview (model {model}): {truncated}")
-
-            # Broadcast updated interactions after each successful call
             if reporter and interactions is not None:
-                reporter.set_stage_data_key("llm_interactions", [i.model_dump() for i in interactions])
-
-            # Log full raw content to a debug file
+                reporter.set_stage_data_key(
+                    "llm_interactions", [i.model_dump() for i in interactions]
+                )
             try:
                 from backend.config import WORKING_DIR
-                debug_path = WORKING_DIR / f"llm_debug_{int(time.time())}.txt"
+                debug_path = WORKING_DIR / f"llm_debug_{stage_name}_{int(time.time())}.txt"
                 debug_path.parent.mkdir(parents=True, exist_ok=True)
                 with open(debug_path, "w", encoding="utf-8") as f:
                     f.write(raw_content)
-                logger.debug(f"Full LLM raw output saved to {debug_path}")
             except Exception as log_e:
                 logger.warning(f"Failed to write LLM debug log: {log_e}")
-
             return raw_content.strip()
         except Exception as e:
-            logger.warning(f"LLM call failed with model {model}: {e}")
+            logger.warning(f"LLM call failed ({stage_name}) model={model}: {e}")
             last_error = e
 
-    raise RuntimeError(f"All NVIDIA models failed after retries. Last error: {last_error}") from last_error
+    raise RuntimeError(f"All NVIDIA models failed ({stage_name}). Last error: {last_error}") from last_error
 
 
 def _try_repair_truncated_json(text: str) -> str:
-    """Try to repair a truncated JSON by balancing braces and brackets,
-    fixing trailing commas, and closing unclosed string quotes."""
     if not text:
         return ""
-
-    # 1. Fix trailing commas before closing brackets/braces first
     repaired = re.sub(r',\s*([}\]])', r'\1', text.strip())
-
-    # If truncated inside a string literal, close the quote
-    # Count unescaped double quotes
     unescaped_quotes = len(re.findall(r'(?<!\\)"', repaired))
     if unescaped_quotes % 2 != 0:
         repaired += '"'
-
-    # Count opening/closing braces and brackets
     open_braces = repaired.count("{")
     close_braces = repaired.count("}")
     open_brackets = repaired.count("[")
     close_brackets = repaired.count("]")
-
-    # Add missing closing braces/brackets
     repaired += "}" * max(0, open_braces - close_braces)
     repaired += "]" * max(0, open_brackets - close_brackets)
-
     try:
         json.loads(repaired)
         return repaired
     except json.JSONDecodeError:
         pass
-
-    # 2. Try to find the last complete JSON object by scanning backwards
     try:
         for start_pos in [repaired.find("{"), repaired.find("[")]:
             if start_pos < 0:
@@ -238,7 +364,7 @@ def _try_repair_truncated_json(text: str) -> str:
                 elif ch in ('}', ']'):
                     depth -= 1
                     if depth == 0:
-                        candidate = repaired[start_pos:i+1]
+                        candidate = repaired[start_pos:i + 1]
                         try:
                             json.loads(candidate)
                             return candidate
@@ -246,371 +372,318 @@ def _try_repair_truncated_json(text: str) -> str:
                             continue
     except (json.JSONDecodeError, IndexError):
         pass
-
-    # 3. Last resort: try to find any valid JSON substring
-    try:
-        for start_pos in range(len(repaired)):
-            if repaired[start_pos] in ('{', '['):
-                for end_pos in range(len(repaired), start_pos, -1):
-                    candidate = repaired[start_pos:end_pos]
-                    try:
-                        json.loads(candidate)
-                        return candidate
-                    except json.JSONDecodeError:
-                        continue
-    except (json.JSONDecodeError, IndexError):
-        pass
-
     return ""
 
 
-def _compute_group_count_target(source_duration_seconds: float) -> tuple[int, int]:
-    """
-    Group count target for 5-40 minute long-form videos.
-
-    min_groups scales with video length to ensure long videos produce multiple reels.
-    max_groups is a ceiling the LLM can reach up to.
-
-      - <5 min     → (1, 4)
-      - 5-10 min   → (3, 6)
-      - 10-20 min  → (4, 8)
-      - 20-40+ min → (5, 12)
-    """
-    if source_duration_seconds <= 300:
-        return (1, 4)
-    if source_duration_seconds <= 600:
-        return (3, 6)
-    if source_duration_seconds <= 1200:
-        return (4, 8)
-    return (5, 12)
-
-
-def _build_reel_plan_prompt(video_title: str, video_description: str, transcript_text: str,
-                           min_groups: int = 1, max_groups: int = 2,
-                           clips_per_group: str = "5-10",
-                           narration_per_group: str = "3-6",
-                           reel_duration_target: str = "90-150",
-                           source_duration: float = 0.0,
-                           has_rich_timeline: bool = False) -> str:
-    """Build the full LLM prompt for reel_plan generation.
-
-    Duration-driven clip selection with varied pacing. The LLM selects a MIX
-    of short, medium, and long clips to fill the target duration naturally.
-    Deterministic by design: temperature=0.0, concrete specs.
-    """
-    reuse_note = ""
-    if source_duration <= 120:
-        reuse_note = ("\nREUSE RULE: This is a short source video. Clips SHOULD be reused across groups "
-                      "with different narrative angles and commentary. What makes each group distinct is "
-                      "the story framing and narration, not unique footage.")
-
-    # Parse reel_duration_target to extract min/max
-    dur_parts = reel_duration_target.split("-")
-    try:
-        dur_min = int(dur_parts[0])
-        dur_max = int(dur_parts[1])
-    except (IndexError, ValueError):
-        dur_min, dur_max = 90, 150
-
-    # Compute timeline coverage bins for spread enforcement
-    if source_duration > 0:
-        early_end = source_duration * 0.25
-        mid_start = source_duration * 0.25
-        mid_end = source_duration * 0.75
-        late_start = source_duration * 0.75
-    else:
-        early_end = mid_start = mid_end = late_start = 0
-
-    return f"""You are an elite short-form content strategist. Your SOLE job is to assemble a {dur_min}-{dur_max} second vertical reel by selecting clips of VARIED lengths that create compelling pacing and maximize viewer retention.
-
-You are NOT a summarizer. You are an EDITOR — cutting a reel with intentional rhythm. Every clip must earn its place through specific duration choice.
-
-===== CORE MISSION: ASSEMBLE A REEL WITH VARIED PACING =====
-Select clips from the transcript and assemble them into a {dur_min}-{dur_max}s reel. Your KEY decision is the MIX of clip lengths — this determines pacing and energy.
-
-HOOK CLIP (MANDATORY — FIRST CLIP OF EVERY GROUP):
-- The VERY FIRST clip of every group MUST be a HOOK CLIP: 1-4 seconds from the EARLIEST part of the source video.
-- This hook clip grabs the audience with the source video's original audio (speech, sounds, energy).
-- Set "is_hook_clip": true for this clip. All other clips have "is_hook_clip": false.
-- The hook clip MUST be short (1-4s), high-energy, and immediately attention-grabbing.
-- The hook clip's original audio plays at full volume — no ducking is applied to it.
-- This is NOT the narration hook (TTS). The hook clip IS the source video playing.
-
-CLIP DURATION CATEGORIES:
-- SHORT (3-5s): Punchy cuts, reactions, transitions, single-line punchlines, visual stingers.
-  Use 3-5 per reel. These CREATE ENERGY and rhythm. Short clips are your beat drops.
-- MEDIUM (6-15s): Dialogue exchanges, demonstrations, narrative beats, key reveals.
-  Use 3-5 per reel. These CARRY THE STORY. Medium clips are your backbone.
-- LONG (16-30s): Emotional moments, detailed explanations, transformations, sustained tension.
-  Use 1-3 per reel. These LET MOMENTS BREATHE. Long clips are your emotional anchors.
-
-CLIP SELECTION TIERS — which moments deserve which clip length:
-TIER 1 — HIGHEST VALUE (assign these to SHORT or MEDIUM clips):
-• Action climaxes: physical feats, reveals, demonstrations, transformations
-• Emotional peaks: shock, triumph, breakdown, laughter, tears, rage
-• Stakes moments: "if this fails...", ultimatums, gambles, high-consequence decisions
-• Viral hooks: outrageous claims, absurd situations, "did that just happen?" moments
-
-TIER 2 — HIGH VALUE (assign these to MEDIUM or LONG clips):
-• Key payoffs: answers to built-up questions, before/after reveals, results
-• Surprising twists: plot turns, unexpected outcomes, contrarian takes
-• Humor peaks: the biggest laugh, funniest exchange, most absurd moment
-• Expert insights: specific numbers, data points, professional techniques
-
-TIER 3 — SUPPORTING (use MEDIUM clips to bridge TIER 1-2 moments):
-• Setup context: necessary background that makes TIER 1-2 moments land
-• Transitional energy: moments that maintain momentum between peaks
-• Reactions: genuine audience/participant reactions to high moments
-
-EXCLUDE entirely: filler, greetings, repetitive explanations, low-energy passages, generic statements, transitions without substance.
-
-===== GROUPING STRATEGY (CRITICAL — THINK CAREFULLY) =====
-Your goal is to maximize total audience retention across ALL output reels. More groups = more content = more reach, BUT only if each group is strong enough to stand alone.
-
-HOW TO ANALYZE THE VIDEO FOR GROUPS:
-1. First, identify the video's STRUCTURE:
-   - Challenge/competition videos: Each challenge round = 1 story arc. "Who can X?" → participants compete → winner revealed. MrBeast, game shows, sports, cooking competitions.
-   - Listicle/countdown videos: Each item = 1 story arc. "Top 10 X" → item 1 → item 2 → ...
-   - Interview/podcast: Each topic discussed = 1 story arc. Question → answer → reaction → next topic.
-   - Educational/explainer: Usually 1 story arc (one cohesive lesson). MAYBE 2-3 if covering distinct sub-topics.
-   - Vlog/lifestyle: Different activities or locations may = different story arcs.
-   - Documentary: Each segment/chapter = 1 story arc.
-
-2. For EACH identified story arc, identify its SUB-CONTENTS:
-   - Challenge video: each challenge round = 1 sub-content
-   - Listicle: each item = 1 sub-content
-   - Interview: each question/topic = 1 sub-content
-   - Competition: each round/match = 1 sub-content
-   - Vlog: each distinct activity or location = 1 sub-content
-
-3. DECISION RULE:
-   - Each sub-content that has enough usable footage (30s+) to fill a 90-150s reel = 1 group
-   - If a sub-content is too short (<30s of usable content), merge it with an adjacent sub-content
-   - If a video has 6 challenges → up to 6 groups
-   - If a video has 3 podcast topics → up to 3 groups
-   - NEVER produce 0 groups. ALWAYS produce at least 1.
-   - NEVER artificially inflate group count. Each group must come from a genuinely distinct sub-content.
-
-CROSS-GROUP RULES:
-- Maximum 20% clip time overlap between any two groups.
-- Each group's narrative_angle MUST reference a DIFFERENT story arc or aspect.
-- Each group's key_moment MUST be from a DIFFERENT part of the video.
-- If two groups would naturally use the same clips, MERGE them into one group.
-
-EXAMPLES OF WHEN TO CREATE MULTIPLE GROUPS:
-- MrBeast "World's Strongest Man Vs Robot": 6 challenges = up to 6 groups (each challenge is a sub-content unit)
-- "Top 10 Scariest Moments": 10 items = up to max_groups groups (each moment is a sub-content unit)
-- Podcast with 3 guest segments: 3 groups (each segment is a sub-content unit)
-- Cooking competition with 3 rounds: 3 groups (each round is a sub-content unit)
-
-EXAMPLES OF WHEN TO CREATE 1 GROUP:
-- Tutorial video teaching one skill: 1 group
-- Single continuous vlog with no break points: 1 group
-- Documentary covering one event: 1 group
-- Short video (<3min) with one story: 1 group
-
-===== DURATION BUDGET (THE MOST IMPORTANT SECTION) =====
-HARD RULE: Every output reel MUST be between {dur_min}-{dur_max} seconds. NO exceptions.
-- {dur_min} seconds is the ABSOLUTE MINIMUM. If your selection is shorter, ADD MORE CLIPS.
-- {dur_max} seconds is the ABSOLUTE MAXIMUM. If your selection is longer, REMOVE CLIPS.
-- Target: aim for {dur_min + 30}-{dur_max - 20} seconds to have buffer room.
-
-Your PRIMARY constraint is TOTAL DURATION, not clip count.
-
-Duration math:
-  total_clip_duration = sum of (source_end - source_start) for all clips
-  total_narration_duration = sum of (reel_end - reel_start) for all narration events
-  NOTE: Narration OVERLAPS the video — it plays ON TOP of the clips, not after them.
-  Therefore: estimated_duration = total_clip_duration + 2.0 (narration does NOT add to duration)
-
-Target: estimated_duration should be {dur_min}-{dur_max} seconds.
-- Clips alone should sum to {dur_min - 5}s to {dur_max - 5}s.
-- DO NOT add narration duration to clip duration — narration is overlaid, not appended.
-- DO NOT pad clips to fill time. Pick the RIGHT clips, then calculate duration.
-- If your selection is under {dur_min}s, ADD MORE CLIPS until you reach {dur_min}s.
-- If your selection is over {dur_max}s, REMOVE CLIPS until you are under {dur_max}s.
-- NEVER produce a reel shorter than {dur_min} seconds. This is a hard minimum.
-
-PACING RULES (instead of rigid HOOK/BUILD/PAYOFF template):
-1. Open with energy: first 2 clips should be SHORT or MEDIUM — never start with a long clip.
-2. Vary rhythm: alternate between short and medium/long clips. NO back-to-back LONG clips.
-3. Place your single STRONGEST moment in the final 30% of the reel.
-4. The final clip should be MEDIUM or LONG — let the ending land, don't rush it.
-5. NO more than 3 SHORT clips in a row (feels choppy).
-6. At least one MEDIUM or LONG clip in the first half (establishes substance).
-
-===== SOURCE VIDEO =====
-Title: {video_title}
-Description: {video_description[:10000]}
-Duration: {source_duration:.1f} seconds
-
-Transcript (segment index [timestamp]):
-{transcript_text}
-
-===== MANDATORY OUTPUT =====
-- Analyze the video structure first, THEN decide how many groups to produce.
-- Output {min_groups}-{max_groups} reel_groups. Each group tells a DIFFERENT story arc.
-- If the video has multiple distinct story arcs (challenges, segments, topics), produce multiple groups.
-- If the video is one cohesive story with no natural break points, produce 1 group.
-- Groups MUST be spread across the FULL video timeline — NOT clustered in the first few minutes.
-- Timeline coverage is MANDATORY:
-  * Early zone: 0.0s - {early_end:.0f}s (at least 1-2 clips from here)
-  * Middle zone: {mid_start:.0f}s - {mid_end:.0f}s (at least 2-3 clips from here)
-  * Late zone: {late_start:.0f}s - {source_duration:.0f}s (at least 1-2 clips from here)
-- Each group should have 6-15 clips of VARIED lengths (not all the same duration).
-- The group_reasoning field MUST include a duration breakdown showing SHORT/MEDIUM/LONG counts.
-
-===== CLIP SELECTION RULES =====
-1. ONLY select moments from TIER 1 or TIER 2. Use TIER 3 sparingly.
-2. Each clip must have a CLEAR reason tied to the group's narrative arc.
-3. No filler. No "overview" clips. Every clip must deliver a specific emotional or informational payload.
-4. VARY clip lengths: mix SHORT + MEDIUM + LONG. A reel with all medium clips is boring.
-5. The final clip of each group must be the STRONGEST remaining moment.
-6. Do NOT include clips that merely mention the topic — include clips that DEMONSTRATE it.
-7. NEVER select a clip shorter than 3.0 seconds.
-
-===== NARRATION RULES =====
-IMPORTANT: Total narration events per group: 1 HOOK + 0-1 COMMENTARY = MAX 2 total.
-Quality over quantity. A single powerful commentary line beats five generic ones.
-
-Hook (event_type: "hook"):
-- reel_start: 0.0 always. reel_end: 2.5-4.0 seconds.
-- 6-10 words. Specific to this video's content. Creates immediate curiosity.
-- BANNED: "Watch what happens", "You won't believe", "This is insane", "Wait for it"
-
-Commentary (event_type: "commentary"):
-- MAX 1 per group. 8-14 words. Makes the viewer FEEL something.
-- You MUST assign a persona to each commentary event (see PERSONA SYSTEM below).
-- Distribute: if 1 commentary, place at 40-60% of reel. If only hook, no commentary needed.
-- BANNED: "As you can see", "Notice how", "Check this out", "Pretty cool"
-
-PERSONA SYSTEM — assign ONE persona to each commentary event:
-Each persona changes the TONE and ANGLE of the commentary. Pick the one that fits the moment:
-
-- "roast" — Witty, playful criticism. Teasing the subject with humor.
-  Example: "Bro really thought that was a good take. It was not."
-  Example: "The confidence here is honestly impressive. The execution? Not so much."
-
-- "brutally_honest" — Raw unfiltered truth. No sugarcoating, direct and blunt.
-  Example: "Let's be real — this is terrible and here's why it matters."
-  Example: "Nobody wants to say it, but this approach fails every single time."
-
-- "friendly" — Warm, supportive, encouraging tone. Like a friend hyping you up.
-  Example: "Okay this is actually genius, and let me explain why."
-  Example: "No but seriously, this person deserves more credit for this."
-
-- "sarcastic" — Ironic understatement. Says the opposite of what's meant.
-  Example: "Oh wow, what a surprise — another bad decision."
-  Example: "Clearly nobody planned this. Shocking."
-
-- "hype" — High energy, intense excitement. Urgency and FOMO.
-  Example: "STOP SCROLLING. This changes everything."
-  Example: "This is the moment everyone's been waiting for."
-
-- "deadpan" — Emotionless delivery for maximum comedic contrast.
-  Example: "And then he fell. That happened."
-  Example: "This is fine. Everything is fine."
-
-The audio system uses AI-powered Voice Activity Detection for ducking — it only ducks when TTS narration is actually speaking. This means narration can be placed over dialogue; the ducking will only activate during actual TTS speech, leaving surrounding dialogue intact.
-
-===== CRITICAL: NARRATION PLACEMENT =====
-- Leave at least 0.8s clear gap between narration events.
-- NEVER place narration over the group's key_moment (the main payoff/climax).
-- The last 5-8 seconds of the reel should be FREE of narration — let the payoff land.
-- Total narration duration should be no more than 25% of total reel duration.
-- Narration events must NOT overlap each other.
-- MAXIMUM 2 narration events total (1 hook + 0-1 commentary). Fewer is often better.
-
-===== TEXT RULES =====
-Allowed: letters, numbers, . , ! ? ' - — " : ;
-BANNED: / \\ | * # _ < > [ ] {{ }}
-Use contractions. Be conversational. Be specific.
-
-===== SELF-VERIFICATION (MANDATORY) =====
-Before outputting, you MUST verify:
-1. Did you identify the sub-contents (challenges, items, segments) in the video?
-2. Is your group count justified by the number of sub-contents you found?
-3. total_clip_duration = sum of (source_end - source_start) for all clips
-4. estimated_duration = total_clip_duration + 2.0 (narration OVERLAPS clips, does NOT add to duration)
-5. estimated_duration >= {dur_min}? If NO: ADD MORE CLIPS until you reach {dur_min}s. NEVER produce a reel shorter than {dur_min}s.
-6. estimated_duration <= {dur_max}? If NO: REMOVE CLIPS until you are under {dur_max}s.
-7. Clips span early/middle/late zones? If NO: replace clips to fix coverage.
-8. Clip length mix: Are there SHORT + MEDIUM + LONG clips? (not all same length)
-9. Rhythm check: No back-to-back LONG clips? No 3+ SHORT clips in a row?
-10. Maximum 2 narration events (1 hook + 0-1 commentary)? If more: REMOVE the weakest.
-11. Each commentary event has a persona assigned? If not: assign one from the PERSONA SYSTEM.
-12. First clip has "is_hook_clip": true and is 1-4 seconds? If not: FIX IT.
-13. estimated_duration_seconds = estimated_duration from step 4.
-
-===== OUTPUT (STRICT JSON ONLY) =====
-Output ONLY valid JSON. No markdown. No explanation.
-Use "source_start" and "source_end" for clip timestamps.
-If speech energy is available, use it to inform clip quality (high energy = clear speech, low energy = silence/background).
-If OCR text is available, consider it for context (on-screen text often indicates key moments).
-If metrics show BLACK_FRAME or FREEZE, avoid those segments unless they serve a narrative purpose.
-
-{{
-  "ranked_segments": [
-    {{"segment_id": 0, "score": 85, "reason": "Strong opening with high energy and clear speech."}},
-    {{"segment_id": 18, "score": 97, "reason": "Peak emotional moment with high volume and clear dialogue."}}
-  ],
-  "reel_groups": [
-    {{
-      "group_index": 0,
-      "group_reasoning": "Why these specific moments form a compelling arc. MUST include: 'Short clips: N, Medium clips: N, Long clips: N' and duration breakdown.",
-      "estimated_duration_seconds": {dur_min}.0,
-      "reel_summary": {{
-        "title": "Scroll-stopping title (max 60 chars)",
-        "short_description": "One-sentence hook (max 150 chars)",
-        "source_understanding": "What this covers",
-        "narrative_angle": "Emotional framing",
-        "key_moment": "The single strongest moment in this group"
-      }},
-      "source_clips": [
-        {{"source_start": 0.0, "source_end": 3.5, "reason": "HOOK CLIP: High-energy opening moment — original audio grabs audience", "is_hook_clip": true}},
-        {{"source_start": 12.0, "source_end": 25.0, "reason": "MEDIUM: Key dialogue exchange that establishes the story", "is_hook_clip": false}},
-        {{"source_start": 45.0, "source_end": 60.0, "reason": "MEDIUM: Building tension with specific details", "is_hook_clip": false}},
-        {{"source_start": 72.0, "source_end": 75.0, "reason": "SHORT: Quick reaction or punchline beat", "is_hook_clip": false}},
-        {{"source_start": 90.0, "source_end": 110.0, "reason": "LONG: Emotional peak — the moment that makes this video worth watching", "is_hook_clip": false}},
-        {{"source_start": 120.0, "source_end": 123.0, "reason": "SHORT: Final punchy beat before the payoff", "is_hook_clip": false}},
-        {{"source_start": 130.0, "source_end": 145.0, "reason": "MEDIUM: Payoff moment — the strongest remaining clip", "is_hook_clip": false}}
-      ],
-      "narration_events": [
-        {{"event_type": "hook", "reel_start": 0.0, "reel_end": 3.0, "text": "Specific hook tied to this video...", "persona": null, "voice_id": null}},
-        {{"event_type": "commentary", "reel_start": 25.0, "reel_end": 28.0, "text": "Witty roast about this moment.", "persona": "roast", "voice_id": null}}
-      ]
-    }}
-  ],
-  "explanations": [
-    "Why this reel plan works: brief reasoning about the overall strategy.",
-    "Key moments identified and why they were selected."
-  ]
-}}"""
-
-
-
-
-
 def _extract_json_object(text: str) -> str:
-    """Extract first JSON object from text, stripping markdown fences and outer conversational text."""
     t = text.strip()
-    # Check for markdown code fences
     fence_match = re.search(r"```(?:json)?\s*(\{[\s\S]*\})\s*```", t, re.IGNORECASE)
     if fence_match:
         return fence_match.group(1).strip()
-
     if t.startswith("```json"):
         t = t[len("```json"):].strip()
     if t.startswith("```"):
         t = t[len("```"):].strip()
     if t.endswith("```"):
         t = t[:-len("```")].strip()
-
     m = re.search(r"\{[\s\S]*\}", t)
     if not m:
         raise ValueError("No JSON object found in LLM response.")
     return m.group(0).strip()
 
+
+def _parse_json_response(raw: str) -> dict:
+    raw_json = _extract_json_object(raw)
+    try:
+        return json.loads(raw_json)
+    except json.JSONDecodeError:
+        repaired = _try_repair_truncated_json(raw_json)
+        if repaired:
+            logger.info("Repaired malformed JSON from LLM")
+            return json.loads(repaired)
+        raise
+
+
+def _compute_group_count_ceiling(source_duration_seconds: float) -> int:
+    """Hard ceiling only. Content decides the actual count.
+
+    Targets 4-8 groups when content supports it. The ceiling allows
+    the LLM to find strong standalone stories without being artificially
+    limited, but prevents excessive fragmentation.
+    """
+    minutes = source_duration_seconds / 60.0
+    if minutes <= 2:
+        return 2
+    if minutes <= 5:
+        return 4
+    if minutes <= 10:
+        return 6
+    if minutes <= 20:
+        return 8
+    return 10
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stage prompts — each LLM has one job
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _prompt_structure_planner(
+    video_title: str,
+    video_description: str,
+    blocks_text: str,
+    source_duration: float,
+    max_groups: int,
+    block_usable_hints: str,
+) -> str:
+    return f"""You are an editorial structure planner for YouTube Shorts.
+Your ONLY job: identify the strongest standalone story units worth turning into individual Shorts.
+Do NOT select clips. Do NOT write narration.
+
+You think like a professional editor, not a chapter detector.
+Chapters mirror the source. Editorial units tell complete stories.
+
+SOURCE
+Title: {video_title}
+Description: {video_description[:4000]}
+Duration: {source_duration:.1f}s
+Max groups allowed: {max_groups} (this is a CEILING, not a goal — target 4-8 if content supports it)
+
+SEMANTIC BLOCKS (pre-scored by Python — imp=importance 0-100):
+{blocks_text}
+
+PRECOMPUTED USABLE SECONDS BY REGION:
+{block_usable_hints}
+
+EDITORIAL SCORING — before grouping, score each candidate section on:
+- Emotional intensity (0-10): crowd gasps, player reactions, stakes
+- Novelty (0-10): unexpected outcome, never-seen-before moment
+- Stakes (0-10): what is at risk for the participants
+- Visual action (0-10): motion, spectacle, physical comedy
+- Surprise (0-10): twist, reversal, unexpected winner
+- Payoff clarity (0-10): is there a clear result/reveal
+
+Only sections scoring ≥5 average deserve standalone reels.
+
+GROUPING RULES
+1. Classify video_type.
+2. For each candidate unit, reason about its internal arc:
+   - Setup: what is established or promised
+   - Conflict: what tension or challenge builds
+   - Peak: the climax, reveal, or payoff
+   - Resolution: how it lands (reaction, aftermath)
+3. A unit is ONLY a group if it has a complete arc (setup → peak at minimum).
+4. If a section has setup but no payoff, merge it with adjacent content that provides the payoff.
+5. Never split a challenge/contest if the climax immediately follows — keep them as one unit.
+6. Never combine two unrelated climaxes into one group — they are separate stories.
+7. Would someone watch this as a standalone Short? If not, merge it.
+8. Avoid groups that are just "introduction" or "setup" with no payoff.
+9. The max groups ({max_groups}) is a hard limit. Fewer strong groups always beats more weak ones.
+10. Target 4-8 groups when content quality supports it. ALWAYS produce at least 1 group.
+
+THINK INTERNALLY about each unit's arc before outputting. Only output the final boundaries.
+
+OUTPUT — STRICT JSON ONLY
+{{
+  "structure_analysis": {{
+    "video_type": "challenge|listicle|podcast|tutorial|vlog|review|documentary|continuous_story|other",
+    "identified_units": [
+      {{
+        "name": "unit name",
+        "approx_start": 0.0,
+        "approx_end": 90.0,
+        "usable_seconds": 72,
+        "kept": true
+      }}
+    ],
+    "final_group_count": 1,
+    "reasoning": "Why this many groups. What makes each unit a complete standalone story."
+  }}
+}}"""
+
+
+def _prompt_clip_planner(
+    video_title: str,
+    structure: dict,
+    blocks_text: str,
+    source_duration: float,
+    dur_min: int,
+    dur_max: int,
+) -> str:
+    units = structure.get("identified_units", [])
+    kept = [u for u in units if u.get("kept", True)]
+    units_json = json.dumps(kept, ensure_ascii=False, indent=2)
+
+    return f"""You are a senior YouTube Shorts clip editor.
+Your ONLY job: select the strongest source clips for each group defined by the structure plan.
+Do NOT write narration text. Do NOT change the number of groups.
+
+You choose clips for maximum impact, not transcript continuity.
+Every second must earn its place. If nothing meaningful happens, cut it.
+
+STRUCTURE PLAN (already decided):
+{json.dumps(structure.get("structure_analysis", structure), ensure_ascii=False, indent=2)}
+
+KEPT UNITS:
+{units_json}
+
+SEMANTIC BLOCKS (imp = importance 0-100, peak = best moment offset):
+{blocks_text}
+
+CRITICAL RULE — NO SOURCE OVERLAP
+Every source timestamp may belong to ONE reel only.
+If reel A uses 20.0-35.0s, NO other reel may touch 20.0-35.0s.
+Exception: explicit recap clips (must state "RECAP" in reason).
+Violating this creates duplicate Shorts. This is the #1 rule.
+
+CLIP SELECTION PRIORITIES (ranked)
+1. Curiosity gap — "What happens next?" / "No way..." / unexpected visuals
+2. Emotional peak — crowd gasps, player reactions, shock, celebration
+3. Visual action — motion, spectacle, physical moments
+4. Stakes — what is at risk, what could go wrong
+5. Payoff — result, winner reveal, outcome
+6. Surprise — twist, reversal, unexpected result
+NEVER choose a clip just because it comes next in the transcript.
+Dialogue continuity does NOT matter. Impact does.
+
+CLIP STORY ARC — every reel must contain within its clips:
+- Hook: the curiosity trigger (first clip)
+- Escalation: tension building (middle clips)
+- Peak: the climax or reveal (later clip)
+- Resolution: how it lands (optional final clip)
+If you cannot achieve this arc, merge or expand clips until you can.
+
+HOOK CLIPS — chosen by curiosity, NOT earliest timestamp.
+Search the entire unit for:
+- "What happens if..." moments
+- Unexpected visuals or instant action
+- Crowd reactions before you see why
+- Oh-my-God expressions
+- Visual spectacle that makes you stop scrolling
+Avoid: introductions, greetings, "Hey guys", slow builds, setup without payoff.
+is_hook_clip=true only on the hook clip.
+
+FILLER REMOVAL — aggressively cut:
+- Repeated explanations saying the same thing
+- Countdowns that go nowhere
+- Slow walking, waiting, dead air
+- Reset moments ("Okay let's try again")
+- Repeated commentary
+- Any 5+ second stretch where nothing visually or emotionally happens
+Trim clips to the minimum that delivers the moment. Shorter is almost always better.
+
+CLIP MIX
+- SHORT 3-5s, MEDIUM 6-15s, LONG 16-30s — mix them for pacing.
+- No back-to-back LONG clips. No 3+ SHORT in a row.
+- Strongest moment must be in the final 30% of the reel.
+- Final clip must be MEDIUM or LONG (never end on a SHORT).
+- Never < 3.0s per clip.
+- Prefer SHOW THEN EXPLAIN: visual action first, commentary after.
+
+IF TWO ADJACENT CLIPS COMMUNICATE THE SAME INFORMATION
+Keep only the stronger one. Redundancy kills pacing.
+
+EVERY REEL STANDS ALONE
+No clip should require a previous reel for context.
+A viewer seeing this Short cold must understand what is happening.
+
+DURATION RULES (HARD)
+- Each group estimated_duration = sum of (source_end - source_start) of its clips.
+- Must be between {dur_min} and {dur_max} seconds.
+- Narration is overlaid later — it does NOT add duration.
+- Prefer high-imp blocks. Avoid BLACK / FREEZE unless intentional.
+- Prefer SILENCE_BEFORE as cut points.
+- If duration is too short, expand existing clips (wider time ranges) rather than adding filler clips.
+
+OUTPUT — STRICT JSON ONLY
+{{
+  "reel_groups": [
+    {{
+      "group_index": 0,
+      "group_reasoning": "Short:N Medium:N Long:N, total duration, why this arc works as a standalone story.",
+      "estimated_duration_seconds": 120.0,
+      "reel_summary": {{
+        "title": "≤60 chars — what makes this Short compelling",
+        "short_description": "≤150 chars",
+        "source_understanding": "what this covers",
+        "narrative_angle": "unique emotional framing",
+        "key_moment": "strongest moment — what makes someone stop scrolling"
+      }},
+      "source_clips": [
+        {{"source_start": 12.0, "source_end": 15.0, "reason": "HOOK: curiosity gap — ...", "is_hook_clip": true}},
+        {{"source_start": 20.0, "source_end": 32.0, "reason": "MEDIUM: escalation — ...", "is_hook_clip": false}}
+      ]
+    }}
+  ]
+}}"""
+
+
+def _prompt_narration_writer(
+    video_title: str,
+    groups_without_narration: list[dict],
+) -> str:
+    groups_json = json.dumps(groups_without_narration, ensure_ascii=False, indent=2)
+    return f"""You are a narration writer for vertical reels.
+Your ONLY job: write narration_events for each group.
+Do NOT change clips, timestamps, or group count.
+
+Video title: {video_title}
+
+GROUPS (clips already locked):
+{groups_json}
+
+RULES
+- Max 2 events per group: 1 hook + optional 1 commentary.
+- Hook: reel_start=0.0, reel_end=2.5-4.0, 6-10 words, specific curiosity.
+  BANNED: "Watch what happens", "You won't believe", "This is insane", "Wait for it"
+- Commentary (optional): 8-14 words, must have persona:
+  roast | brutally_honest | friendly | sarcastic | hype | deadpan
+  Place at ~40-60% of estimated_duration. BANNED filler phrases.
+- ≥0.8s gap between events. Never cover key_moment. Last 5-8s free of narration.
+- Allowed chars: letters numbers . , ! ? ' - — " : ;
+
+OUTPUT — STRICT JSON ONLY
+{{
+  "reel_groups": [
+    {{
+      "group_index": 0,
+      "narration_events": [
+        {{"event_type": "hook", "reel_start": 0.0, "reel_end": 3.0, "text": "...", "persona": null, "voice_id": null}},
+        {{"event_type": "commentary", "reel_start": 45.0, "reel_end": 48.0, "text": "...", "persona": "roast", "voice_id": null}}
+      ]
+    }}
+  ]
+}}"""
+
+
+def _prompt_critic(plan: dict, dur_min: int, dur_max: int) -> str:
+    plan_json = json.dumps(plan, ensure_ascii=False, indent=2)[:60000]
+    return f"""You are a senior YouTube Shorts editor.
+Do NOT invent new groups. Do NOT rewrite everything.
+Critique the draft reel plan and apply concrete fixes.
+
+Draft:
+{plan_json}
+
+Check for:
+- boring openings (weak hook clips that don't create curiosity)
+- weak pacing (too many similar lengths, no rhythm)
+- redundant clips across groups (EVERY source timestamp may belong to ONE reel only — zero overlap)
+- confusing story / missing payoff in any group
+- dead air / low-value clips (repeated explanations, waiting, filler)
+- missed emotional peaks (strongest moment buried in middle instead of final 30%)
+- duration outside {dur_min}-{dur_max}s
+- groups that don't stand alone (require context from another reel)
+- hook clips that are introductions instead of curiosity triggers
+- clips showing then explaining instead of explaining then showing (prefer show-first)
+
+Return the FULL revised plan as STRICT JSON with the same schema:
+structure_analysis (if present), ranked_segments (optional), reel_groups (with source_clips + narration_events), explanations.
+Only change what needs fixing. Keep strong parts intact."""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Multi-stage orchestration
+# ─────────────────────────────────────────────────────────────────────────────
 
 def select_reel_plan(
     transcript: list[dict],
@@ -621,238 +694,223 @@ def select_reel_plan(
     interactions: list[LLMInteraction] | None = None,
     rich_timeline: RichTimeline | None = None,
 ) -> ReelPlan:
-    """Main entry: produce a ReelPlan from a Rich Timeline using LLM analysis.
-
-    If a Rich Timeline is provided, it is the single source of truth for the LLM.
-    Falls back to raw transcript formatting if no Rich Timeline is available.
-
-    If reporter and interactions are provided, collects structured LLMInteraction
-    records during processing and broadcasts them live via set_stage_data_key.
-
-    Args:
-        transcript: Full transcript list with start/end/text keys (fallback).
-        video_title: Video title for context.
-        video_description: Video description for context.
-        progress_cb: Optional progress callback.
-        reporter: Optional ProgressReporter.
-        interactions: Optional list to append LLMInteraction records to.
-        rich_timeline: Optional Rich Timeline (preferred over raw transcript).
-
-    Returns:
-        ReelPlan with reel_groups, ranked_segments, and explanations.
-
-    Raises:
-        RuntimeError: On empty transcript or LLM failure.
-    """
     if progress_cb:
-        progress_cb("Preparing content for reel analysis...", 10)
+        progress_cb("Building semantic blocks...", 5)
 
     if not transcript:
         raise RuntimeError("Transcript is empty; cannot build reel plan.")
 
-    # Use Rich Timeline if available, fall back to raw transcript
-    if rich_timeline and rich_timeline.segments:
-        transcript_text = _format_rich_timeline(rich_timeline)
-        has_rich_timeline = True
-        logger.info("Using Rich Timeline as single source of truth for LLM")
-    else:
-        transcript_text = _format_full_transcript(transcript)
-        has_rich_timeline = False
-        logger.info("Falling back to raw transcript (no Rich Timeline available)")
+    source_duration = float(transcript[-1]["end"]) if transcript else 0.0
+    max_groups = _compute_group_count_ceiling(source_duration)
 
-    description = (video_description or "")[:10000]
-
-    if progress_cb:
-        progress_cb("Sending content to LLM for reel planning...", 30)
-
-    source_duration = transcript[-1]["end"] if transcript else 0.0
-    min_groups, max_groups = _compute_group_count_target(source_duration)
-
-    # Compute per-group specs proportional to source duration
-    
-    # HARD MINIMUM: 90 seconds (1:30). HARD MAXIMUM: 180 seconds (2:00).
-    # Every output reel MUST be between 90-180 seconds. No exceptions.
+    # Duration targets
     if source_duration < 90:
-        # Very short source: use as much as possible but cap at source duration
         reel_dur_min = max(45, int(source_duration * 0.8))
         reel_dur_max = min(int(source_duration * 0.95), 90)
     elif source_duration < 180:
-        # Short-medium source: target 90s to source_duration
         reel_dur_min = 90
         reel_dur_max = min(int(source_duration * 0.95), 180)
     else:
-        # Normal source (3+ min): always 90-180s
         reel_dur_min = 90
         reel_dur_max = 180
-    
-    # Ensure at least 30s spread between min/max
     if reel_dur_max - reel_dur_min < 30:
         reel_dur_max = reel_dur_min + 30
-    # Hard cap at config max
     reel_dur_max = min(reel_dur_max, int(MAX_OUTPUT_DURATION))
-    reel_duration_target = f"{reel_dur_min}-{reel_dur_max}"
-    
-    # Wider clip range: LLM mixes SHORT (2-5s) + MEDIUM (6-15s) + LONG (16-30s) clips
-    # Low end assumes mostly LONG clips; high end assumes mostly SHORT clips
-    clips_min = max(5, math.floor(reel_dur_min / 20))   # fewest clips if all avg 20s
-    clips_max = min(18, math.ceil(reel_dur_max / 5))     # most clips if all avg 5s
-    clips_min = min(clips_min, clips_max - 1)
-    clips_per_group = f"{clips_min}-{clips_max}"
-    
-    # More narration: 1-2 events (1 hook + 0-1 commentary) — quality over quantity
-    narr_min = 1
-    narr_max = 2
-    narration_per_group = f"{narr_min}-{narr_max}"
 
-    logger.info(f"DURATION-DRIVEN TARGETS for {source_duration:.1f}s video: "
-                f"{min_groups}-{max_groups} groups, clips: {clips_per_group}, narration: {narration_per_group}, duration: {reel_duration_target}s (min {reel_dur_min}s per group)")
+    # ── Python: semantic blocks + importance ──
+    blocks = _build_semantic_blocks(rich_timeline, transcript)
+    blocks_text = _format_blocks_for_llm(blocks)
 
-    prompt = _build_reel_plan_prompt(
-        video_title, description, transcript_text,
-        min_groups=min_groups, max_groups=max_groups,
-        clips_per_group=clips_per_group,
-        narration_per_group=narration_per_group,
-        reel_duration_target=reel_duration_target,
-        source_duration=source_duration,
-        has_rich_timeline=has_rich_timeline,
+    # Precomputed usable hints for structure planner (no LLM math)
+    regions = [
+        ("early", 0.0, source_duration * 0.25),
+        ("mid", source_duration * 0.25, source_duration * 0.75),
+        ("late", source_duration * 0.75, source_duration),
+    ]
+    usable_hints = "\n".join(
+        f"  {name}: {start:.0f}-{end:.0f}s → usable≈{_usable_duration(blocks, start, end):.0f}s"
+        for name, start, end in regions
     )
-    logger.debug(f"Prompt length: {len(prompt)} chars, timeline: {len(transcript_text)} chars")
+    # Also coarse whole-video usable
+    whole_usable = _usable_duration(blocks, 0.0, source_duration)
+    usable_hints = f"  whole_video usable≈{whole_usable:.0f}s\n" + usable_hints
 
-    try:
-        raw_content = _call_llm(
-            [
-                {"role": "system", "content": "You must respond with ONLY valid JSON. No explanations, no thinking, no text before or after the JSON object."},
-                {"role": "user", "content": prompt}
-            ],
-            progress_cb,
-            reporter=reporter,
-            interactions=interactions,
-            stage_name="reel_plan",
-        )
-    except Exception as e:
-        raise RuntimeError(f"LLM failed: {e}") from e
+    description = (video_description or "")[:10000]
+    logger.info(
+        f"MULTI-STAGE PLAN source={source_duration:.1f}s max_groups={max_groups} "
+        f"blocks={len(blocks)} duration_target={reel_dur_min}-{reel_dur_max}s"
+    )
 
+    # ── LLM #1 Structure Planner ──
     if progress_cb:
-        progress_cb("Parsing reel plan...", 80)
+        progress_cb("Structure planning...", 20)
+    raw1 = _call_llm(
+        [
+            {"role": "system", "content": "Respond with ONLY valid JSON."},
+            {"role": "user", "content": _prompt_structure_planner(
+                video_title, description, blocks_text, source_duration, max_groups, usable_hints
+            )},
+        ],
+        progress_cb, reporter, interactions, stage_name="structure_planner",
+    )
+    structure = _parse_json_response(raw1)
+    sa = structure.get("structure_analysis", structure)
+    logger.info(
+        f"STRUCTURE: type={sa.get('video_type')} groups={sa.get('final_group_count')} "
+        f"reason={sa.get('reasoning')}"
+    )
 
-    try:
-        raw_json = _extract_json_object(raw_content)
-        # Try to parse — if it fails, attempt repair
-        try:
-            reel_plan = json.loads(raw_json)
-        except json.JSONDecodeError:
-            repaired = _try_repair_truncated_json(raw_json)
-            if repaired:
-                logger.info("Repaired malformed JSON from LLM")
-                reel_plan = json.loads(repaired)
-            else:
-                raise
-        truncated = raw_json[:500].encode('ascii', 'replace').decode()
-        logger.debug(f"Raw LLM reel_plan: {truncated}...")
-    except Exception as e:
-        logger.warning(f"First LLM response failed to parse: {e}")
-        raw_preview = raw_content[:2000].encode('ascii','replace').decode()
-        logger.debug(f"Raw content (first attempt): {raw_preview}")
+    # ── LLM #2 Clip Planner ──
+    if progress_cb:
+        progress_cb("Selecting clips...", 45)
+    raw2 = _call_llm(
+        [
+            {"role": "system", "content": "Respond with ONLY valid JSON."},
+            {"role": "user", "content": _prompt_clip_planner(
+                video_title, structure, blocks_text, source_duration, reel_dur_min, reel_dur_max
+            )},
+        ],
+        progress_cb, reporter, interactions, stage_name="clip_planner",
+    )
+    clips_plan = _parse_json_response(raw2)
+    groups = clips_plan.get("reel_groups", [])
+    if not groups:
+        raise RuntimeError("Clip planner returned no reel_groups")
+
+    # Strip any narration the clip planner may have hallucinated
+    for g in groups:
+        g.pop("narration_events", None)
+
+    # ── LLM #3 Narration Writer ──
+    if progress_cb:
+        progress_cb("Writing narration...", 65)
+    raw3 = _call_llm(
+        [
+            {"role": "system", "content": "Respond with ONLY valid JSON."},
+            {"role": "user", "content": _prompt_narration_writer(video_title, groups)},
+        ],
+        progress_cb, reporter, interactions, stage_name="narration_writer",
+    )
+    narr_plan = _parse_json_response(raw3)
+    narr_by_idx = {
+        g.get("group_index", i): g.get("narration_events", [])
+        for i, g in enumerate(narr_plan.get("reel_groups", []))
+    }
+    for i, g in enumerate(groups):
+        idx = g.get("group_index", i)
+        g["narration_events"] = narr_by_idx.get(idx, [])
+
+    # Assemble draft
+    draft = {
+        "structure_analysis": sa,
+        "ranked_segments": clips_plan.get("ranked_segments", []),
+        "reel_groups": groups,
+        "explanations": clips_plan.get("explanations", []),
+    }
+
+    # ── LLM #4 Critic (one revision) ──
+    from backend.config import FAST_MODE
+    if not FAST_MODE:
         if progress_cb:
-            progress_cb("LLM returned non-JSON. Retrying with stricter constraints...", 40)
-
-        raw_content_retry = _call_llm(
-            [
-                {
-                    "role": "user",
-                    "content": prompt + "\n\nCRITICAL: Output ONLY the complete JSON object. No additional text. Do not truncate."
-                }
-            ],
-            progress_cb,
-            reporter=reporter,
-            interactions=interactions,
-            stage_name="reel_plan_retry",
-        )
-
+            progress_cb("Critic pass...", 80)
         try:
-            raw_json = _extract_json_object(raw_content_retry)
-            try:
-                reel_plan = json.loads(raw_json)
-            except json.JSONDecodeError:
-                repaired = _try_repair_truncated_json(raw_json)
-                if repaired:
-                    logger.info("Repaired malformed JSON from LLM retry")
-                    reel_plan = json.loads(repaired)
-                else:
-                    raise
-            retry_truncated = raw_json[:500].encode('ascii', 'replace').decode()
-            logger.debug(f"Raw LLM reel_plan (retry): {retry_truncated}...")
-        except Exception as e2:
-            retry_preview = raw_content_retry[:2000].encode('ascii','replace').decode()
-            logger.debug(f"Raw content (retry attempt): {retry_preview}")
-            raise RuntimeError(f"LLM failed: LLM output could not be parsed as valid JSON ({e2})") from e2
+            raw4 = _call_llm(
+                [
+                    {"role": "system", "content": "Respond with ONLY valid JSON."},
+                    {"role": "user", "content": _prompt_critic(draft, reel_dur_min, reel_dur_max)},
+                ],
+                progress_cb, reporter, interactions, stage_name="critic",
+            )
+            revised = _parse_json_response(raw4)
+            if isinstance(revised.get("reel_groups"), list) and revised["reel_groups"]:
+                draft = revised
+                if "structure_analysis" not in draft:
+                    draft["structure_analysis"] = sa
+                logger.info("Critic applied revisions")
+            else:
+                logger.info("Critic returned empty groups — keeping draft")
+        except Exception as e:
+            logger.warning(f"Critic pass failed, keeping draft: {e}")
+    else:
+        if progress_cb:
+            progress_cb("Skipping critic (FAST_MODE)...", 80)
+        logger.info("FAST_MODE: skipping critic pass")
 
-    if not isinstance(reel_plan, dict) or "reel_groups" not in reel_plan:
-        raise RuntimeError(f"LLM failed: LLM output missing 'reel_groups' key: {reel_plan}")
-
-    groups = reel_plan["reel_groups"]
-    if not isinstance(groups, list) or len(groups) == 0:
-        raise RuntimeError(f"LLM failed: 'reel_groups' must be a non-empty array, got {type(groups)}")
-
+    # Validate shape
+    groups = draft.get("reel_groups", [])
+    if not isinstance(groups, list) or not groups:
+        raise RuntimeError("Final plan missing reel_groups")
     for i, group in enumerate(groups):
         if not isinstance(group, dict):
-            raise RuntimeError(f"LLM failed: Group {i} must be an object")
-        if "source_clips" not in group or not isinstance(group["source_clips"], list) or len(group["source_clips"]) == 0:
-            raise RuntimeError(f"LLM failed: Group {i} missing valid 'source_clips'")
+            raise RuntimeError(f"Group {i} must be an object")
+        if not group.get("source_clips"):
+            raise RuntimeError(f"Group {i} missing source_clips")
         if "narration_events" not in group or not isinstance(group["narration_events"], list):
-            raise RuntimeError(f"LLM failed: Group {i} missing valid 'narration_events'")
+            group["narration_events"] = []
 
-    # Soft log if group count differs from target
-    if len(groups) < min_groups:
-        logger.info(f"LLM returned {len(groups)} groups (target was {min_groups}-{max_groups}). Accepting.")
-    elif len(groups) > max_groups:
-        logger.info(f"LLM returned {len(groups)} groups (target was {min_groups}-{max_groups}). Accepting.")
+    logger.info(f"LLM returned {len(groups)} groups (ceiling {max_groups})")
 
-    # ===== DETERMINISTIC VALIDATION (Python owns this) =====
-    # All clip bounds, timing, overlaps, narration, duration, and dedup validation
-    # is performed by plan_validator — the LLM is NOT responsible for any of this.
-    reel_plan = finalize_edit(reel_plan, source_duration)
+    # ── Python validator owns final numbers ──
+    if progress_cb:
+        progress_cb("Validating plan...", 90)
+    reel_plan = finalize_edit(draft, source_duration)
 
     if progress_cb:
         progress_cb(f"Built reel plan with {len(reel_plan.reel_groups)} group(s)", 100)
 
-    # Log key stats
     total_clips = sum(len(g.source_clips) for g in reel_plan.reel_groups)
-    total_narrations = sum(len(g.narration_events) for g in reel_plan.reel_groups)
-    avg_duration = sum(g.estimated_duration_seconds for g in reel_plan.reel_groups) / max(len(reel_plan.reel_groups), 1)
-    logger.info(f"REEL PLAN STATS: {len(reel_plan.reel_groups)} groups, {total_clips} total clips, "
-                f"{total_narrations} total narrations, avg duration {avg_duration:.1f}s")
+    total_narr = sum(len(g.narration_events) for g in reel_plan.reel_groups)
+    avg_dur = sum(g.estimated_duration_seconds for g in reel_plan.reel_groups) / max(
+        len(reel_plan.reel_groups), 1
+    )
+    logger.info(
+        f"REEL PLAN STATS: {len(reel_plan.reel_groups)} groups, {total_clips} clips, "
+        f"{total_narr} narrations, avg duration {avg_dur:.1f}s"
+    )
 
-    # Broadcast final interactions state
     if reporter and interactions is not None:
-        reporter.set_stage_data_key("llm_interactions", [i.model_dump() for i in interactions])
+        reporter.set_stage_data_key(
+            "llm_interactions", [i.model_dump() for i in interactions]
+        )
 
     return reel_plan
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Legacy flat clip selection (unchanged API)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _format_full_transcript(transcript: list) -> str:
+    if not transcript:
+        return ""
+    lines = []
+    for i, entry in enumerate(transcript):
+        start = entry.get("start", 0.0)
+        end = entry.get("end", 0.0)
+        text = entry.get("text", "").strip()
+        if text:
+            lines.append(f"Seg {i} [{start:.1f}-{end:.1f}s]: {text}")
+    return "\n".join(lines)
 
 
 def _normalize_clip_range(transcript: list, start_seg: int, end_seg: int) -> tuple[int, int]:
     max_idx = len(transcript) - 1
     start_seg = min(max(start_seg, 0), max_idx)
     end_seg = min(max(end_seg, start_seg), max_idx)
-
     while transcript[end_seg]["end"] - transcript[start_seg]["start"] < CLIP_DURATION_SOFT_MIN:
-        can_expand_after = end_seg < max_idx
-        can_expand_before = start_seg > 0
-        if can_expand_after:
+        if end_seg < max_idx:
             end_seg += 1
-        elif can_expand_before:
+        elif start_seg > 0:
             start_seg -= 1
         else:
             break
-
     while transcript[end_seg]["end"] - transcript[start_seg]["start"] > CLIP_DURATION_SOFT_MAX and end_seg > start_seg:
-        remove_after_duration = transcript[end_seg - 1]["end"] - transcript[start_seg]["start"]
-        remove_before_duration = transcript[end_seg]["end"] - transcript[start_seg + 1]["start"]
-        if abs(remove_after_duration - CLIP_DURATION_SOFT_MAX) <= abs(remove_before_duration - CLIP_DURATION_SOFT_MAX):
+        remove_after = transcript[end_seg - 1]["end"] - transcript[start_seg]["start"]
+        remove_before = transcript[end_seg]["end"] - transcript[start_seg + 1]["start"]
+        if abs(remove_after - CLIP_DURATION_SOFT_MAX) <= abs(remove_before - CLIP_DURATION_SOFT_MAX):
             end_seg -= 1
         else:
             start_seg += 1
-
     return start_seg, end_seg
 
 
@@ -865,114 +923,80 @@ def select_clips(
     """Legacy flat clip selection (kept for compatibility)."""
     if progress_cb:
         progress_cb("Preparing transcript for analysis...", 10)
-
     if not transcript:
         raise RuntimeError("Transcript is empty; cannot select clips.")
 
     transcript_text = _format_full_transcript(transcript)
-
     description = (video_description or "")[:500]
-
     if progress_cb:
         progress_cb("Sending transcript to LLM for clip selection...", 30)
 
-    prompt = f"""You are a JSON-only output machine. You MUST output ONLY valid JSON. No explanations, no thinking, no text before or after.
+    prompt = f"""You are a JSON-only output machine. Output ONLY valid JSON.
 
-Given the video title: {video_title}
-And description: {description[:500]}
+Video title: {video_title}
+Description: {description[:500]}
 
-Transcript (segment index: [start-end] text):
+Transcript:
 {transcript_text}
 
-Select {CLIP_COUNT_MIN}-{CLIP_COUNT_MAX} standalone short-form moments. Each selected range should be {CLIP_DURATION_SOFT_MIN:.0f}-{CLIP_DURATION_SOFT_MAX:.0f} seconds when possible.
+Select {CLIP_COUNT_MIN}-{CLIP_COUNT_MAX} moments, each ~{CLIP_DURATION_SOFT_MIN:.0f}-{CLIP_DURATION_SOFT_MAX:.0f}s.
+Hard cap {MAX_OUTPUT_DURATION}s total including hooks/insights.
 
-Choose moments that will make sense after a 3-second hook, then the original clip, then a short topical insight. Prefer moments with clear stakes, contrast, surprising claims, useful explanations, or a payoff. Do NOT pick random fragments or single sentences without context.
-
-The final edit has a hard cap of {MAX_OUTPUT_DURATION} seconds. Estimate each moment as clip duration + {HOOK_SECONDS:.0f}s hook + up to {INSIGHT_SECONDS_MAX:.0f}s insight.
-
-Output this EXACT format with NO other text:
 [
-  {{"start_segment": 0, "end_segment": 2, "topic": "specific topic", "why_it_hooks": "why viewers care", "payoff": "what the viewer learns", "reason": "brief reason"}},
-  {{"start_segment": 5, "end_segment": 7, "topic": "specific topic", "why_it_hooks": "why viewers care", "payoff": "what the viewer learns", "reason": "brief reason"}}
+  {{"start_segment": 0, "end_segment": 2, "topic": "...", "why_it_hooks": "...", "payoff": "...", "reason": "..."}}
 ]"""
 
-    try:
-        raw_content = _call_llm(
-            [
-                {"role": "system", "content": "You must respond with ONLY valid JSON. No explanations, no thinking, no text before or after the JSON."},
-                {"role": "user", "content": prompt}
-            ],
-            progress_cb,
-        )
-    except Exception as e:
-        raise RuntimeError(f"LLM failed: {e}") from e
+    raw_content = _call_llm(
+        [
+            {"role": "system", "content": "Respond with ONLY valid JSON."},
+            {"role": "user", "content": prompt},
+        ],
+        progress_cb,
+        stage_name="legacy_clips",
+    )
 
     def _extract_json_array(text: str) -> str:
         t = text.strip()
         if t.startswith("```json"):
-            t = t[len("```json") :].strip()
+            t = t[len("```json"):].strip()
         if t.startswith("```"):
-            t = t[len("```") :].strip()
+            t = t[len("```"):].strip()
         if t.endswith("```"):
-            t = t[: -len("```")].strip()
-
+            t = t[:-3].strip()
         m = re.search(r"\[[\s\S]*\]", t)
         if not m:
-            raise ValueError("No JSON array found in LLM response.")
+            raise ValueError("No JSON array found")
         return m.group(0).strip()
 
     if progress_cb:
         progress_cb("Parsing clip selections...", 80)
-
     try:
-        raw_json_array = _extract_json_array(raw_content)
-        clip_data = json.loads(raw_json_array)
-    except Exception as e:
-        if progress_cb:
-            progress_cb("LLM returned non-JSON. Retrying with stricter output constraints...", 40)
-
-        raw_content_retry = _call_llm(
-            [
-                {
-                    "role": "user",
-                    "content": prompt + "\n\nCRITICAL: Output ONLY the JSON array. Nothing else."
-                }
-            ],
+        clip_data = json.loads(_extract_json_array(raw_content))
+    except Exception:
+        raw_retry = _call_llm(
+            [{"role": "user", "content": prompt + "\n\nCRITICAL: ONLY the JSON array."}],
             progress_cb,
+            stage_name="legacy_clips_retry",
         )
-
-        try:
-            raw_json_array = _extract_json_array(raw_content_retry)
-            clip_data = json.loads(raw_json_array)
-        except Exception as e2:
-            raise RuntimeError(f"LLM failed: Unable to parse valid JSON array from LLM response ({e2})") from e2
+        clip_data = json.loads(_extract_json_array(raw_retry))
 
     if not isinstance(clip_data, list):
-        raise RuntimeError(f"Expected JSON array, got {type(clip_data)}\nRaw: {raw_content}")
+        raise RuntimeError("Expected JSON array")
 
     clips = []
     for item in clip_data:
         if not isinstance(item, dict):
-            raise RuntimeError(f"Expected object in array, got {type(item)}\nRaw: {raw_content}")
-
-        start_seg = item.get("start_segment")
-        end_seg = item.get("end_segment")
-
+            continue
+        start_seg, end_seg = item.get("start_segment"), item.get("end_segment")
         if not isinstance(start_seg, int) or not isinstance(end_seg, int):
-            raise RuntimeError(f"start_segment and end_segment must be integers\nRaw: {raw_content}")
+            continue
         start_seg, end_seg = _normalize_clip_range(transcript, start_seg, end_seg)
-
         actual_start = transcript[start_seg]["start"]
         actual_end = transcript[end_seg]["end"]
         duration = actual_end - actual_start
-        planned_duration = duration + HOOK_SECONDS + INSIGHT_SECONDS_MAX
-        if sum((c["end"] - c["start"]) + HOOK_SECONDS + INSIGHT_SECONDS_MAX for c in clips) + planned_duration > MAX_OUTPUT_DURATION:
-            logger.info(f"Skipping clip {start_seg}-{end_seg}; planned output would exceed {MAX_OUTPUT_DURATION}s")
+        planned = duration + HOOK_SECONDS + INSIGHT_SECONDS_MAX
+        if sum((c["end"] - c["start"]) + HOOK_SECONDS + INSIGHT_SECONDS_MAX for c in clips) + planned > MAX_OUTPUT_DURATION:
             continue
-
-        if duration < CLIP_DURATION_SOFT_MIN or duration > CLIP_DURATION_SOFT_MAX:
-            logger.warning(f"Clip {start_seg}-{end_seg} duration {duration:.1f}s outside soft range [{CLIP_DURATION_SOFT_MIN}-{CLIP_DURATION_SOFT_MAX}]")
-
         clips.append({
             "start": actual_start,
             "end": actual_end,
@@ -986,5 +1010,4 @@ Output this EXACT format with NO other text:
 
     if progress_cb:
         progress_cb(f"Selected {len(clips)} clips", 100)
-
     return clips

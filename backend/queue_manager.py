@@ -312,11 +312,11 @@ class QueueManager:
                         analyzer_progress, reporter, llm_interactions,
                         rich_timeline=job.rich_timeline,
                     ),
-                    timeout=1200.0,
+                    timeout=2700.0,
                 )
             except asyncio.TimeoutError:
                 raise RuntimeError(
-                    "ANALYZING exceeded 20-minute hard ceiling — LLM never responded "
+                    "ANALYZING exceeded 45-minute hard ceiling — LLM never responded "
                     "in time even after retries. Check NVIDIA API status."
                 )
             ckpt.save_stage("analyze", {"reel_plan": reel_plan.model_dump()})

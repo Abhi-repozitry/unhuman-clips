@@ -234,6 +234,30 @@ async def health_check():
     }
 
 
+# --- Mode config endpoints ---
+
+class ModeRequest(BaseModel):
+    mode: str  # "quality" or "fast"
+
+
+@app.get("/config/mode")
+async def get_mode():
+    """Return current processing mode."""
+    import backend.config as cfg
+    return {"mode": "fast" if cfg.FAST_MODE else "quality"}
+
+
+@app.put("/config/mode")
+async def set_mode(body: ModeRequest):
+    """Switch between quality and fast processing modes."""
+    import backend.config as cfg
+    if body.mode not in ("quality", "fast"):
+        return JSONResponse(status_code=400, content={"error": "mode must be 'quality' or 'fast'"})
+    cfg.FAST_MODE = body.mode == "fast"
+    logger.info("Processing mode set to: %s", body.mode)
+    return {"mode": body.mode, "fast_mode": cfg.FAST_MODE}
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await connection_manager.connect(websocket)

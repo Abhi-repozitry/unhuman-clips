@@ -3,6 +3,7 @@
 All configurable values are read from environment variables with sensible defaults.
 validate_config() is called automatically on import to check critical paths and ranges.
 """
+
 from __future__ import annotations
 
 import logging
@@ -52,6 +53,7 @@ NVIDIA_API_KEY = os.environ.get("NVIDIA_API_KEY")
 NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
 NVIDIA_MODEL = os.environ.get("NVIDIA_MODEL", "openai/gpt-oss-120b")
 NVIDIA_MODEL_FALLBACK = os.environ.get("NVIDIA_MODEL_FALLBACK", "openai/gpt-oss-120b")
+
 MAX_INPUT_TOKENS = int(os.environ.get("MAX_INPUT_TOKENS", "80000"))
 MAX_OUTPUT_TOKENS = int(os.environ.get("MAX_OUTPUT_TOKENS", "16384"))
 REASONING_EFFORT = os.environ.get("REASONING_EFFORT", "high")
@@ -75,7 +77,6 @@ FFMPEG_PATH = r"C:\Projects\unhuman-clips\ffmpeg\ffmpeg-8.1.2-full_build\bin\ffm
 FFPROBE_PATH = r"C:\Projects\unhuman-clips\ffmpeg\ffmpeg-8.1.2-full_build\bin\ffprobe.exe"
 
 TTS_VOICE = os.environ.get("TTS_VOICE", "en-US-ChristopherNeural")
-
 CAPTION_FONT_SIZE = 64
 CAPTION_FONT = "Arial"
 

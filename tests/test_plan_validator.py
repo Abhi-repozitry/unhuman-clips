@@ -172,3 +172,20 @@ class TestFinalizeEdit:
         sample_reel_plan_dict["explanations"] = ["Test explanation"]
         plan = finalize_edit(sample_reel_plan_dict, source_duration=60.0)
         assert len(plan.explanations) == 1
+
+    def test_preserves_structure_analysis(self, sample_reel_plan_dict):
+        plan = finalize_edit(sample_reel_plan_dict, source_duration=60.0)
+        assert plan.structure_analysis is not None
+        assert plan.structure_analysis.video_type == "documentary"
+        assert plan.structure_analysis.final_group_count == 1
+
+    def test_works_without_structure_analysis(self, sample_reel_plan_dict):
+        sample_reel_plan_dict.pop("structure_analysis", None)
+        plan = finalize_edit(sample_reel_plan_dict, source_duration=60.0)
+        assert plan.structure_analysis is None
+
+    def test_ignores_unknown_top_level_keys(self, sample_reel_plan_dict):
+        sample_reel_plan_dict["unknown_key"] = "should not break"
+        sample_reel_plan_dict["another_random"] = 42
+        plan = finalize_edit(sample_reel_plan_dict, source_duration=60.0)
+        assert isinstance(plan, ReelPlan)

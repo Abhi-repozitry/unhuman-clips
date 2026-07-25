@@ -14,8 +14,8 @@ __all__ = ["generate_clip_ass", "generate_commentary_ass"]
 
 
 # Caption sizes (4:5, 1080x1350)
-CLIP_CAPTION_SIZE = 56       # Larger than before (was 48 default)
-COMMENTARY_CAPTION_SIZE = 64  # Larger than before (was 48+8=56)
+CLIP_CAPTION_SIZE = 44
+COMMENTARY_CAPTION_SIZE = 52
 
 # Key words to highlight with color
 KEY_WORDS = {

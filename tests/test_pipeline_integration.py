@@ -18,6 +18,7 @@ from backend.models import (
     ReelPlan,
     ReelSummary,
     SourceClip,
+    StructureAnalysis,
     VideoJob,
 )
 
@@ -29,6 +30,12 @@ from backend.models import (
 def _make_reel_plan() -> ReelPlan:
     """Build a valid ReelPlan for integration testing."""
     return ReelPlan(
+        structure_analysis=StructureAnalysis(
+            video_type="documentary",
+            identified_units=[{"name": "Unit 1", "approx_start": 0.0, "approx_end": 60.0, "usable_seconds": 55, "kept": True}],
+            final_group_count=1,
+            reasoning="Single continuous narrative.",
+        ),
         reel_groups=[
             ReelGroup(
                 group_index=0,
@@ -66,6 +73,30 @@ class TestPipelineIntegration:
         restored = ReelPlan.model_validate(data)
         assert len(restored.reel_groups) == 1
         assert restored.reel_groups[0].reel_summary.title == "Integration Test Reel"
+
+    def test_structure_analysis_roundtrip(self):
+        """StructureAnalysis survives serialization roundtrip."""
+        plan = _make_reel_plan()
+        data = plan.model_dump()
+        restored = ReelPlan.model_validate(data)
+        assert restored.structure_analysis is not None
+        assert restored.structure_analysis.video_type == "documentary"
+        assert restored.structure_analysis.final_group_count == 1
+        assert len(restored.structure_analysis.identified_units) == 1
+
+    def test_structure_analysis_optional(self):
+        """ReelPlan works without structure_analysis."""
+        plan = ReelPlan(reel_groups=[
+            ReelGroup(
+                group_index=0, group_reasoning="test", estimated_duration_seconds=90.0,
+                reel_summary=ReelSummary(title="T", source_understanding="S", narrative_angle="N", key_moment="K"),
+                source_clips=[SourceClip(source_start=0.0, source_end=5.0, reason="hook")],
+                narration_events=[],
+            )
+        ])
+        data = plan.model_dump()
+        restored = ReelPlan.model_validate(data)
+        assert restored.structure_analysis is None
 
     def test_transcript_to_reel_plan_flow(self):
         """Simulate: transcript -> analyzer -> reel plan -> clip windows."""

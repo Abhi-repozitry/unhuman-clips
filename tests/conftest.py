@@ -59,6 +59,14 @@ def short_transcript() -> list[dict]:
 def sample_reel_plan_dict() -> dict:
     """A valid reel plan dict matching the LLM JSON schema."""
     return {
+        "structure_analysis": {
+            "video_type": "documentary",
+            "identified_units": [
+                {"name": "Unit 1", "approx_start": 0.0, "approx_end": 60.0, "usable_seconds": 55, "kept": True},
+            ],
+            "final_group_count": 1,
+            "reasoning": "Single continuous narrative.",
+        },
         "reel_groups": [
             {
                 "group_index": 0,

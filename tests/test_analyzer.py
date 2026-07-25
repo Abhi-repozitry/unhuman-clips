@@ -1,4 +1,4 @@
-"""Tests for backend.pipeline.analyzer — original planner prompt, JSON extraction/repair, transcript formatting."""
+"""Tests for backend.pipeline.analyzer — multi-stage helpers, JSON extraction/repair, transcript formatting."""
 from __future__ import annotations
 
 import json
@@ -7,9 +7,11 @@ import pytest
 
 from backend.models import FFmpegMetrics, RichTimeline, RichTimelineSegment
 from backend.pipeline.analyzer import (
+    _compute_group_count_ceiling,
+    _compute_importance,
     _extract_json_object,
+    _format_blocks_for_llm,
     _format_full_transcript,
-    _format_rich_timeline,
     _normalize_clip_range,
     _try_repair_truncated_json,
 )
@@ -44,65 +46,96 @@ class TestFormatFullTranscript:
         assert "Seg 2" in result
 
 
-class TestFormatRichTimeline:
-    """Test _format_rich_timeline metadata formatting."""
+class TestComputeImportance:
+    """Test deterministic importance scoring."""
 
-    def test_empty_timeline(self):
-        timeline = RichTimeline()
-        assert _format_rich_timeline(timeline) == ""
+    def test_high_energy_high_score(self):
+        score = _compute_importance(0.9, -10.0, False, False, False, False)
+        assert score > 50.0
 
-    def test_includes_energy(self):
-        timeline = RichTimeline(
-            segments=[
-                RichTimelineSegment(
-                    segment_id=0, start=0.0, end=5.0, duration=5.0,
-                    speech="Hello world", speech_energy=0.8,
-                ),
-            ],
-        )
-        result = _format_rich_timeline(timeline)
-        assert "energy=" in result
-        assert "Hello world" in result
+    def test_low_energy_low_score(self):
+        score = _compute_importance(0.1, -40.0, False, False, False, False)
+        assert score < 20.0
 
-    def test_includes_ocr(self):
-        timeline = RichTimeline(
-            segments=[
-                RichTimelineSegment(
-                    segment_id=0, start=0.0, end=5.0, duration=5.0,
-                    speech="test", speech_energy=0.5,
-                    ocr=["BANNER TEXT"],
-                ),
-            ],
-        )
-        result = _format_rich_timeline(timeline)
-        assert "OCR: BANNER TEXT" in result
+    def test_ocr_boosts_score(self):
+        base = _compute_importance(0.5, -20.0, False, False, False, False)
+        with_ocr = _compute_importance(0.5, -20.0, True, False, False, False)
+        assert with_ocr > base
 
-    def test_includes_metrics(self):
-        timeline = RichTimeline(
-            segments=[
-                RichTimelineSegment(
-                    segment_id=0, start=0.0, end=5.0, duration=5.0,
-                    speech="test", speech_energy=0.5,
-                    metrics=FFmpegMetrics(volume_db=-10.0, black_frame=True),
-                ),
-            ],
-        )
-        result = _format_rich_timeline(timeline)
-        assert "vol=-10.0dB" in result
-        assert "BLACK_FRAME" in result
+    def test_black_frame_penalizes(self):
+        base = _compute_importance(0.5, -20.0, False, False, False, False)
+        with_black = _compute_importance(0.5, -20.0, False, False, True, False)
+        assert with_black < base
 
-    def test_includes_silence_before(self):
-        timeline = RichTimeline(
-            segments=[
-                RichTimelineSegment(
-                    segment_id=0, start=0.0, end=5.0, duration=5.0,
-                    speech="test", speech_energy=0.5,
-                    silence_before=True,
-                ),
-            ],
-        )
-        result = _format_rich_timeline(timeline)
-        assert "[SILENCE_BEFORE]" in result
+    def test_score_clamped_0_100(self):
+        score = _compute_importance(1.0, 0.0, True, True, False, False)
+        assert 0.0 <= score <= 100.0
+
+    def test_silence_before_boosts(self):
+        base = _compute_importance(0.5, None, False, False, False, False)
+        with_silence = _compute_importance(0.5, None, False, True, False, False)
+        assert with_silence > base
+
+
+class TestComputeGroupCountCeiling:
+    """Test group count ceiling based on source duration."""
+
+    def test_short_video_returns_2(self):
+        assert _compute_group_count_ceiling(90.0) == 2  # 1.5 min
+
+    def test_medium_video_returns_4(self):
+        assert _compute_group_count_ceiling(300.0) == 4  # 5 min
+
+    def test_long_video_returns_6(self):
+        assert _compute_group_count_ceiling(480.0) == 6  # 8 min
+
+    def test_very_long_video_returns_8(self):
+        assert _compute_group_count_ceiling(900.0) == 8  # 15 min
+
+    def test_huge_video_returns_10(self):
+        assert _compute_group_count_ceiling(1800.0) == 10  # 30 min
+
+    def test_boundary_2min(self):
+        assert _compute_group_count_ceiling(120.0) == 2  # exactly 2 min
+
+    def test_boundary_5min(self):
+        assert _compute_group_count_ceiling(300.0) == 4  # exactly 5 min
+
+    def test_boundary_10min(self):
+        assert _compute_group_count_ceiling(600.0) == 6  # exactly 10 min
+
+    def test_boundary_20min(self):
+        assert _compute_group_count_ceiling(1200.0) == 8  # exactly 20 min
+
+
+class TestFormatBlocksForLlm:
+    """Test block formatting for LLM prompt."""
+
+    def test_empty_blocks(self):
+        assert _format_blocks_for_llm([]) == ""
+
+    def test_includes_block_info(self):
+        from backend.pipeline.analyzer import SemanticBlock
+        blocks = [SemanticBlock(
+            block_id=0, start=0.0, end=5.0, text="hello world",
+            speech_energy=0.8, volume_db=-10.0, ocr=[], silence_before=False,
+            black_frame=False, freeze=False, importance=75.0, peak_offset=2.5,
+        )]
+        result = _format_blocks_for_llm(blocks)
+        assert "Block 0" in result
+        assert "hello world" in result
+
+    def test_top_n_emphasis(self):
+        from backend.pipeline.analyzer import SemanticBlock
+        blocks = [
+            SemanticBlock(block_id=i, start=float(i*10), end=float(i*10+5),
+                          text=f"block {i}", speech_energy=0.5, volume_db=None,
+                          ocr=[], silence_before=False, black_frame=False,
+                          freeze=False, importance=float(i*10), peak_offset=0.0)
+            for i in range(5)
+        ]
+        result = _format_blocks_for_llm(blocks, top_n=2)
+        assert "TOP-2" in result
 
 
 class TestExtractJsonObject:

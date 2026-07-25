@@ -15,7 +15,7 @@ from typing import Callable
 import edge_tts
 
 from backend.config import TTS_VOICE
-from backend.ffmpeg_utils import get_ffprobe
+from backend.ffmpeg_utils import get_ffmpeg, get_ffprobe
 
 __all__ = ["synthesize_commentary"]
 
@@ -86,6 +86,27 @@ def synthesize_commentary(
                     f"edge-tts produced a suspiciously small/empty file "
                     f"({size} bytes) for text: {text[:60]!r}"
                 )
+
+            # edge-tts outputs MP3 format but we need WAV for soundfile/VAD.
+            # Convert the MP3 to proper WAV using ffmpeg.
+            tmp_mp3 = out_path + ".tmp.mp3"
+            os.replace(out_path, tmp_mp3)
+            try:
+                subprocess.run(
+                    [
+                        get_ffmpeg(), "-loglevel", "error",
+                        "-i", tmp_mp3,
+                        "-c:a", "pcm_s16le", "-ar", "16000", "-ac", "1",
+                        "-y", out_path,
+                    ],
+                    check=True, capture_output=True, text=True, timeout=30,
+                )
+            finally:
+                try:
+                    os.unlink(tmp_mp3)
+                except OSError:
+                    pass
+
             break
         except Exception as e:
             last_error = e
