@@ -530,7 +530,8 @@ class GroupOrchestrator:
         logger.info("Cleaned up partial artifacts for group %d", group_idx)
 
     async def run_group(
-        self, group_idx: int, group: ReelGroup, reporter: Any, source_path: str
+        self, group_idx: int, group: ReelGroup, reporter: Any, source_path: str,
+        generate_captions: bool = True
     ) -> str:
         """Run the full pipeline for one group with automatic retry.
 
@@ -543,6 +544,7 @@ class GroupOrchestrator:
             group: The ReelGroup to process.
             reporter: ProgressReporter for status updates.
             source_path: Path to the source video file.
+            generate_captions: If False, skip clip captions (bottom subtitles).
 
         Returns:
             Path to the final output video.
@@ -568,9 +570,32 @@ class GroupOrchestrator:
 
                 group_clip_paths = await self.run_clipping(group_idx, group, reporter, source_path)
                 group_narration_audio, _ = await self.run_tts(group_idx, group, reporter, working_dir)
-                group_clip_captions, group_narration_captions = await self.run_captioning(
-                    group_idx, group, reporter, working_dir, group_narration_audio
-                )
+
+                if generate_captions:
+                    group_clip_captions, group_narration_captions = await self.run_captioning(
+                        group_idx, group, reporter, working_dir, group_narration_audio
+                    )
+                else:
+                    reporter.log_info(f"Group {group_idx+1}: Skipping clip captions (generate_captions=False)")
+                    group_clip_captions = []
+                    group_narration_captions = []
+                    # Still generate commentary captions (top) even when clip captions are skipped
+                    for i, nar in enumerate(group_narration_audio):
+                        narr_caption_path = working_dir / f"group_{group_idx}_narr_caption_{i}.ass"
+                        await asyncio.to_thread(
+                            generate_commentary_ass,
+                            nar["text"],
+                            nar["duration"],
+                            str(narr_caption_path),
+                            lambda msg, prog: None,
+                            nar["reel_start"],
+                        )
+                        group_narration_captions.append({
+                            "event_type": nar["event_type"],
+                            "reel_start": nar["reel_start"],
+                            "reel_end": nar["reel_end"],
+                            "path": str(narr_caption_path),
+                        })
                 group_output_path = await self.run_compositing(
                     group_idx, group, reporter, working_dir,
                     group_clip_paths, group_narration_audio,

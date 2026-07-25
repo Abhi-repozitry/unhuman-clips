@@ -74,9 +74,9 @@ class QueueManager:
         except queue.Full:
             pass  # Drop oldest under backpressure
 
-    def add_job(self, url: str) -> VideoJob:
+    def add_job(self, url: str, generate_captions: bool = True) -> VideoJob:
         """Create a new job, enqueue it, and return the job object."""
-        job = VideoJob(url=url)
+        job = VideoJob(url=url, generate_captions=generate_captions)
         self.jobs[job.id] = job
         self.queue.put_nowait(job.id)
         # Immediately enqueue a broadcast so the frontend sees the new job
@@ -372,7 +372,7 @@ class QueueManager:
 
         for group_idx, group in enumerate(reel_plan.reel_groups):
             self.enqueue_broadcast(job)
-            await orchestrator.run_group(group_idx, group, reporter, job.source_path)
+            await orchestrator.run_group(group_idx, group, reporter, job.source_path, job.generate_captions)
             self.enqueue_broadcast(job)
 
         job.status = JobStatus.DONE

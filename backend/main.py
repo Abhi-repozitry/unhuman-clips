@@ -146,6 +146,7 @@ FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend" / "renderer"
 
 class CreateJobRequest(BaseModel):
     url: str
+    generate_captions: bool = True
 
 
 def _check_rate_limit() -> bool:
@@ -174,7 +175,7 @@ async def create_job(body: CreateJobRequest):
             status_code=429,
             content={"error": "Rate limit exceeded. Try again later."},
         )
-    job = queue_manager.add_job(body.url)
+    job = queue_manager.add_job(body.url, generate_captions=body.generate_captions)
     return job
 
 

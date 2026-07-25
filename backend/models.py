@@ -179,3 +179,4 @@ class VideoJob(BaseModel):
     audio_download_stats: dict | None = None
     num_output_groups: int = 1
     current_group_index: int = 0
+    generate_captions: bool = True

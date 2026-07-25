@@ -364,26 +364,57 @@ TIER 3 — SUPPORTING (use MEDIUM clips to bridge TIER 1-2 moments):
 
 EXCLUDE entirely: filler, greetings, repetitive explanations, low-energy passages, generic statements, transitions without substance.
 
-===== STRICT GROUP SEPARATION (CRITICAL) =====
-DO NOT force the video into multiple output groups. If the entire video can be presented as ONE compelling reel for the audience, produce ONLY 1 group. Multiple groups are ONLY for videos with genuinely distinct, unrelated topics. One cohesive video = one group. Do NOT artificially split content.
+===== GROUPING STRATEGY (CRITICAL — THINK CAREFULLY) =====
+Your goal is to maximize total audience retention across ALL output reels. More groups = more content = more reach, BUT only if each group is strong enough to stand alone.
 
-Each group MUST tell a COMPLETELY DIFFERENT STORY about a DIFFERENT TOPIC or ASPECT of the video. Groups are NOT interchangeable highlights — each has a unique narrative.
+HOW TO ANALYZE THE VIDEO FOR GROUPS:
+1. First, identify the video's STRUCTURE:
+   - Challenge/competition videos: Each challenge round = 1 story arc. "Who can X?" → participants compete → winner revealed. MrBeast, game shows, sports, cooking competitions.
+   - Listicle/countdown videos: Each item = 1 story arc. "Top 10 X" → item 1 → item 2 → ...
+   - Interview/podcast: Each topic discussed = 1 story arc. Question → answer → reaction → next topic.
+   - Educational/explainer: Usually 1 story arc (one cohesive lesson). MAYBE 2-3 if covering distinct sub-topics.
+   - Vlog/lifestyle: Different activities or locations may = different story arcs.
+   - Documentary: Each segment/chapter = 1 story arc.
 
-HOW TO DETERIMINE GROUPS:
-- Identify the DISTINCT TOPICS or STORY ARCS in the video. A topic = a self-contained story, argument, demonstration, or theme.
-- If the video covers ONE cohesive topic, produce ONLY 1 group. Do NOT split one topic into multiple groups.
-- If the video covers 2 different topics, produce 2 groups. If 3 topics, 3 groups. And so on.
-- Each group should focus on ONE topic and tell its complete story (setup → conflict → payoff).
-- When in doubt, produce FEWER groups. One great reel beats two mediocre ones.
+2. For EACH identified story arc, identify its SUB-CONTENTS:
+   - Challenge video: each challenge round = 1 sub-content
+   - Listicle: each item = 1 sub-content
+   - Interview: each question/topic = 1 sub-content
+   - Competition: each round/match = 1 sub-content
+   - Vlog: each distinct activity or location = 1 sub-content
 
-CROSS-GROUP UNIQUENESS RULES:
+3. DECISION RULE:
+   - Each sub-content that has enough usable footage (30s+) to fill a 90-150s reel = 1 group
+   - If a sub-content is too short (<30s of usable content), merge it with an adjacent sub-content
+   - If a video has 6 challenges → up to 6 groups
+   - If a video has 3 podcast topics → up to 3 groups
+   - NEVER produce 0 groups. ALWAYS produce at least 1.
+   - NEVER artificially inflate group count. Each group must come from a genuinely distinct sub-content.
+
+CROSS-GROUP RULES:
 - Maximum 20% clip time overlap between any two groups.
-- If Group 1 uses a moment at 45.0-55.0s, Group 2 CANNOT use any clip overlapping that range UNLESS it's genuinely part of the same content moment.
-- Each group's narrative_angle MUST reference a DIFFERENT topic, theme, or aspect of the video.
+- Each group's narrative_angle MUST reference a DIFFERENT story arc or aspect.
 - Each group's key_moment MUST be from a DIFFERENT part of the video.
-- If two groups would naturally use the same clips, MERGE them into one group instead.
+- If two groups would naturally use the same clips, MERGE them into one group.
+
+EXAMPLES OF WHEN TO CREATE MULTIPLE GROUPS:
+- MrBeast "World's Strongest Man Vs Robot": 6 challenges = up to 6 groups (each challenge is a sub-content unit)
+- "Top 10 Scariest Moments": 10 items = up to max_groups groups (each moment is a sub-content unit)
+- Podcast with 3 guest segments: 3 groups (each segment is a sub-content unit)
+- Cooking competition with 3 rounds: 3 groups (each round is a sub-content unit)
+
+EXAMPLES OF WHEN TO CREATE 1 GROUP:
+- Tutorial video teaching one skill: 1 group
+- Single continuous vlog with no break points: 1 group
+- Documentary covering one event: 1 group
+- Short video (<3min) with one story: 1 group
 
 ===== DURATION BUDGET (THE MOST IMPORTANT SECTION) =====
+HARD RULE: Every output reel MUST be between {dur_min}-{dur_max} seconds. NO exceptions.
+- {dur_min} seconds is the ABSOLUTE MINIMUM. If your selection is shorter, ADD MORE CLIPS.
+- {dur_max} seconds is the ABSOLUTE MAXIMUM. If your selection is longer, REMOVE CLIPS.
+- Target: aim for {dur_min + 30}-{dur_max - 20} seconds to have buffer room.
+
 Your PRIMARY constraint is TOTAL DURATION, not clip count.
 
 Duration math:
@@ -396,7 +427,9 @@ Target: estimated_duration should be {dur_min}-{dur_max} seconds.
 - Clips alone should sum to {dur_min - 5}s to {dur_max - 5}s.
 - DO NOT add narration duration to clip duration — narration is overlaid, not appended.
 - DO NOT pad clips to fill time. Pick the RIGHT clips, then calculate duration.
-- If your selection is under {dur_min}s, add more clips. If over {dur_max}s, remove clips.
+- If your selection is under {dur_min}s, ADD MORE CLIPS until you reach {dur_min}s.
+- If your selection is over {dur_max}s, REMOVE CLIPS until you are under {dur_max}s.
+- NEVER produce a reel shorter than {dur_min} seconds. This is a hard minimum.
 
 PACING RULES (instead of rigid HOOK/BUILD/PAYOFF template):
 1. Open with energy: first 2 clips should be SHORT or MEDIUM — never start with a long clip.
@@ -415,10 +448,10 @@ Transcript (segment index [timestamp]):
 {transcript_text}
 
 ===== MANDATORY OUTPUT =====
-- Output {min_groups}-{max_groups} reel_groups ONLY if the video has distinct topics that warrant separate reels.
-- If the video is one cohesive topic, output EXACTLY 1 group. Do NOT force multiple groups.
-- Each group tells a DIFFERENT story arc about a DIFFERENT topic.
-- When in doubt, produce FEWER groups. One great reel > two mediocre ones.
+- Analyze the video structure first, THEN decide how many groups to produce.
+- Output {min_groups}-{max_groups} reel_groups. Each group tells a DIFFERENT story arc.
+- If the video has multiple distinct story arcs (challenges, segments, topics), produce multiple groups.
+- If the video is one cohesive story with no natural break points, produce 1 group.
 - Groups MUST be spread across the FULL video timeline — NOT clustered in the first few minutes.
 - Timeline coverage is MANDATORY:
   * Early zone: 0.0s - {early_end:.0f}s (at least 1-2 clips from here)
@@ -495,18 +528,19 @@ Use contractions. Be conversational. Be specific.
 
 ===== SELF-VERIFICATION (MANDATORY) =====
 Before outputting, you MUST verify:
-1. Are you FORCING multiple groups when the video is one topic? If YES: merge into 1 group.
-2. total_clip_duration = sum of (source_end - source_start) for all clips
-3. estimated_duration = total_clip_duration + 2.0 (narration OVERLAPS clips, does NOT add to duration)
-4. estimated_duration >= {dur_min}? If NO: add more clips until YES.
-5. estimated_duration <= {dur_max}? If NO: remove clips or shorten clips until YES.
-6. Clips span early/middle/late zones? If NO: replace clips to fix coverage.
-7. Clip length mix: Are there SHORT + MEDIUM + LONG clips? (not all same length)
-8. Rhythm check: No back-to-back LONG clips? No 3+ SHORT clips in a row?
-9. Maximum 2 narration events (1 hook + 0-1 commentary)? If more: REMOVE the weakest.
-10. Each commentary event has a persona assigned? If not: assign one from the PERSONA SYSTEM.
-11. First clip has "is_hook_clip": true and is 1-4 seconds? If not: FIX IT.
-12. estimated_duration_seconds = estimated_duration from step 3.
+1. Did you identify the sub-contents (challenges, items, segments) in the video?
+2. Is your group count justified by the number of sub-contents you found?
+3. total_clip_duration = sum of (source_end - source_start) for all clips
+4. estimated_duration = total_clip_duration + 2.0 (narration OVERLAPS clips, does NOT add to duration)
+5. estimated_duration >= {dur_min}? If NO: ADD MORE CLIPS until you reach {dur_min}s. NEVER produce a reel shorter than {dur_min}s.
+6. estimated_duration <= {dur_max}? If NO: REMOVE CLIPS until you are under {dur_max}s.
+7. Clips span early/middle/late zones? If NO: replace clips to fix coverage.
+8. Clip length mix: Are there SHORT + MEDIUM + LONG clips? (not all same length)
+9. Rhythm check: No back-to-back LONG clips? No 3+ SHORT clips in a row?
+10. Maximum 2 narration events (1 hook + 0-1 commentary)? If more: REMOVE the weakest.
+11. Each commentary event has a persona assigned? If not: assign one from the PERSONA SYSTEM.
+12. First clip has "is_hook_clip": true and is 1-4 seconds? If not: FIX IT.
+13. estimated_duration_seconds = estimated_duration from step 4.
 
 ===== OUTPUT (STRICT JSON ONLY) =====
 Output ONLY valid JSON. No markdown. No explanation.
@@ -636,21 +670,20 @@ def select_reel_plan(
 
     # Compute per-group specs proportional to source duration
     
-    # AGGRESSIVE DURATION TARGETS: aim for 90-150s per group as the primary target
-    # For very short source videos (< 150s), target 60-90% of source duration
-    # For longer sources (>= 150s), target 90-150s
-    if source_duration < 120:
-        # Short source: target 60-90% but min 45s
-        reel_dur_min = max(45, int(source_duration * 0.6))
-        reel_dur_max = min(int(source_duration * 0.9), 120)
-    elif source_duration < 300:
-        # Medium source: target 90-150s
-        reel_dur_min = max(60, min(90, int(source_duration * 0.5)))
-        reel_dur_max = min(150, int(source_duration * 0.8))
-    else:
-        # Long source (5+ min): target 90-150s hardcore
+    # HARD MINIMUM: 90 seconds (1:30). HARD MAXIMUM: 180 seconds (2:00).
+    # Every output reel MUST be between 90-180 seconds. No exceptions.
+    if source_duration < 90:
+        # Very short source: use as much as possible but cap at source duration
+        reel_dur_min = max(45, int(source_duration * 0.8))
+        reel_dur_max = min(int(source_duration * 0.95), 90)
+    elif source_duration < 180:
+        # Short-medium source: target 90s to source_duration
         reel_dur_min = 90
-        reel_dur_max = 150
+        reel_dur_max = min(int(source_duration * 0.95), 180)
+    else:
+        # Normal source (3+ min): always 90-180s
+        reel_dur_min = 90
+        reel_dur_max = 180
     
     # Ensure at least 30s spread between min/max
     if reel_dur_max - reel_dur_min < 30:
