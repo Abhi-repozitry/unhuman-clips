@@ -5,7 +5,6 @@ import json
 
 import pytest
 
-from backend.models import FFmpegMetrics, RichTimeline, RichTimelineSegment
 from backend.pipeline.analyzer import (
     _compute_group_count_ceiling,
     _compute_group_count_floor,
@@ -14,6 +13,8 @@ from backend.pipeline.analyzer import (
     _format_blocks_for_llm,
     _format_full_transcript,
     _normalize_clip_range,
+    _rank_hook_candidates,
+    _score_clip_as_hook,
     _try_repair_truncated_json,
 )
 
@@ -305,3 +306,205 @@ class TestNormalizeClipRange:
         start, end = _normalize_clip_range(transcript, 0, 0)
         assert start == 0
         assert end == 0
+
+
+class TestSemanticBlockFields:
+    """Test new SemanticBlock fields and summary_line output."""
+
+    def test_question_flag_in_summary(self):
+        from backend.pipeline.analyzer import SemanticBlock
+        block = SemanticBlock(
+            block_id=0, start=0.0, end=5.0, text="What happens next?",
+            speech_energy=0.8, volume_db=-10.0, ocr=[], silence_before=False,
+            black_frame=False, freeze=False, importance=75.0, peak_offset=2.5,
+            has_question=True,
+        )
+        result = block.summary_line()
+        assert "[Q]" in result
+
+    def test_exclamation_flag_in_summary(self):
+        from backend.pipeline.analyzer import SemanticBlock
+        block = SemanticBlock(
+            block_id=0, start=0.0, end=5.0, text="Unbelievable!",
+            speech_energy=0.8, volume_db=-10.0, ocr=[], silence_before=False,
+            black_frame=False, freeze=False, importance=75.0, peak_offset=2.5,
+            has_exclamation=True,
+        )
+        result = block.summary_line()
+        assert "[!]" in result
+
+    def test_emphasis_flag_in_summary(self):
+        from backend.pipeline.analyzer import SemanticBlock
+        block = SemanticBlock(
+            block_id=0, start=0.0, end=5.0, text="This is INCREDIBLE",
+            speech_energy=0.8, volume_db=-10.0, ocr=[], silence_before=False,
+            black_frame=False, freeze=False, importance=75.0, peak_offset=2.5,
+            has_emphasis=True,
+        )
+        result = block.summary_line()
+        assert "[CAPS]" in result
+
+    def test_word_density_in_summary(self):
+        from backend.pipeline.analyzer import SemanticBlock
+        block = SemanticBlock(
+            block_id=0, start=0.0, end=5.0, text="fast talking here",
+            speech_energy=0.8, volume_db=-10.0, ocr=[], silence_before=False,
+            black_frame=False, freeze=False, importance=75.0, peak_offset=2.5,
+            word_density=3.2,
+        )
+        result = block.summary_line()
+        assert "wps=3.2" in result
+
+    def test_multiple_flags_combined(self):
+        from backend.pipeline.analyzer import SemanticBlock
+        block = SemanticBlock(
+            block_id=0, start=0.0, end=5.0, text="WHAT?!",
+            speech_energy=0.8, volume_db=-10.0, ocr=[], silence_before=True,
+            black_frame=False, freeze=False, importance=75.0, peak_offset=2.5,
+            has_question=True, has_exclamation=True, has_emphasis=True, word_density=2.0,
+        )
+        result = block.summary_line()
+        assert "Q" in result
+        assert "!" in result
+        assert "CAPS" in result
+        assert "SILENCE_BEFORE" in result
+        assert "wps=2.0" in result
+
+
+class TestScoreClipAsHook:
+    """Test hook clip scoring."""
+
+    def _make_block(self, **kwargs):
+        from backend.pipeline.analyzer import SemanticBlock
+        defaults = dict(
+            block_id=0, start=0.0, end=5.0, text="test",
+            speech_energy=0.5, volume_db=None, ocr=[], silence_before=False,
+            black_frame=False, freeze=False, importance=50.0, peak_offset=0.0,
+        )
+        defaults.update(kwargs)
+        return SemanticBlock(**defaults)
+
+    def test_question_block_scores_higher(self):
+        clip = {"source_start": 0.0, "source_end": 5.0}
+        block_no_q = self._make_block(has_question=False)
+        block_with_q = self._make_block(has_question=True)
+        assert _score_clip_as_hook(clip, [block_with_q]) > _score_clip_as_hook(clip, [block_no_q])
+
+    def test_silence_before_boosts(self):
+        clip = {"source_start": 0.0, "source_end": 5.0}
+        block_no_silence = self._make_block(silence_before=False)
+        block_with_silence = self._make_block(silence_before=True)
+        assert _score_clip_as_hook(clip, [block_with_silence]) > _score_clip_as_hook(clip, [block_no_silence])
+
+    def test_shorter_clip_scores_higher(self):
+        block = self._make_block()
+        clip_short = {"source_start": 0.0, "source_end": 3.0}
+        clip_long = {"source_start": 0.0, "source_end": 20.0}
+        assert _score_clip_as_hook(clip_short, [block]) > _score_clip_as_hook(clip_long, [block])
+
+    def test_non_start_position_scores_higher(self):
+        from backend.pipeline.analyzer import SemanticBlock
+        # Block spans 5-15s so it overlaps both clips
+        block = SemanticBlock(
+            block_id=0, start=5.0, end=15.0, text="test",
+            speech_energy=0.5, volume_db=None, ocr=[], silence_before=False,
+            black_frame=False, freeze=False, importance=50.0, peak_offset=0.0,
+        )
+        # Clip at start (0-5s) doesn't overlap the block
+        clip_start = {"source_start": 0.0, "source_end": 5.0}
+        # Clip later (5-15s) overlaps the block and starts after 3.0s
+        clip_later = {"source_start": 5.0, "source_end": 15.0}
+        score_start = _score_clip_as_hook(clip_start, [block])
+        score_later = _score_clip_as_hook(clip_later, [block])
+        assert score_later > score_start
+
+    def test_no_blocks_returns_zero(self):
+        clip = {"source_start": 0.0, "source_end": 5.0}
+        assert _score_clip_as_hook(clip, []) == 0.0
+
+
+class TestRankHookCandidates:
+    """Test hook clip re-ranking."""
+
+    def test_swaps_to_better_hook(self):
+        from backend.pipeline.analyzer import SemanticBlock
+        blocks = [
+            SemanticBlock(
+                block_id=0, start=0.0, end=5.0, text="boring intro",
+                speech_energy=0.3, volume_db=None, ocr=[], silence_before=False,
+                black_frame=False, freeze=False, importance=30.0, peak_offset=0.0,
+            ),
+            SemanticBlock(
+                block_id=1, start=10.0, end=15.0, text="What happens next?!",
+                speech_energy=0.9, volume_db=-10.0, ocr=[], silence_before=True,
+                black_frame=False, freeze=False, importance=85.0, peak_offset=2.0,
+                has_question=True, has_exclamation=True,
+            ),
+        ]
+        groups = [{
+            "group_index": 0,
+            "source_clips": [
+                {"source_start": 0.0, "source_end": 5.0, "is_hook_clip": True},
+                {"source_start": 10.0, "source_end": 15.0, "is_hook_clip": False},
+            ],
+        }]
+        swaps = _rank_hook_candidates(groups, blocks)
+        assert swaps == 1
+        assert groups[0]["source_clips"][0]["is_hook_clip"] is False
+        assert groups[0]["source_clips"][1]["is_hook_clip"] is True
+
+    def test_no_swap_when_current_is_best(self):
+        from backend.pipeline.analyzer import SemanticBlock
+        blocks = [
+            SemanticBlock(
+                block_id=0, start=0.0, end=5.0, text="Amazing hook?!",
+                speech_energy=0.9, volume_db=-10.0, ocr=[], silence_before=True,
+                black_frame=False, freeze=False, importance=90.0, peak_offset=1.0,
+                has_question=True, has_exclamation=True,
+            ),
+            SemanticBlock(
+                block_id=1, start=10.0, end=15.0, text="boring middle",
+                speech_energy=0.3, volume_db=None, ocr=[], silence_before=False,
+                black_frame=False, freeze=False, importance=30.0, peak_offset=0.0,
+            ),
+        ]
+        groups = [{
+            "group_index": 0,
+            "source_clips": [
+                {"source_start": 0.0, "source_end": 5.0, "is_hook_clip": True},
+                {"source_start": 10.0, "source_end": 15.0, "is_hook_clip": False},
+            ],
+        }]
+        swaps = _rank_hook_candidates(groups, blocks)
+        assert swaps == 0
+        assert groups[0]["source_clips"][0]["is_hook_clip"] is True
+
+    def test_single_clip_group_skipped(self):
+        groups = [{
+            "group_index": 0,
+            "source_clips": [
+                {"source_start": 0.0, "source_end": 5.0, "is_hook_clip": True},
+            ],
+        }]
+        swaps = _rank_hook_candidates(groups, [])
+        assert swaps == 0
+
+    def test_no_hook_clip_in_group(self):
+        groups = [{
+            "group_index": 0,
+            "source_clips": [
+                {"source_start": 0.0, "source_end": 5.0, "is_hook_clip": False},
+                {"source_start": 10.0, "source_end": 15.0, "is_hook_clip": False},
+            ],
+        }]
+        swaps = _rank_hook_candidates(groups, [])
+        assert swaps == 0
+
+    def test_empty_groups_list(self):
+        swaps = _rank_hook_candidates([], [])
+        assert swaps == 0
+
+    def test_empty_clip_list_in_group(self):
+        groups = [{"group_index": 0, "source_clips": []}]
+        swaps = _rank_hook_candidates(groups, [])
+        assert swaps == 0

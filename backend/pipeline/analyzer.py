@@ -35,12 +35,15 @@ from backend.config import (
     CLIP_DURATION_SOFT_MIN,
     HOOK_SECONDS,
     INSIGHT_SECONDS_MAX,
+    MAX_INPUT_TOKENS,
     MAX_OUTPUT_DURATION,
+    MAX_OUTPUT_TOKENS,
     MIN_OUTPUT_DURATION,
     NVIDIA_API_KEY,
     NVIDIA_BASE_URL,
     NVIDIA_MODEL,
     NVIDIA_MODEL_FALLBACK,
+    REASONING_EFFORT,
 )
 from backend.models import LLMInteraction, ReelPlan, RichTimeline
 from backend.pipeline.plan_validator import finalize_edit
@@ -71,6 +74,10 @@ class SemanticBlock:
     importance: float
     peak_offset: float  # seconds from block start to peak energy moment
     segment_ids: list[int] = field(default_factory=list)
+    has_question: bool = False
+    has_exclamation: bool = False
+    has_emphasis: bool = False
+    word_density: float = 0.0
 
     @property
     def duration(self) -> float:
@@ -86,12 +93,19 @@ class SemanticBlock:
             flags.append("BLACK")
         if self.freeze:
             flags.append("FREEZE")
+        if self.has_question:
+            flags.append("Q")
+        if self.has_exclamation:
+            flags.append("!")
+        if self.has_emphasis:
+            flags.append("CAPS")
         flag_str = f" [{', '.join(flags)}]" if flags else ""
         vol = f" vol={self.volume_db:.1f}dB" if self.volume_db is not None else ""
+        wps = f" wps={self.word_density:.1f}" if self.word_density > 0 else ""
         return (
             f"Block {self.block_id} [{self.start:.1f}-{self.end:.1f}s] "
             f"imp={self.importance:.0f} energy={energy_bar}({self.speech_energy:.2f})"
-            f"{vol} peak=+{self.peak_offset:.1f}s{flag_str}: "
+            f"{vol} peak=+{self.peak_offset:.1f}s{wps}{flag_str}: "
             f"{self.text[:220]}{ocr_str}"
         )
 
@@ -152,6 +166,10 @@ def _build_semantic_blocks(
                 "silence_before": bool(getattr(seg, "silence_before", False)),
                 "black": bool(getattr(seg.metrics, "black_frame", False)) if hasattr(seg, "metrics") else False,
                 "freeze": bool(getattr(seg.metrics, "freeze_detected", False)) if hasattr(seg, "metrics") else False,
+                "has_question": bool(getattr(seg, "has_question", False)),
+                "has_exclamation": bool(getattr(seg, "has_exclamation", False)),
+                "has_emphasis": bool(getattr(seg, "has_emphasis", False)),
+                "word_density": float(getattr(seg, "word_density", 0.0) or 0.0),
             })
     else:
         items = []
@@ -167,6 +185,10 @@ def _build_semantic_blocks(
                 "silence_before": False,
                 "black": False,
                 "freeze": False,
+                "has_question": False,
+                "has_exclamation": False,
+                "has_emphasis": False,
+                "word_density": 0.0,
             })
 
     if not items:
@@ -196,6 +218,11 @@ def _build_semantic_blocks(
         silence_before = group[0]["silence_before"]
         black = any(g["black"] for g in group)
         freeze = any(g["freeze"] for g in group)
+        has_question = any(g["has_question"] for g in group)
+        has_exclamation = any(g["has_exclamation"] for g in group)
+        has_emphasis = any(g["has_emphasis"] for g in group)
+        word_densities = [g["word_density"] for g in group if g["word_density"] > 0]
+        avg_word_density = sum(word_densities) / len(word_densities) if word_densities else 0.0
         importance = _compute_importance(
             avg_energy, volume_db, bool(ocr), silence_before, black, freeze
         )
@@ -213,6 +240,10 @@ def _build_semantic_blocks(
             importance=importance,
             peak_offset=peak_offset,
             segment_ids=[g["id"] for g in group],
+            has_question=has_question,
+            has_exclamation=has_exclamation,
+            has_emphasis=has_emphasis,
+            word_density=avg_word_density,
         ))
 
     for item in items[1:]:
@@ -265,6 +296,109 @@ def _usable_duration(blocks: list[SemanticBlock], start: float, end: float) -> f
     return total
 
 
+def _score_clip_as_hook(
+    clip: dict,
+    blocks: list[SemanticBlock],
+) -> float:
+    """Score a clip's suitability as a hook (0-100). Higher = better hook.
+
+    Factors:
+    - Blocks with questions or exclamations in the clip range
+    - SILENCE_BEFORE on the first block (clean entry point)
+    - High importance blocks
+    - Shorter duration (fast hooks)
+    - Position not at the very start (curiosity gap > intro)
+    """
+    clip_start = clip.get("source_start", 0.0)
+    clip_end = clip.get("source_end", 0.0)
+    clip_duration = clip_end - clip_start
+
+    score = 0.0
+    blocks_in_clip = [
+        b for b in blocks
+        if b.end > clip_start and b.start < clip_end
+    ]
+    if not blocks_in_clip:
+        return 0.0
+
+    # Question/exclamation density (curiosity signals)
+    q_count = sum(1 for b in blocks_in_clip if b.has_question)
+    e_count = sum(1 for b in blocks_in_clip if b.has_exclamation)
+    score += min(30.0, (q_count * 15.0) + (e_count * 10.0))
+
+    # Clean entry (silence before first block in clip)
+    first_block = min(blocks_in_clip, key=lambda b: b.start)
+    if first_block.silence_before:
+        score += 15.0
+
+    # Average importance of blocks in clip
+    avg_imp = sum(b.importance for b in blocks_in_clip) / len(blocks_in_clip)
+    score += avg_imp * 0.25  # 0-25 points
+
+    # Shorter clips make better hooks (faster payoff)
+    if clip_duration <= 5.0:
+        score += 15.0
+    elif clip_duration <= 10.0:
+        score += 8.0
+    elif clip_duration <= 15.0:
+        score += 3.0
+
+    # Not at the very start (curiosity gap)
+    if clip_start > 3.0:
+        score += 10.0
+
+    return min(100.0, score)
+
+
+def _rank_hook_candidates(
+    groups: list[dict],
+    blocks: list[SemanticBlock],
+) -> int:
+    """Re-evaluate hook clip choices. Returns number of hook swaps made.
+
+    For each group, if another clip scores higher as a hook than the
+    currently marked hook clip, swap the hook flag. Max 1 swap per group.
+    """
+    swaps = 0
+    for group in groups:
+        clips = group.get("source_clips", [])
+        if len(clips) < 2:
+            continue
+
+        hook_idx = None
+        for i, c in enumerate(clips):
+            if c.get("is_hook_clip", False):
+                hook_idx = i
+                break
+        if hook_idx is None:
+            continue
+
+        current_hook = clips[hook_idx]
+        current_score = _score_clip_as_hook(current_hook, blocks)
+
+        best_idx = hook_idx
+        best_score = current_score
+        for i, c in enumerate(clips):
+            if i == hook_idx:
+                continue
+            s = _score_clip_as_hook(c, blocks)
+            if s > best_score:
+                best_score = s
+                best_idx = i
+
+        if best_idx != hook_idx:
+            clips[hook_idx]["is_hook_clip"] = False
+            clips[best_idx]["is_hook_clip"] = True
+            swaps += 1
+            logger.info(
+                f"Hook swap in group {group.get('group_index', '?')}: "
+                f"block {current_hook.get('source_start', 0):.1f}s (score={current_score:.0f}) "
+                f"-> block {clips[best_idx].get('source_start', 0):.1f}s (score={best_score:.0f})"
+            )
+
+    return swaps
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # LLM plumbing
 # ─────────────────────────────────────────────────────────────────────────────
@@ -275,6 +409,8 @@ def _call_llm(
     reporter: Any = None,
     interactions: list[LLMInteraction] | None = None,
     stage_name: str = "reel_plan",
+    max_tokens: int = MAX_OUTPUT_TOKENS,
+    reasoning_effort: str = REASONING_EFFORT,
 ) -> str:
     if not NVIDIA_API_KEY:
         raise RuntimeError(
@@ -295,11 +431,12 @@ def _call_llm(
                 api_key=NVIDIA_API_KEY,
                 base_url=NVIDIA_BASE_URL,
                 temperature=0.0,
-                max_tokens=131072,
+                max_tokens=max_tokens,
                 timeout=480.0,
                 reporter=reporter,
                 interactions=interactions,
                 stage_name=stage_name,
+                reasoning_effort=reasoning_effort,
             )
             if reporter and interactions is not None:
                 reporter.set_stage_data_key(
@@ -386,8 +523,51 @@ def _extract_json_object(text: str) -> str:
         t = t[len("```"):].strip()
     if t.endswith("```"):
         t = t[:-len("```")].strip()
+    # Strip <thinking> blocks from reasoning models
+    t = re.sub(r"<thinking>[\s\S]*?</thinking>\s*", "", t, flags=re.IGNORECASE)
+    t = re.sub(r"<think>[\s\S]*?</think>\s*", "", t, flags=re.IGNORECASE)
+    t = t.strip()
+    # Try to find the LAST valid JSON object (reasoning models prepend thinking text)
+    last_brace = t.rfind("}")
+    last_bracket = t.rfind("]")
+    end_pos = max(last_brace, last_bracket)
+    if end_pos >= 0:
+        # Walk backwards from end to find matching open brace/bracket
+        # When walking backwards: } increments depth, { decrements it
+        close_ch = "}" if last_brace > last_bracket else "]"
+        open_ch = "{" if close_ch == "}" else "["
+        depth = 0
+        in_string = False
+        escape = False
+        for i in range(end_pos, -1, -1):
+            ch = t[i]
+            if escape:
+                escape = False
+                continue
+            if ch == '\\' and in_string:
+                escape = True
+                continue
+            if ch == '"':
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if ch == close_ch:
+                depth += 1
+            elif ch == open_ch:
+                depth -= 1
+                if depth == 0:
+                    candidate = t[i:end_pos + 1]
+                    try:
+                        json.loads(candidate)
+                        return candidate
+                    except json.JSONDecodeError:
+                        break
+        logger.debug("Backward JSON extraction failed, trying forward scan")
+    # Fallback: scan forward for first complete JSON object
     m = re.search(r"\{[\s\S]*\}", t)
     if not m:
+        logger.error(f"No JSON object found in LLM response (length={len(text)}). Preview: {text[:300]}")
         raise ValueError("No JSON object found in LLM response.")
     return m.group(0).strip()
 
@@ -496,8 +676,8 @@ GROUPING RULES
    - Setup: what is established or promised
    - Conflict: what tension or challenge builds
    - Peak: the climax, reveal, or payoff
-   - Resolution: how it lands (reaction, aftermath)
-3. A unit is ONLY a group if it has a complete arc (setup → peak at minimum).
+   - Resolution: the actual outcome, winner reveal, result, or aftermath (REQUIRED — every unit must end by showing what happened)
+3. A unit is ONLY a group if it has a complete arc (setup → peak → resolution).
 4. If a section has setup but no payoff, merge it with adjacent content that provides the payoff.
 5. Never split a challenge/contest if the climax immediately follows — keep them as one unit.
 6. Never combine two unrelated climaxes into one group — they are separate stories.
@@ -505,6 +685,7 @@ GROUPING RULES
 8. Avoid groups that are just "introduction" or "setup" with no payoff.
 9. The max groups ({max_groups}) is a hard limit. Fewer strong groups always beats more weak ones.
 10. Produce {min_groups}-{max_groups} groups if content supports it. ALWAYS produce at least {min_groups} group(s).
+11. Every group MUST end at or after the moment the viewer sees the outcome. If a challenge ends at 5:00, the group must extend past 5:00 to capture the result.
 
 THINK INTERNALLY about each unit's arc before outputting. Only output the final boundaries.
 
@@ -534,10 +715,15 @@ def _prompt_clip_planner(
     source_duration: float,
     dur_min: int,
     dur_max: int,
+    top_blocks_hint: str = "",
 ) -> str:
     units = structure.get("identified_units", [])
     kept = [u for u in units if u.get("kept", True)]
     units_json = json.dumps(kept, ensure_ascii=False, indent=2)
+
+    top_section = ""
+    if top_blocks_hint:
+        top_section = f"\nTOP BLOCKS BY IMPORTANCE (use these to anchor your strongest clips):\n{top_blocks_hint}\n"
 
     return f"""You are a senior YouTube Shorts clip editor.
 Your ONLY job: select the strongest source clips for each group defined by the structure plan.
@@ -554,7 +740,7 @@ KEPT UNITS:
 
 SEMANTIC BLOCKS (imp = importance 0-100, peak = best moment offset):
 {blocks_text}
-
+{top_section}
 CRITICAL RULE — NO SOURCE OVERLAP
 Every source timestamp may belong to ONE reel only.
 If reel A uses 20.0-35.0s, NO other reel may touch 20.0-35.0s.
@@ -562,11 +748,11 @@ Exception: explicit recap clips (must state "RECAP" in reason).
 Violating this creates duplicate Shorts. This is the #1 rule.
 
 CLIP SELECTION PRIORITIES (ranked)
-1. Curiosity gap — "What happens next?" / "No way..." / unexpected visuals
-2. Emotional peak — crowd gasps, player reactions, shock, celebration
-3. Visual action — motion, spectacle, physical moments
-4. Stakes — what is at risk, what could go wrong
-5. Payoff — result, winner reveal, outcome
+1. Payoff — result, winner reveal, outcome, final moment (MANDATORY for last clip)
+2. Curiosity gap — "What happens next?" / "No way..." / unexpected visuals
+3. Emotional peak — crowd gasps, player reactions, shock, celebration
+4. Visual action — motion, spectacle, physical moments
+5. Stakes — what is at risk, what could go wrong
 6. Surprise — twist, reversal, unexpected result
 NEVER choose a clip just because it comes next in the transcript.
 Dialogue continuity does NOT matter. Impact does.
@@ -575,8 +761,9 @@ CLIP STORY ARC — every reel must contain within its clips:
 - Hook: the curiosity trigger (first clip)
 - Escalation: tension building (middle clips)
 - Peak: the climax or reveal (later clip)
-- Resolution: how it lands (optional final clip)
-If you cannot achieve this arc, merge or expand clips until you can.
+- Resolution: the actual outcome/result/winner reveal (REQUIRED final clip — show what happens at the end)
+The Resolution clip is NOT optional. Every reel MUST end by showing what happened.
+Find the exact moment where the winner is declared, the record is broken, the prize is awarded, or the challenge concludes. This is the payoff the viewer stays for.
 
 HOOK CLIPS — chosen by curiosity, NOT earliest timestamp.
 Search the entire unit for:
@@ -732,16 +919,16 @@ def select_reel_plan(
     max_groups = _compute_group_count_ceiling(source_duration)
     min_groups = _compute_group_count_floor(source_duration)
 
-    # Duration targets
+    # Duration targets — must land between 90-150s for output compliance
     if source_duration < 90:
         reel_dur_min = max(45, int(source_duration * 0.8))
         reel_dur_max = min(int(source_duration * 0.95), 90)
-    elif source_duration < 180:
+    elif source_duration < 150:
         reel_dur_min = 90
-        reel_dur_max = min(int(source_duration * 0.95), 180)
+        reel_dur_max = min(int(source_duration * 0.95), 150)
     else:
         reel_dur_min = 90
-        reel_dur_max = 180
+        reel_dur_max = 150
     if reel_dur_max - reel_dur_min < 30:
         reel_dur_max = reel_dur_min + 30
     reel_dur_max = min(reel_dur_max, int(MAX_OUTPUT_DURATION))
@@ -781,6 +968,7 @@ def select_reel_plan(
             )},
         ],
         progress_cb, reporter, interactions, stage_name="structure_planner",
+        max_tokens=32768,
     )
     structure = _parse_json_response(raw1)
     sa = structure.get("structure_analysis", structure)
@@ -792,14 +980,39 @@ def select_reel_plan(
     # ── LLM #2 Clip Planner ──
     if progress_cb:
         progress_cb("Selecting clips...", 45)
+
+    # Build top-blocks hint per kept unit for the clip planner
+    top_blocks_lines: list[str] = []
+    kept_units = [u for u in sa.get("identified_units", []) if u.get("kept", True)]
+    for unit in kept_units:
+        u_start = unit.get("approx_start", 0.0)
+        u_end = unit.get("approx_end", source_duration)
+        unit_blocks = [
+            b for b in blocks
+            if b.end > u_start and b.start < u_end and not b.black_frame and not b.freeze
+        ]
+        unit_blocks.sort(key=lambda b: b.importance, reverse=True)
+        top5 = unit_blocks[:5]
+        if top5:
+            block_strs = ", ".join(
+                f"Block {b.block_id} (imp={b.importance:.0f}, peak=+{b.peak_offset:.1f}s)"
+                for b in top5
+            )
+            top_blocks_lines.append(
+                f"  {unit.get('name', 'unit')} [{u_start:.0f}-{u_end:.0f}s]: {block_strs}"
+            )
+    top_blocks_hint = "\n".join(top_blocks_lines)
+
     raw2 = _call_llm(
         [
             {"role": "system", "content": "Respond with ONLY valid JSON."},
             {"role": "user", "content": _prompt_clip_planner(
-                video_title, structure, blocks_text, source_duration, reel_dur_min, reel_dur_max
+                video_title, structure, blocks_text, source_duration, reel_dur_min, reel_dur_max,
+                top_blocks_hint=top_blocks_hint,
             )},
         ],
         progress_cb, reporter, interactions, stage_name="clip_planner",
+        max_tokens=65536,
     )
     clips_plan = _parse_json_response(raw2)
     groups = clips_plan.get("reel_groups", [])
@@ -810,15 +1023,21 @@ def select_reel_plan(
     for g in groups:
         g.pop("narration_events", None)
 
+    # ── Python: rank hook candidates ──
+    hook_swaps = _rank_hook_candidates(groups, blocks)
+    if hook_swaps > 0:
+        logger.info(f"Hook ranking: swapped {hook_swaps} hook clip(s)")
+
     # ── LLM #3 Narration Writer ──
     if progress_cb:
         progress_cb("Writing narration...", 65)
     raw3 = _call_llm(
         [
-            {"role": "system", "content": "Respond with ONLY valid JSON."},
+            {"role": "system", "content": "Respond with ONLY valid JSON. Do NOT include any reasoning, thinking, or commentary. Output ONLY the JSON object."},
             {"role": "user", "content": _prompt_narration_writer(video_title, groups)},
         ],
         progress_cb, reporter, interactions, stage_name="narration_writer",
+        max_tokens=16384,
     )
     narr_plan = _parse_json_response(raw3)
     narr_by_idx = {
@@ -849,6 +1068,7 @@ def select_reel_plan(
                     {"role": "user", "content": _prompt_critic(draft, reel_dur_min, reel_dur_max)},
                 ],
                 progress_cb, reporter, interactions, stage_name="critic",
+                max_tokens=32768,
             )
             revised = _parse_json_response(raw4)
             revised_groups = revised.get("reel_groups", [])

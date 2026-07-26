@@ -8,6 +8,7 @@ from typing import Any, Callable
 
 from backend.config import (
     MAX_OUTPUT_DURATION,
+    MIN_CONTENT_DURATION,
     MIN_OUTPUT_DURATION, get_job_working_dir,
 )
 from backend.models import JobStatus, NarrationEvent, ReelGroup, VideoJob
@@ -91,16 +92,24 @@ class GroupOrchestrator:
         self.job.stage_data = {"status": "done", "group_index": group_idx, "clips_cut": len(group_clip_paths)}
         reporter.log_info(f"Group {group_idx+1}: Cut {len(group_clip_paths)} clips")
 
-        # Warn if analyzer under-selected clips
+        # Safety: expand clips if content is still below minimum
         actual_clip_dur = sum(c.source_end - c.source_start for c in group.source_clips)
-        if group.estimated_duration_seconds > 0 and actual_clip_dur < 0.7 * group.estimated_duration_seconds:
-            reporter.log_info(
-                f"[WARN] Group {group_idx+1}: analyzer under-selected clips — "
-                f"actual clip duration {actual_clip_dur:.1f}s is less than 70% of "
-                f"estimated {group.estimated_duration_seconds:.1f}s "
-                f"({actual_clip_dur / group.estimated_duration_seconds * 100:.0f}%). "
-                f"Compositor will extend final clip into remaining source footage."
+        if actual_clip_dur < MIN_CONTENT_DURATION:
+            from backend.pipeline.plan_validator import _expand_clips_to_fill_gap
+            clips_dicts = [c.model_dump() for c in group.source_clips]
+            expanded = _expand_clips_to_fill_gap(
+                clips_dicts,
+                float(self.job.transcript[-1]["end"]) if self.job.transcript else 0.0,
+                MIN_CONTENT_DURATION,
             )
+            if expanded > 0:
+                reporter.log_info(
+                    f"Group {group_idx+1}: Expanded {expanded} clips to meet "
+                    f"minimum content ({MIN_CONTENT_DURATION:.0f}s)"
+                )
+                # Update the group's clips in-place
+                from backend.models import SourceClip
+                group.source_clips = [SourceClip(**c) for c in clips_dicts]
 
         self.ckpt.save_stage(ckpt_key, {"clip_paths": group_clip_paths})
         return group_clip_paths
@@ -240,12 +249,16 @@ class GroupOrchestrator:
         target_dur = max(total_clip_dur, max_nar_end, group.estimated_duration_seconds, float(MIN_OUTPUT_DURATION))
         target_dur = min(target_dur, float(MAX_OUTPUT_DURATION))
 
+        # Use actual clip content duration for narration placement — narration
+        # must land within real content, not within padding/extension zone
+        narration_limit = total_clip_dur
+
         await asyncio.to_thread(
             validate_and_adjust_narration_timings,
             group_narration_audio=group_narration_audio,
             source_clips=group.source_clips,
             transcript=self.job.transcript,
-            target_duration=target_dur,
+            target_duration=narration_limit,
             reporter=reporter,
             group_idx=group_idx,
         )
@@ -426,6 +439,7 @@ class GroupOrchestrator:
             source_path,
             working_dir,
             group.estimated_duration_seconds,
+            float(self.job.transcript[-1]["end"]) if self.job.transcript else 0.0,
             compositor_progress,
         )
 

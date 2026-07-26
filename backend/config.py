@@ -18,6 +18,7 @@ __all__ = [
     "FFMPEG_PATH", "FFPROBE_PATH",
     "NVIDIA_API_KEY", "NVIDIA_BASE_URL", "NVIDIA_MODEL", "NVIDIA_MODEL_FALLBACK",
     "MAX_INPUT_TOKENS", "MAX_OUTPUT_TOKENS",
+    "MIN_CONTENT_DURATION",
     "WHISPER_MODEL_SIZE", "WHISPER_COMPUTE_TYPE_CUDA", "WHISPER_COMPUTE_TYPE_CPU",
     "TTS_VOICE",
 ]
@@ -65,7 +66,10 @@ CLIP_DURATION_SOFT_MAX = float(os.environ.get("CLIP_DURATION_SOFT_MAX", "30"))
 HOOK_SECONDS = float(os.environ.get("HOOK_SECONDS", "3"))
 INSIGHT_SECONDS_MAX = float(os.environ.get("INSIGHT_SECONDS_MAX", "4"))
 MIN_OUTPUT_DURATION = int(os.environ.get("MIN_OUTPUT_DURATION", "90"))
-MAX_OUTPUT_DURATION = int(os.environ.get("MAX_OUTPUT_DURATION", "180"))
+MAX_OUTPUT_DURATION = int(os.environ.get("MAX_OUTPUT_DURATION", "150"))
+# Minimum seconds of actual clip content required per group.
+# Compositor extends last clip into source if clips fall short.
+MIN_CONTENT_DURATION = float(os.environ.get("MIN_CONTENT_DURATION", "85"))
 
 OUTPUT_WIDTH = 1080
 OUTPUT_HEIGHT = 1350
@@ -150,6 +154,12 @@ def validate_config() -> list[str]:
             f"MIN_OUTPUT_DURATION ({MIN_OUTPUT_DURATION}) >= "
             f"MAX_OUTPUT_DURATION ({MAX_OUTPUT_DURATION}). "
             f"Output duration will be capped incorrectly."
+        )
+    if MIN_CONTENT_DURATION > MIN_OUTPUT_DURATION:
+        warnings.append(
+            f"MIN_CONTENT_DURATION ({MIN_CONTENT_DURATION}) > "
+            f"MIN_OUTPUT_DURATION ({MIN_OUTPUT_DURATION}). "
+            f"Clip expansion may not reach target."
         )
 
     # --- Validate numeric ranges ---

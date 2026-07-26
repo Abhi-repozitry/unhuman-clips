@@ -432,12 +432,15 @@ def compose_group(
     source_path: str,
     working_dir: Path,
     estimated_duration_seconds: float = 0.0,
+    source_duration: float = 0.0,
     progress_cb: Callable[[str, float], None] | None = None,
 ) -> dict[str, Any]:
     """Build a single group's output reel.
 
-    Renders continuous video from clips with optional freeze-frame padding,
-    VAD-driven audio ducking during narration, caption overlays, and final mux.
+    Renders continuous video from clips with VAD-driven audio ducking during
+    narration, caption overlays, and final mux.  If clip content is shorter
+    than the target, the last clip is extended into the source video to fill
+    the gap — no freeze-frame padding is used.
 
     Args:
         job_id: Job identifier.
@@ -450,6 +453,7 @@ def compose_group(
         source_path: Path to the source video file.
         working_dir: Working directory for intermediate files.
         estimated_duration_seconds: Target duration from the analyzer.
+        source_duration: Total source video duration in seconds (for extending last clip).
         progress_cb: Optional progress callback.
 
     Returns:
@@ -531,13 +535,6 @@ def compose_group(
     if narration_audio:
         max_narration_end = max(nar.get("reel_end", 0) for nar in narration_audio)
     
-    # IMPROVED TARGET DURATION CALCULATION:
-    # estimated_duration_seconds is the most reliable signal — it represents the
-    # analyzer's intent for how long this reel should be. We respect it as a
-    # strong target, not a hint.
-    #
-    # Priority: estimated_duration_seconds > max_narration_end > total_clip_duration > MIN_OUTPUT_DURATION
-    # We use the HIGHEST of these to ensure nothing gets cut off.
     target_duration = max(
         estimated_duration_seconds,    # Analyzer's intended duration (primary signal)
         max_narration_end,             # Don't cut off narration
@@ -547,66 +544,23 @@ def compose_group(
     target_duration = min(target_duration, float(MAX_OUTPUT_DURATION))
     pad_duration = target_duration - total_clip_duration
 
-    # TARGET DURATION CALCULATION (IMPROVED):
-    # We now respect estimated_duration_seconds as a strong signal, not a weak hint.
-    # MAX_FREEZE_PAD increased to 12s to allow longer freeze-padding on valid long reels.
-    # The analyzer now produces 90-150s groups, so we need to allow proportionally more pad.
-    #
-    # Strategy:
-    # 1. Start with max(total_clip_duration, max_narration_end, estimated_duration_seconds, MIN_OUTPUT_DURATION)
-    # 2. Allow freeze-pad up to MAX_FREEZE_PAD to fill the gap
-    # 3. Clamp to MAX_OUTPUT_DURATION
-    # 4. If pad exceeds MAX_FREEZE_PAD, cap pad to MAX_FREEZE_PAD and let audio run longer via silence
-    
-    MAX_FREEZE_PAD = 12.0  # Increased from 3.0 to allow longer freeze-padding for 90-150s target reels
-    
-    if pad_duration > MAX_FREEZE_PAD:
-        # narration_tail is how far narration reaches past the last video frame.
-        narration_tail = max(0.0, max_narration_end - total_clip_duration)
-        # Allow more pad when there's narration tail to cover, up to MAX_FREEZE_PAD
-        allowed_pad = min(MAX_FREEZE_PAD, max(narration_tail, MAX_FREEZE_PAD * 0.5))
-
-        logger.info(f"Group {group_idx}: clip content ({total_clip_duration:.1f}s) short of "
-                    f"target ({target_duration:.1f}s) — using freeze pad {allowed_pad:.1f}s "
-                    f"(was {pad_duration:.1f}s cap, narration_tail={narration_tail:.1f}s). "
-                    f"Audio will be padded with silence beyond freeze.")
-
-        # Only drop narration events if they'd be lost beyond video+freeze end.
-        # Previously we capped at total_clip_duration + allowed_pad, but now with
-        # larger pad allowance we can accommodate more narration without dropping.
-        capped_limit = total_clip_duration + allowed_pad
-        truncated_events = [
-            nar for nar in narration_audio
-            if nar.get("reel_end", 0) > capped_limit
-        ]
-        if truncated_events:
-            for nar in truncated_events:
-                logger.warning(
-                    f"Group {group_idx}: dropping narration event that would be truncated — "
-                    f"type={nar.get('event_type', '?')!r}, "
-                    f"reel=[{nar.get('reel_start', 0):.2f}s–{nar.get('reel_end', 0):.2f}s], "
-                    f"capped_limit={capped_limit:.2f}s, "
-                    f"text={str(nar.get('text', nar.get('narration_text', '')))[:80]!r}"
-                )
-            # narration_audio and narration_caption_paths are index-correlated (built in
-            # the same order in queue_manager).  Zip them together, apply the same
-            # reel_end <= capped_limit filter, then unzip so both lists stay in sync.
-            paired = list(zip(narration_audio, narration_caption_paths))
-            paired = [(nar, cap) for nar, cap in paired if nar.get("reel_end", 0) <= capped_limit]
-            if paired:
-                narration_audio, narration_caption_paths = map(list, zip(*paired))
-            else:
-                narration_audio, narration_caption_paths = [], []
-            # Recompute max_narration_end after dropping over-limit events.
-            max_narration_end = max((nar.get("reel_end", 0) for nar in narration_audio), default=0.0)
-
-        pad_duration = allowed_pad
-        # Recompute target_duration so audio padding (apad=whole_dur=...) uses the same
-        # corrected value, not the original inflated target.
-        target_duration = total_clip_duration + pad_duration
+    # Fill gap by extending the last clip into the source video (no freeze-frame).
+    if pad_duration > 0 and source_duration > 0 and source_clips:
+        last_clip = source_clips[-1]
+        last_end = last_clip.get("source_end", 0.0)
+        room = source_duration - last_end
+        extend_by = min(pad_duration, room)
+        if extend_by > 0.5:
+            last_clip["source_end"] = round(last_end + extend_by, 3)
+            total_clip_duration += extend_by
+            pad_duration = target_duration - total_clip_duration
+            logger.info(
+                f"Group {group_idx}: Extended last clip [{last_end:.1f} -> "
+                f"{last_clip['source_end']:.1f}] by {extend_by:.1f}s to fill gap"
+            )
 
     logger.info(f"Group {group_idx}: total_clip_duration={total_clip_duration:.1f}s, "
-                f"max_narration_end={max_narration_end:.1f}s, est={estimated_duration_seconds:.1f}s, target={target_duration:.1f}s, pad={pad_duration:.1f}s")
+                f"max_narration_end={max_narration_end:.1f}s, est={estimated_duration_seconds:.1f}s, target={target_duration:.1f}s")
 
     # 1. Build video filter complex
     if use_precut:

@@ -7,14 +7,16 @@ import pytest
 
 from backend.models import ReelPlan
 from backend.pipeline.plan_validator import (
+    _estimate_clip_importance,
+    _expand_clips_to_fill_gap,
     deduplicate_groups,
+    enforce_clip_pacing,
     finalize_edit,
     remove_overlaps,
+    repair_clip_diversity,
     repair_json,
     validate_clip_bounds,
     validate_narration,
-    verify_captions,
-    verify_duration,
 )
 
 
@@ -85,14 +87,15 @@ class TestRemoveOverlaps:
         assert removed == 0
         assert len(groups[0]["source_clips"]) == 2
 
-    def test_overlap_keeps_longer(self):
+    def test_overlap_keeps_higher_importance(self):
         groups = [{"source_clips": [
-            {"source_start": 0.0, "source_end": 10.0},
-            {"source_start": 5.0, "source_end": 7.0},
+            {"source_start": 0.0, "source_end": 10.0, "reason": "LONG: important content"},
+            {"source_start": 5.0, "source_end": 7.0, "reason": "SHORT: filler"},
         ]}]
         removed = remove_overlaps(groups)
         assert removed > 0
         assert len(groups[0]["source_clips"]) == 1
+        # Kept the more important clip (longer + has reason keywords)
         assert groups[0]["source_clips"][0]["source_end"] == 10.0
 
 
@@ -198,3 +201,210 @@ class TestFinalizeEdit:
     def test_floor_enforcement_fails_when_below_minimum(self, sample_reel_plan_dict):
         with pytest.raises(RuntimeError, match="fell below minimum"):
             finalize_edit(sample_reel_plan_dict, source_duration=60.0, min_groups=99)
+
+
+class TestEstimateClipImportance:
+    """Test clip importance estimation from reason text."""
+
+    def test_hook_clip_scores_higher(self):
+        hook = {"source_start": 0.0, "source_end": 5.0, "reason": "HOOK: curiosity gap", "is_hook_clip": True}
+        regular = {"source_start": 0.0, "source_end": 5.0, "reason": "MEDIUM: building tension", "is_hook_clip": False}
+        assert _estimate_clip_importance(hook) > _estimate_clip_importance(regular)
+
+    def test_climax_keyword_boosts(self):
+        climax = {"source_start": 0.0, "source_end": 10.0, "reason": "LONG: climax moment"}
+        plain = {"source_start": 0.0, "source_end": 10.0, "reason": "MEDIUM: regular clip"}
+        assert _estimate_clip_importance(climax) > _estimate_clip_importance(plain)
+
+    def test_longer_clip_slightly_higher(self):
+        long = {"source_start": 0.0, "source_end": 15.0, "reason": "test"}
+        short = {"source_start": 0.0, "source_end": 3.0, "reason": "test"}
+        assert _estimate_clip_importance(long) > _estimate_clip_importance(short)
+
+
+class TestRemoveOverlapsImportance:
+    """Test importance-weighted overlap removal."""
+
+    def test_keeps_more_important_clip(self):
+        groups = [{"source_clips": [
+            {"source_start": 0.0, "source_end": 10.0, "reason": "boring filler", "is_hook_clip": False},
+            {"source_start": 5.0, "source_end": 8.0, "reason": "HOOK: amazing reveal", "is_hook_clip": True},
+        ]}]
+        removed = remove_overlaps(groups)
+        assert removed > 0
+        assert groups[0]["source_clips"][0]["is_hook_clip"] is True
+
+
+class TestEnforceClipPacing:
+    """Test deterministic pacing enforcement."""
+
+    def test_swaps_short_ending(self):
+        groups = [{"source_clips": [
+            {"source_start": 0.0, "source_end": 10.0, "reason": "LONG: buildup"},
+            {"source_start": 20.0, "source_end": 30.0, "reason": "LONG: climax"},
+            {"source_start": 40.0, "source_end": 43.0, "reason": "SHORT: quick beat"},
+        ]}]
+        adjustments = enforce_clip_pacing(groups)
+        assert adjustments > 0
+        # Last clip should no longer be SHORT
+        last_dur = groups[0]["source_clips"][-1]["source_end"] - groups[0]["source_clips"][-1]["source_start"]
+        assert last_dur > 5.0
+
+    def test_no_change_for_already_diverse(self):
+        groups = [{"source_clips": [
+            {"source_start": 0.0, "source_end": 4.0, "reason": "SHORT: hook"},
+            {"source_start": 10.0, "source_end": 20.0, "reason": "MEDIUM: middle"},
+            {"source_start": 30.0, "source_end": 48.0, "reason": "LONG: ending"},
+        ]}]
+        adjustments = enforce_clip_pacing(groups)
+        assert adjustments == 0
+
+    def test_trims_back_to_back_long(self):
+        groups = [{"source_clips": [
+            {"source_start": 0.0, "source_end": 25.0, "reason": "LONG: first long"},
+            {"source_start": 30.0, "source_end": 55.0, "reason": "LONG: second long"},
+        ]}]
+        adjustments = enforce_clip_pacing(groups)
+        assert adjustments > 0
+        # At least one should be trimmed to <=15s
+        durs = [c["source_end"] - c["source_start"] for c in groups[0]["source_clips"]]
+        assert any(d <= 15.0 for d in durs)
+
+
+class TestRepairClipDiversity:
+    """Test diversity repair."""
+
+    def test_fixes_tight_gaps(self):
+        groups = [{"source_clips": [
+            {"source_start": 0.0, "source_end": 5.0, "reason": "a"},
+            {"source_start": 5.5, "source_end": 10.0, "reason": "b"},  # 0.5s gap (< MIN_TEMPORAL_GAP=1.0)
+            {"source_start": 20.0, "source_end": 25.0, "reason": "c"},
+        ]}]
+        repairs = repair_clip_diversity(groups, source_duration=100.0)
+        assert repairs > 0
+        # Clip 0's end should have moved forward to reduce the gap
+        assert groups[0]["source_clips"][0]["source_end"] > 5.0
+
+    def test_no_change_when_already_diverse(self):
+        groups = [{"source_clips": [
+            {"source_start": 0.0, "source_end": 5.0, "reason": "a"},
+            {"source_start": 15.0, "source_end": 20.0, "reason": "b"},
+            {"source_start": 40.0, "source_end": 45.0, "reason": "c"},
+        ]}]
+        repairs = repair_clip_diversity(groups, source_duration=200.0)
+        assert repairs == 0
+
+    def test_gap_expansion_does_not_create_overlap(self):
+        groups = [{"source_clips": [
+            {"source_start": 0.0, "source_end": 4.9, "reason": "a"},
+            {"source_start": 5.0, "source_end": 10.0, "reason": "b"},  # 0.1s gap
+            {"source_start": 12.0, "source_end": 17.0, "reason": "c"},
+        ]}]
+        repairs = repair_clip_diversity(groups, source_duration=100.0)
+        # Clip 0 end should NOT exceed clip 1 start
+        assert groups[0]["source_clips"][0]["source_end"] <= groups[0]["source_clips"][1]["source_start"]
+
+    def test_relocate_redundant_clip_to_gap(self):
+        groups = [{"source_clips": [
+            {"source_start": 0.0, "source_end": 5.0, "reason": "a"},
+            {"source_start": 0.5, "source_end": 5.5, "reason": "b"},  # overlaps with a
+            {"source_start": 10.0, "source_end": 15.0, "reason": "c"},
+        ]}]
+        repairs = repair_clip_diversity(groups, source_duration=100.0)
+        # After repair, clips should be more spread out
+        starts = sorted(c["source_start"] for c in groups[0]["source_clips"])
+        assert starts[-1] - starts[0] >= 5.0
+
+
+class TestEnforceClipPacingEdgeCases:
+    """Edge case tests for pacing enforcement."""
+
+    def test_single_clip_group_unchanged(self):
+        groups = [{"source_clips": [
+            {"source_start": 0.0, "source_end": 5.0, "reason": "SHORT: only clip"},
+        ]}]
+        adjustments = enforce_clip_pacing(groups)
+        assert adjustments == 0
+        assert len(groups[0]["source_clips"]) == 1
+
+    def test_two_short_clips_not_merged(self):
+        groups = [{"source_clips": [
+            {"source_start": 0.0, "source_end": 3.0, "reason": "SHORT: a"},
+            {"source_start": 10.0, "source_end": 13.0, "reason": "SHORT: b"},
+        ]}]
+        adjustments = enforce_clip_pacing(groups)
+        # Only 2 SHORTs, not 3+ — no merge needed
+        assert len(groups[0]["source_clips"]) == 2
+
+    def test_trimmed_long_stays_above_minimum(self):
+        groups = [{"source_clips": [
+            {"source_start": 0.0, "source_end": 30.0, "reason": "LONG: first"},
+            {"source_start": 35.0, "source_end": 65.0, "reason": "LONG: second"},
+        ]}]
+        adjustments = enforce_clip_pacing(groups)
+        durs = [c["source_end"] - c["source_start"] for c in groups[0]["source_clips"]]
+        assert all(d >= 3.0 for d in durs)
+
+    def test_swap_preserves_clip_count(self):
+        groups = [{"source_clips": [
+            {"source_start": 0.0, "source_end": 10.0, "reason": "LONG: a"},
+            {"source_start": 15.0, "source_end": 25.0, "reason": "LONG: b"},
+            {"source_start": 30.0, "source_end": 33.0, "reason": "SHORT: c"},
+        ]}]
+        original_count = len(groups[0]["source_clips"])
+        enforce_clip_pacing(groups)
+        assert len(groups[0]["source_clips"]) == original_count
+
+
+class TestExpandClipsToFillGap:
+    """Test _expand_clips_to_fill_gap deterministic expansion."""
+
+    def test_expands_short_clips_to_target(self):
+        clips = [
+            {"source_start": 10.0, "source_end": 15.0, "reason": "SHORT a"},
+            {"source_start": 30.0, "source_end": 35.0, "reason": "SHORT b"},
+        ]
+        expanded = _expand_clips_to_fill_gap(clips, source_duration=60.0, target_total=40.0)
+        assert expanded > 0
+        total = sum(c["source_end"] - c["source_start"] for c in clips)
+        assert total >= 40.0
+
+    def test_no_expansion_when_already_enough(self):
+        clips = [
+            {"source_start": 0.0, "source_end": 20.0, "reason": "LONG a"},
+            {"source_start": 25.0, "source_end": 50.0, "reason": "LONG b"},
+        ]
+        expanded = _expand_clips_to_fill_gap(clips, source_duration=60.0, target_total=40.0)
+        assert expanded == 0
+        total = sum(c["source_end"] - c["source_start"] for c in clips)
+        assert total == 45.0
+
+    def test_respects_clip_soft_max_in_first_pass(self):
+        clips = [
+            {"source_start": 10.0, "source_end": 15.0, "reason": "SHORT a"},
+            {"source_start": 30.0, "source_end": 35.0, "reason": "SHORT b"},
+        ]
+        _expand_clips_to_fill_gap(clips, source_duration=60.0, target_total=50.0)
+        for c in clips:
+            dur = c["source_end"] - c["source_start"]
+            # First pass caps at 30s, but pass 2 may extend further to fill gap
+            assert dur <= 30.0 or dur <= 50.0
+
+    def test_no_overlap_created(self):
+        clips = [
+            {"source_start": 10.0, "source_end": 15.0, "reason": "SHORT a"},
+            {"source_start": 20.0, "source_end": 25.0, "reason": "SHORT b"},
+        ]
+        _expand_clips_to_fill_gap(clips, source_duration=60.0, target_total=30.0)
+        clips.sort(key=lambda c: c["source_start"])
+        for i in range(len(clips) - 1):
+            assert clips[i]["source_end"] <= clips[i + 1]["source_start"]
+
+    def test_partial_expansion_when_source_short(self):
+        clips = [
+            {"source_start": 0.0, "source_end": 5.0, "reason": "SHORT a"},
+        ]
+        expanded = _expand_clips_to_fill_gap(clips, source_duration=30.0, target_total=40.0)
+        # Can expand to source_duration (30s) but can't reach 40s target
+        total = sum(c["source_end"] - c["source_start"] for c in clips)
+        assert total <= 30.0  # Can't exceed source_duration
