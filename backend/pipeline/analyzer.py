@@ -919,18 +919,18 @@ def select_reel_plan(
     max_groups = _compute_group_count_ceiling(source_duration)
     min_groups = _compute_group_count_floor(source_duration)
 
-    # Duration targets — must land between 90-150s for output compliance
-    if source_duration < 90:
+    # Duration targets — must land between 75-95s for output compliance
+    if source_duration < 75:
         reel_dur_min = max(45, int(source_duration * 0.8))
-        reel_dur_max = min(int(source_duration * 0.95), 90)
-    elif source_duration < 150:
-        reel_dur_min = 90
-        reel_dur_max = min(int(source_duration * 0.95), 150)
+        reel_dur_max = min(int(source_duration * 0.95), 75)
+    elif source_duration < 95:
+        reel_dur_min = 75
+        reel_dur_max = min(int(source_duration * 0.95), 95)
     else:
-        reel_dur_min = 90
-        reel_dur_max = 150
-    if reel_dur_max - reel_dur_min < 30:
-        reel_dur_max = reel_dur_min + 30
+        reel_dur_min = 75
+        reel_dur_max = 95
+    if reel_dur_max - reel_dur_min < 20:
+        reel_dur_max = reel_dur_min + 20
     reel_dur_max = min(reel_dur_max, int(MAX_OUTPUT_DURATION))
 
     # ── Python: semantic blocks + importance ──

@@ -74,7 +74,7 @@ def validate_and_adjust_narration_timings(
         """Find a gap of at least `duration` seconds with minimal speech overlap.
         Enforces 0.5s minimum distance from any speech boundary for clean VAD-driven ducking."""
         candidate = search_start
-        max_search = max(target_duration, cumulative_offset + 30.0)
+        max_search = target_duration
         while candidate + duration <= max_search:
             overlap, _ = get_speech_overlap(candidate, candidate + duration)
             if overlap <= 0.05:  # Near-zero overlap required for clean ducking
