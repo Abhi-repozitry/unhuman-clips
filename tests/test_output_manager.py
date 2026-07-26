@@ -91,7 +91,7 @@ class TestOutputManager:
              patch("backend.output_manager.get_ffmpeg", mock_ffmpeg), \
              patch("backend.output_manager.get_ffprobe", mock_ffprobe), \
              patch("backend.config.OUTPUTS_DIR", tmp_path / "outputs"), \
-             patch("backend.config.MAX_OUTPUT_DURATION", 180):
+             patch("backend.config.MAX_OUTPUT_DURATION", 95):
             result = manager.final_edit_group(
                 str(input_path), group, tmp_path / "working", "testjob"
             )
@@ -128,7 +128,7 @@ class TestOutputManager:
              patch("backend.output_manager.get_ffprobe", mock_ffprobe), \
              patch("backend.output_manager.subprocess.run", mock_run), \
              patch("backend.config.OUTPUTS_DIR", tmp_path / "outputs"), \
-             patch("backend.config.MAX_OUTPUT_DURATION", 180):
+             patch("backend.config.MAX_OUTPUT_DURATION", 95):
             result = manager.final_edit_group(
                 str(input_path), group, tmp_path / "working", "testjob"
             )

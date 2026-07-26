@@ -31,8 +31,8 @@ All settings are configured via environment variables in `backend/.env`. The ser
 |----------|---------|-------------|
 | `DOWNLOAD_MAX_HEIGHT` | `1080` | Max video resolution to download |
 | `DOWNLOAD_FORMAT` | `bestvideo[height<=1080]+bestaudio/best[height<=1080]` | yt-dlp format selector |
-| `MAX_OUTPUT_DURATION` | `180` | Maximum output reel duration (seconds) |
-| `MIN_OUTPUT_DURATION` | `90` | Minimum output reel duration (seconds) |
+| `MAX_OUTPUT_DURATION` | `95` | Maximum output reel duration (seconds) |
+| `MIN_OUTPUT_DURATION` | `75` | Minimum output reel duration (seconds) |
 | `TARGET_GROUP_DURATION` | `120` | Ideal group duration for LLM planning (seconds) |
 | `ALLOW_CPU_FFMPEG_FALLBACK` | `0` | Set `1` to allow CPU encoding when NVENC fails |
 | `CLIP_PADDING_FRAMES` | `15` | Extra frames to add around each clip for clean cuts |
@@ -134,8 +134,8 @@ NVIDIA_MODEL_FALLBACK=openai/gpt-oss-120b
 
 # Video
 DOWNLOAD_MAX_HEIGHT=1080
-MAX_OUTPUT_DURATION=180
-MIN_OUTPUT_DURATION=90
+MAX_OUTPUT_DURATION=95
+MIN_OUTPUT_DURATION=75
 
 # TTS
 TTS_VOICE=en-US-ChristopherNeural

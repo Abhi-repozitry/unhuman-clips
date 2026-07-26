@@ -43,8 +43,8 @@ while time.time() < deadline:
             os = o.get("status", "?")
             print(f"  Group {idx}: {dur:.1f}s status={os} path={path}")
         total = len(outputs)
-        in_range = sum(1 for o in outputs if 90 <= o.get("duration_seconds", 0) <= 180)
-        print(f"\nGroups in 90-180s range: {in_range}/{total}")
+        in_range = sum(1 for o in outputs if 75 <= o.get("duration_seconds", 0) <= 95)
+        print(f"\nGroups in 75-95s range: {in_range}/{total}")
         break
     time.sleep(5)
 else:

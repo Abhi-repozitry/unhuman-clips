@@ -785,10 +785,10 @@ FILLER REMOVAL — aggressively cut:
 Trim clips to the minimum that delivers the moment. Shorter is almost always better.
 
 CLIP MIX
-- SHORT 3-5s, MEDIUM 6-15s, LONG 16-30s — mix them for pacing.
+- SHORT 3-5s, MEDIUM 6-10s, LONG 11-15s — mix them for pacing.
 - No back-to-back LONG clips. No 3+ SHORT in a row.
 - Strongest moment must be in the final 30% of the reel.
-- Final clip must be MEDIUM or LONG (never end on a SHORT).
+- Final clip must be SHORT or MEDIUM — payoff moments (winner reveal, outcome) are typically quick, not long builds.
 - Never < 3.0s per clip.
 - Prefer SHOW THEN EXPLAIN: visual action first, commentary after.
 
