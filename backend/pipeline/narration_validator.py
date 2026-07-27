@@ -173,7 +173,7 @@ def validate_and_adjust_narration_timings(
                         "-i", nar["path"],
                         "-t", str(nar["duration"]),
                         "-c", "copy", tmp_path
-                    ], check=True)
+                    ], check=True, timeout=60)
                     os.replace(tmp_path, nar["path"])
                     reporter.log_info(f"[INFO] Group {group_idx+1}: Trimmed narration audio file to {nar['duration']:.2f}s to fit target duration.")
                 except Exception as e:

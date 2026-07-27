@@ -1,7 +1,6 @@
 """Tests for backend.pipeline.compositor — ducking filter chain, VAD integration, duration math."""
 from __future__ import annotations
 
-import json
 from unittest.mock import MagicMock, patch
 
 import pytest

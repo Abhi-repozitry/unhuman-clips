@@ -4,6 +4,7 @@ __pycache__/
 *.egg-info/
 .venv/
 venv/
+venv_old/
 *.egg
 
 # Node
@@ -38,9 +39,14 @@ frontend/
 
 # Logs
 *.log
+logs/
 
 # Temporary / debug files
 *.wav
 *.patch
 *.txt
 cookies.txt
+scripts/tmp_*
+
+# Blackbox / AI tools
+.blackboxrules

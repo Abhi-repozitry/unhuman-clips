@@ -23,7 +23,6 @@ from backend.models import ReelPlan
 from backend.pipeline.sanitize import sanitize_text
 
 __all__ = [
-    "repair_json",
     "validate_clip_bounds",
     "validate_timing",
     "remove_overlaps",
@@ -37,113 +36,6 @@ __all__ = [
 ]
 
 logger = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# JSON Repair
-# ---------------------------------------------------------------------------
-
-def repair_json(text: str) -> str:
-    """Repair truncated or malformed JSON from LLM output.
-
-    Handles: trailing commas, unclosed strings, unbalanced braces/brackets,
-    markdown fences, and partial JSON extraction.
-    """
-    if not text:
-        return ""
-
-    # Strip markdown fences
-    t = text.strip()
-    fence_match = re.search(r"```(?:json)?\s*(\{[\s\S]*\})\s*```", t, re.IGNORECASE)
-    if fence_match:
-        return fence_match.group(1).strip()
-
-    if t.startswith("```json"):
-        t = t[len("```json"):].strip()
-    if t.startswith("```"):
-        t = t[len("```"):].strip()
-    if t.endswith("```"):
-        t = t[:-len("```")].strip()
-
-    # Try direct parse first
-    try:
-        json.loads(t)
-        return t
-    except json.JSONDecodeError:
-        pass
-
-    # Fix trailing commas
-    repaired = re.sub(r',\s*([}\]])', r'\1', t)
-
-    # Close unclosed string quotes
-    unescaped_quotes = len(re.findall(r'(?<!\\)"', repaired))
-    if unescaped_quotes % 2 != 0:
-        repaired += '"'
-
-    # Balance braces and brackets
-    open_braces = repaired.count("{")
-    close_braces = repaired.count("}")
-    open_brackets = repaired.count("[")
-    close_brackets = repaired.count("]")
-    repaired += "}" * max(0, open_braces - close_braces)
-    repaired += "]" * max(0, open_brackets - close_brackets)
-
-    try:
-        json.loads(repaired)
-        return repaired
-    except json.JSONDecodeError:
-        pass
-
-    # Scan backwards for last complete JSON object
-    try:
-        for start_pos in [repaired.find("{"), repaired.find("[")]:
-            if start_pos < 0:
-                continue
-            depth = 0
-            in_string = False
-            escape = False
-            for i in range(start_pos, len(repaired)):
-                ch = repaired[i]
-                if escape:
-                    escape = False
-                    continue
-                if ch == '\\' and in_string:
-                    escape = True
-                    continue
-                if ch == '"':
-                    in_string = not in_string
-                    continue
-                if in_string:
-                    continue
-                if ch in ('{', '['):
-                    depth += 1
-                elif ch in ('}', ']'):
-                    depth -= 1
-                    if depth == 0:
-                        candidate = repaired[start_pos:i + 1]
-                        try:
-                            json.loads(candidate)
-                            return candidate
-                        except json.JSONDecodeError:
-                            continue
-    except (json.JSONDecodeError, IndexError):
-        pass
-
-    # Last resort: scan for any valid JSON substring
-    try:
-        for start_pos in range(len(repaired)):
-            if repaired[start_pos] in ('{', '['):
-                for end_pos in range(len(repaired), start_pos, -1):
-                    candidate = repaired[start_pos:end_pos]
-                    try:
-                        json.loads(candidate)
-                        return candidate
-                    except json.JSONDecodeError:
-                        continue
-    except (json.JSONDecodeError, IndexError):
-        pass
-
-    return ""
 
 
 # ---------------------------------------------------------------------------

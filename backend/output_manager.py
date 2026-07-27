@@ -9,6 +9,7 @@ import asyncio
 import shutil
 import subprocess
 from pathlib import Path
+from typing import Any
 
 from backend.ffmpeg_utils import get_ffmpeg, get_ffprobe
 
@@ -54,7 +55,7 @@ class OutputManager:
             subprocess.run(
                 [ffmpeg, "-loglevel", "error", "-i", input_path,
                  "-t", str(MAX_OUTPUT_DURATION), "-c", "copy", "-y", str(output_path)],
-                check=True
+                check=True, timeout=120
             )
         else:
             shutil.copy2(input_path, output_path)
@@ -76,7 +77,7 @@ class OutputManager:
         probe = subprocess.run(
             [ffprobe, "-v", "error", "-show_entries", "format=duration",
              "-of", "default=noprint_wrappers=1:nokey=1", path],
-            capture_output=True, text=True
+            capture_output=True, text=True, timeout=30
         )
         if probe.returncode == 0:
             try:

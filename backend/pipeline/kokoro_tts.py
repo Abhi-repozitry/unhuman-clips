@@ -129,7 +129,7 @@ def synthesize_kokoro(
     try:
         result = subprocess.run(
             [get_ffprobe(), "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", out_path],
-            capture_output=True, check=True, text=True,
+            capture_output=True, check=True, text=True, timeout=30,
         )
         duration = float(result.stdout.strip())
     except (subprocess.CalledProcessError, ValueError) as e:

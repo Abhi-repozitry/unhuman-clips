@@ -161,11 +161,7 @@ def call_llm_sync(
                     "seed": 42,
                     "reasoning_effort": reasoning_effort,
                 }
-                # Only add response_format if the model supports it
-                try:
-                    kwargs["response_format"] = {"type": "json_object"}
-                except Exception:
-                    pass
+                kwargs["response_format"] = {"type": "json_object"}
 
                 raw = None
                 token_count = ""
@@ -174,21 +170,26 @@ def call_llm_sync(
                     response = client.chat.completions.create(**kwargs)
                     full_content = ""
                     chunk_count = 0
+                    chunk = None
                     for chunk in response:
-                        delta = chunk.choices[0].delta if chunk.choices else None
-                        if delta and delta.content:
-                            full_content += delta.content
-                            chunk_count += 1
-                            if chunk_count % 10 == 0 and reporter and interactions is not None:
-                                reporter.set_stage_data_key("llm_interactions", [i.model_dump() for i in interactions])
+                        if chunk.choices:
+                            delta = chunk.choices[0].delta if chunk.choices[0] else None
+                            if delta and delta.content:
+                                full_content += delta.content
+                                chunk_count += 1
+                                if chunk_count % 10 == 0 and reporter and interactions is not None:
+                                    reporter.set_stage_data_key("llm_interactions", [i.model_dump() for i in interactions])
                     raw = full_content.strip()
                     usage = getattr(chunk, 'usage', None) if chunk else None
                     if usage:
                         token_count = f" ({usage.completion_tokens} out / {usage.prompt_tokens} in tokens)"
                 except Exception as stream_err:
                     # Fallback to non-streaming if streaming fails
+                    logger.warning(f"Streaming failed, falling back to non-streaming: {stream_err}")
                     kwargs.pop("stream", None)
                     response = client.chat.completions.create(**kwargs)
+                    if not response.choices:
+                        raise RuntimeError("NVIDIA API returned no choices in response.")
                     raw = response.choices[0].message.content
                     if raw is None:
                         finish_reason = response.choices[0].finish_reason

@@ -9,6 +9,7 @@ import ctypes
 import logging
 import os
 import sys
+import threading
 from pathlib import Path
 from typing import Callable
 
@@ -120,7 +121,8 @@ def _prepare_cuda_runtime_libraries() -> list[str]:
     return loaded
 
 
-_prepare_cuda_runtime_libraries()
+_cuda_preloaded = False
+_model_lock = threading.Lock()
 
 import faster_whisper
 from backend.config import WHISPER_MODEL_SIZE, WHISPER_COMPUTE_TYPE_CUDA, WHISPER_COMPUTE_TYPE_CPU
@@ -130,9 +132,13 @@ _model_loaded = False
 
 
 def _load_model():
-    global _model
+    global _model, _cuda_preloaded
     if _model is not None:
         return _model
+
+    if not _cuda_preloaded:
+        _prepare_cuda_runtime_libraries()
+        _cuda_preloaded = True
 
     allow_cpu_fallback = os.environ.get("ALLOW_CPU_WHISPER_FALLBACK") == "1"
     errors = []
@@ -167,12 +173,15 @@ def _ensure_model():
     global _model, _model_loaded
     if _model_loaded:
         return
-    try:
-        _load_model()
-        _model_loaded = True
-    except Exception as e:
-        logger.error(f"Whisper model initialization failed: {e}")
-        logger.info("Transcription will fail at runtime - check CUDA/cuDNN installation")
+    with _model_lock:
+        if _model_loaded:
+            return
+        try:
+            _load_model()
+            _model_loaded = True
+        except Exception as e:
+            logger.error(f"Whisper model initialization failed: {e}")
+            logger.info("Transcription will fail at runtime - check CUDA/cuDNN installation")
 
 
 def transcribe_video(video_path: str, progress_cb: Callable[[str, float], None] | None = None) -> list[dict]:

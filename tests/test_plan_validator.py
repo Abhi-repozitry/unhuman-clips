@@ -1,8 +1,6 @@
 """Tests for backend.pipeline.plan_validator — deterministic validation and repair."""
 from __future__ import annotations
 
-import json
-
 import pytest
 
 from backend.models import ReelPlan
@@ -14,40 +12,9 @@ from backend.pipeline.plan_validator import (
     finalize_edit,
     remove_overlaps,
     repair_clip_diversity,
-    repair_json,
     validate_clip_bounds,
     validate_narration,
 )
-
-
-class TestRepairJson:
-    """Test JSON repair for LLM output."""
-
-    def test_valid_json_passthrough(self):
-        data = '{"key": "value"}'
-        assert repair_json(data) == data
-
-    def test_fenced_json(self):
-        data = '{"key": "value"}'
-        fenced = f"```json\n{data}\n```"
-        assert repair_json(fenced) == data
-
-    def test_missing_closing_brace(self):
-        truncated = '{"key": "value"'
-        repaired = repair_json(truncated)
-        assert repaired
-        parsed = json.loads(repaired)
-        assert parsed["key"] == "value"
-
-    def test_trailing_comma(self):
-        data = '{"key": "value",}'
-        repaired = repair_json(data)
-        assert repaired
-        parsed = json.loads(repaired)
-        assert "key" in parsed
-
-    def test_empty_input(self):
-        assert repair_json("") == ""
 
 
 class TestValidateClipBounds:

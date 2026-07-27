@@ -170,6 +170,8 @@ async def create_job(body: CreateJobRequest):
 
     Rate limited to {RATE_LIMIT_MAX} requests per {RATE_LIMIT_WINDOW} seconds.
     """
+    if queue_manager is None:
+        return JSONResponse(status_code=503, content={"error": "Server starting up, try again shortly."})
     if not _check_rate_limit():
         return JSONResponse(
             status_code=429,
@@ -181,11 +183,15 @@ async def create_job(body: CreateJobRequest):
 
 @app.get("/jobs")
 async def list_jobs():
+    if queue_manager is None:
+        return JSONResponse(status_code=503, content={"error": "Server starting up, try again shortly."})
     return queue_manager.get_jobs()
 
 
 @app.delete("/jobs/{job_id}")
 async def delete_job(job_id: str):
+    if queue_manager is None:
+        return JSONResponse(status_code=503, content={"error": "Server starting up, try again shortly."})
     if queue_manager.delete_job(job_id):
         return {"ok": True}
     return JSONResponse(status_code=404, content={"error": "job not found"})

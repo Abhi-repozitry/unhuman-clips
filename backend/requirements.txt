@@ -11,3 +11,7 @@ edge-tts>=7.2.0,<8
 silero-vad
 torch
 torchaudio
+numpy
+soundfile
+opencv-python
+kokoro
