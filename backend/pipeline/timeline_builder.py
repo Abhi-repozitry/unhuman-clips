@@ -220,7 +220,7 @@ def _run_ocr_on_source(
     video_path: str,
     segments: list[dict],
     sample_interval: float = 5.0,
-    max_frames: int = 30,
+    max_frames: int = 60,
 ) -> dict[int, dict]:
     """Sample frames from the source video and run OCR.
 
@@ -329,11 +329,21 @@ def _check_silence_before(
     speech_regions: list[dict[str, float]],
     min_silence: float = 0.3,
 ) -> bool:
-    """Check if there is a silence gap of at least min_silence before this segment."""
+    """Check if there is a silence gap of at least min_silence before this segment.
+    
+    Only checks the immediately preceding VAD region, not arbitrary ones.
+    """
+    if not speech_regions:
+        return False
+    latest_end = 0.0
+    found_preceding = False
     for region in speech_regions:
-        if region["end"] <= segment_start and (segment_start - region["end"]) >= min_silence:
-            return True
-    return False
+        if region["end"] <= segment_start:
+            latest_end = max(latest_end, region["end"])
+            found_preceding = True
+    if not found_preceding:
+        return False
+    return (segment_start - latest_end) >= min_silence
 
 
 # ---------------------------------------------------------------------------

@@ -117,6 +117,10 @@ def _compute_importance(
     silence_before: bool,
     black: bool,
     freeze: bool,
+    has_question: bool = False,
+    has_exclamation: bool = False,
+    has_emphasis: bool = False,
+    ocr_confidence: float = 0.0,
 ) -> float:
     """Deterministic importance 0–100. Python calculates; LLM only ranks editorially."""
     score = 0.0
@@ -127,12 +131,15 @@ def _compute_importance(
         # typical speech ~-20 to -10; map roughly
         vol_norm = max(0.0, min(1.0, (volume_db + 40) / 30.0))
         score += vol_norm * 15.0
-    # OCR = strong key-moment signal (0–15)
+    # OCR = strong key-moment signal (0–15, weighted by confidence)
     if has_ocr:
-        score += 15.0
+        score += max(5.0, ocr_confidence * 15.0)
     # Natural cut point (0–10)
     if silence_before:
         score += 10.0
+    # Engagement signals — questions, exclamations, emphasis (0–20)
+    engagement = (8.0 if has_question else 0.0) + (7.0 if has_exclamation else 0.0) + (5.0 if has_emphasis else 0.0)
+    score += min(20.0, engagement)
     # Penalties
     if black:
         score -= 25.0
@@ -163,6 +170,7 @@ def _build_semantic_blocks(
                 "energy": float(getattr(seg, "speech_energy", 0.0) or 0.0),
                 "volume_db": getattr(seg.metrics, "volume_db", None) if hasattr(seg, "metrics") else None,
                 "ocr": list(seg.ocr) if getattr(seg, "ocr", None) else [],
+                "ocr_confidence": float(getattr(seg, "ocr_confidence", 0.0) or 0.0),
                 "silence_before": bool(getattr(seg, "silence_before", False)),
                 "black": bool(getattr(seg.metrics, "black_frame", False)) if hasattr(seg, "metrics") else False,
                 "freeze": bool(getattr(seg.metrics, "freeze_detected", False)) if hasattr(seg, "metrics") else False,
@@ -223,8 +231,12 @@ def _build_semantic_blocks(
         has_emphasis = any(g["has_emphasis"] for g in group)
         word_densities = [g["word_density"] for g in group if g["word_density"] > 0]
         avg_word_density = sum(word_densities) / len(word_densities) if word_densities else 0.0
+        # OCR confidence: use max confidence from segments with OCR
+        ocr_confs = [g.get("ocr_confidence", 0.0) for g in group if g.get("ocr")]
+        max_ocr_confidence = max(ocr_confs) if ocr_confs else 0.0
         importance = _compute_importance(
-            avg_energy, volume_db, bool(ocr), silence_before, black, freeze
+            avg_energy, volume_db, bool(ocr), silence_before, black, freeze,
+            has_question, has_exclamation, has_emphasis, max_ocr_confidence
         )
         blocks.append(SemanticBlock(
             block_id=len(blocks),

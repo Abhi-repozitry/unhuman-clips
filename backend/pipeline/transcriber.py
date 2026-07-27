@@ -124,7 +124,6 @@ def _prepare_cuda_runtime_libraries() -> list[str]:
 _cuda_preloaded = False
 _model_lock = threading.Lock()
 
-import faster_whisper
 from backend.config import WHISPER_MODEL_SIZE, WHISPER_COMPUTE_TYPE_CUDA, WHISPER_COMPUTE_TYPE_CPU
 
 _model = None
@@ -139,6 +138,8 @@ def _load_model():
     if not _cuda_preloaded:
         _prepare_cuda_runtime_libraries()
         _cuda_preloaded = True
+
+    import faster_whisper
 
     allow_cpu_fallback = os.environ.get("ALLOW_CPU_WHISPER_FALLBACK") == "1"
     errors = []

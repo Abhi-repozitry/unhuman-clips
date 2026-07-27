@@ -90,8 +90,6 @@ class RichTimelineSegment(BaseModel):
     has_question: bool = False
     has_exclamation: bool = False
     has_emphasis: bool = False
-    keyword_match_score: float = 0.0
-    quality_score: float = 0.0
 
 
 class RichTimeline(BaseModel):
