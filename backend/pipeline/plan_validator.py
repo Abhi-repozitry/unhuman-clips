@@ -517,9 +517,9 @@ def validate_clip_diversity(groups: list[dict], source_duration: float) -> None:
 
 def _classify_clip_duration(duration: float) -> str:
     """Classify a clip as SHORT, MEDIUM, or LONG based on duration."""
-    if duration <= 5.0:
+    if duration <= 6.0:
         return "SHORT"
-    if duration <= 10.0:
+    if duration <= 15.0:
         return "MEDIUM"
     return "LONG"
 
@@ -530,7 +530,7 @@ def enforce_clip_pacing(groups: list[dict]) -> int:
     Rules:
     - No back-to-back LONG clips (merge or trim the weaker one)
     - No 3+ SHORT clips in a row (merge the two weakest adjacent)
-    - Final clip must not be LONG (payoff moments are short/medium, not long builds)
+    - Final clip must be MEDIUM (payoff moments need enough time for the reveal)
 
     Returns the number of clips modified or removed.
     """
@@ -543,20 +543,20 @@ def enforce_clip_pacing(groups: list[dict]) -> int:
 
         clips.sort(key=lambda c: c.get("source_start", 0))
 
-        # 1. Final clip must not be LONG (payoff = quick reveal, not long build)
+        # 1. Final clip must be MEDIUM (payoff needs time for the reveal)
         if clips:
             last = clips[-1]
             last_dur = last.get("source_end", 0) - last.get("source_start", 0)
-            if _classify_clip_duration(last_dur) == "LONG" and len(clips) >= 2:
-                # Find nearest SHORT or MEDIUM clip to swap with
+            if _classify_clip_duration(last_dur) != "MEDIUM" and len(clips) >= 2:
+                # Find nearest MEDIUM clip to swap with
                 for j in range(len(clips) - 2, -1, -1):
                     j_dur = clips[j].get("source_end", 0) - clips[j].get("source_start", 0)
-                    if _classify_clip_duration(j_dur) in ("SHORT", "MEDIUM"):
+                    if _classify_clip_duration(j_dur) == "MEDIUM":
                         clips[-1], clips[j] = clips[j], clips[-1]
                         adjustments += 1
                         logger.info(
-                            f"Group {i}: Swapped final LONG clip with "
-                            f"clip at position {j} to end on payoff (SHORT/MEDIUM)"
+                            f"Group {i}: Swapped final {_classify_clip_duration(last_dur)} clip with "
+                            f"clip at position {j} to end on MEDIUM payoff"
                         )
                         break
 
@@ -570,21 +570,21 @@ def enforce_clip_pacing(groups: list[dict]) -> int:
         k = 0
         while k < len(classified) - 1:
             if classified[k][1] == "LONG" and classified[k + 1][1] == "LONG":
-                # Trim the less important one to MEDIUM range (max 10s)
+                # Trim the less important one to MEDIUM range (max 15s)
                 imp_a = _estimate_clip_importance(clips[classified[k][0]])
                 imp_b = _estimate_clip_importance(clips[classified[k + 1][0]])
                 trim_idx = classified[k][0] if imp_a <= imp_b else classified[k + 1][0]
                 clip = clips[trim_idx]
                 clip_dur = clip.get("source_end", 0) - clip.get("source_start", 0)
-                # Trim to 10s but respect 3s minimum
-                target_dur = max(3.0, min(10.0, clip_dur))
+                # Trim to 15s but respect 3s minimum
+                target_dur = max(3.0, min(15.0, clip_dur))
                 if clip_dur > target_dur:
                     new_end = clip["source_start"] + target_dur
                     clip["source_end"] = round(new_end, 3)
                     adjustments += 1
                     logger.info(
                         f"Group {i}: Trimmed back-to-back LONG clip at "
-                        f"{clip['source_start']:.1f}s from {clip_dur:.1f}s to 10.0s"
+                        f"{clip['source_start']:.1f}s from {clip_dur:.1f}s to 15.0s"
                     )
                     # Reclassify
                     new_dur = clip["source_end"] - clip["source_start"]
@@ -638,18 +638,18 @@ def enforce_clip_pacing(groups: list[dict]) -> int:
             # Advance past the current run (at least 1 position)
             run_start = max(run_end, run_start + 1)
 
-        # 4. Re-check: final clip must not be LONG (merge may have created a LONG)
+        # 4. Re-check: final clip must be MEDIUM (merge may have changed classification)
         if clips:
             last = clips[-1]
             last_dur = last.get("source_end", 0) - last.get("source_start", 0)
-            if _classify_clip_duration(last_dur) == "LONG" and len(clips) >= 2:
+            if _classify_clip_duration(last_dur) != "MEDIUM" and len(clips) >= 2:
                 for j in range(len(clips) - 2, -1, -1):
                     j_dur = clips[j].get("source_end", 0) - clips[j].get("source_start", 0)
-                    if _classify_clip_duration(j_dur) in ("SHORT", "MEDIUM"):
+                    if _classify_clip_duration(j_dur) == "MEDIUM":
                         clips[-1], clips[j] = clips[j], clips[-1]
                         adjustments += 1
                         logger.info(
-                            f"Group {i}: Re-swapped final LONG clip after merge"
+                            f"Group {i}: Re-swapped final clip after merge to end on MEDIUM"
                         )
                         break
 
@@ -733,9 +733,9 @@ def repair_clip_diversity(groups: list[dict], source_duration: float) -> int:
                     gaps.sort(key=lambda g: g[2], reverse=True)
 
                     if gaps:
-                        # Place a short clip (3-5s) in the largest gap
+                        # Place a short clip (≤6s) in the largest gap
                         gap_start, gap_end, gap_size = gaps[0]
-                        clip_dur = min(5.0, gap_size * 0.5)
+                        clip_dur = min(6.0, gap_size * 0.5)
                         clip_center = (gap_start + gap_end) / 2.0
                         clips[redundant_idx]["source_start"] = round(clip_center - clip_dur / 2, 3)
                         clips[redundant_idx]["source_end"] = round(clip_center + clip_dur / 2, 3)

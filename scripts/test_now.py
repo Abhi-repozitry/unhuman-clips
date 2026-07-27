@@ -88,11 +88,11 @@ def main():
         valid_groups = 0
         for o in outputs:
             dur = o.get("duration_seconds", 0)
-            if 75 <= dur <= 95:
+            if 90 <= dur <= 100:
                 valid_groups += 1
         print(f"\n=== RESULT ===")
         print(f"Total groups: {total_groups}")
-        print(f"Groups in 75-95s range: {valid_groups}/{total_groups}")
+        print(f"Groups in 90-100s range: {valid_groups}/{total_groups}")
         if total_groups > 0 and valid_groups < total_groups:
             print(f"[WARN] {total_groups - valid_groups} group(s) outside 75-95s target")
         REPORT_FILE.write_text(json.dumps(report, indent=2, ensure_ascii=False, default=str), encoding="utf-8")

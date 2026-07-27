@@ -785,10 +785,10 @@ FILLER REMOVAL — aggressively cut:
 Trim clips to the minimum that delivers the moment. Shorter is almost always better.
 
 CLIP MIX
-- SHORT 3-5s, MEDIUM 6-10s, LONG 11-15s — mix them for pacing.
+- SHORT ≤6s, MEDIUM 7-15s, LONG 16-20s — mix them for pacing.
 - No back-to-back LONG clips. No 3+ SHORT in a row.
 - Strongest moment must be in the final 30% of the reel.
-- Final clip must be SHORT or MEDIUM — payoff moments (winner reveal, outcome) are typically quick, not long builds.
+- Final clip must be MEDIUM — payoff moments need enough time for the reveal.
 - Never < 3.0s per clip.
 - Prefer SHOW THEN EXPLAIN: visual action first, commentary after.
 
@@ -846,7 +846,7 @@ GROUPS (clips already locked):
 
 RULES
 - Max 3 events per group: 1 hook + up to 2 commentaries.
-- Hook: reel_start=0.0, reel_end=2.5-4.0, 6-10 words, specific curiosity.
+- Hook: reel_start=0.0, reel_end=3.0-5.0, 6-10 words, specific curiosity.
   BANNED: "Watch what happens", "You won't believe", "This is insane", "Wait for it"
 - Commentary 1 (middle): 8-14 words, place at ~35-45% of estimated_duration. Must have persona.
 - Commentary 2 (end): 8-14 words, place at ~70-80% of estimated_duration. Must have persona.
@@ -861,7 +861,7 @@ OUTPUT — STRICT JSON ONLY
     {{
       "group_index": 0,
       "narration_events": [
-        {{"event_type": "hook", "reel_start": 0.0, "reel_end": 3.0, "text": "...", "persona": null, "voice_id": null}},
+        {{"event_type": "hook", "reel_start": 0.0, "reel_end": 5.0, "text": "...", "persona": null, "voice_id": null}},
         {{"event_type": "commentary", "reel_start": 35.0, "reel_end": 38.0, "text": "...", "persona": "roast", "voice_id": null}},
         {{"event_type": "commentary", "reel_start": 70.0, "reel_end": 73.0, "text": "...", "persona": "hype", "voice_id": null}}
       ]
@@ -919,16 +919,16 @@ def select_reel_plan(
     max_groups = _compute_group_count_ceiling(source_duration)
     min_groups = _compute_group_count_floor(source_duration)
 
-    # Duration targets — must land between 75-95s for output compliance
-    if source_duration < 75:
+    # Duration targets — must land between MIN-MAX_OUTPUT_DURATION for output compliance
+    if source_duration < MIN_OUTPUT_DURATION:
         reel_dur_min = max(45, int(source_duration * 0.8))
-        reel_dur_max = min(int(source_duration * 0.95), 75)
-    elif source_duration < 95:
-        reel_dur_min = 75
-        reel_dur_max = min(int(source_duration * 0.95), 95)
+        reel_dur_max = min(int(source_duration * 0.95), MIN_OUTPUT_DURATION)
+    elif source_duration < MAX_OUTPUT_DURATION:
+        reel_dur_min = MIN_OUTPUT_DURATION
+        reel_dur_max = min(int(source_duration * 0.95), MAX_OUTPUT_DURATION)
     else:
-        reel_dur_min = 75
-        reel_dur_max = 95
+        reel_dur_min = MIN_OUTPUT_DURATION
+        reel_dur_max = MAX_OUTPUT_DURATION
     if reel_dur_max - reel_dur_min < 20:
         reel_dur_max = reel_dur_min + 20
     reel_dur_max = min(reel_dur_max, int(MAX_OUTPUT_DURATION))

@@ -209,7 +209,7 @@ class TestEnforceClipPacing:
         groups = [{"source_clips": [
             {"source_start": 0.0, "source_end": 18.0, "reason": "LONG: buildup"},
             {"source_start": 20.0, "source_end": 40.0, "reason": "LONG: climax"},
-            {"source_start": 45.0, "source_end": 48.0, "reason": "SHORT: quick beat"},
+            {"source_start": 45.0, "source_end": 52.0, "reason": "MEDIUM: payoff"},
         ]}]
         adjustments = enforce_clip_pacing(groups)
         assert adjustments > 0  # back-to-back LONG trimmed
@@ -218,10 +218,10 @@ class TestEnforceClipPacing:
         groups = [{"source_clips": [
             {"source_start": 0.0, "source_end": 4.0, "reason": "SHORT: hook"},
             {"source_start": 10.0, "source_end": 20.0, "reason": "MEDIUM: middle"},
-            {"source_start": 30.0, "source_end": 48.0, "reason": "LONG: ending"},
+            {"source_start": 30.0, "source_end": 38.0, "reason": "MEDIUM: ending"},
         ]}]
         adjustments = enforce_clip_pacing(groups)
-        assert adjustments > 0  # LONG ending swapped (payoff = SHORT/MEDIUM)
+        assert adjustments == 0  # already valid: ends on MEDIUM
 
     def test_trims_back_to_back_long(self):
         groups = [{"source_clips": [
@@ -230,9 +230,9 @@ class TestEnforceClipPacing:
         ]}]
         adjustments = enforce_clip_pacing(groups)
         assert adjustments > 0
-        # At least one should be trimmed to <=10s
+        # At least one should be trimmed to <=15s
         durs = [c["source_end"] - c["source_start"] for c in groups[0]["source_clips"]]
-        assert any(d <= 10.0 for d in durs)
+        assert any(d <= 15.0 for d in durs)
 
 
 class TestRepairClipDiversity:

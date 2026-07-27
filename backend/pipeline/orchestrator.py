@@ -168,7 +168,7 @@ class GroupOrchestrator:
                     NarrationEvent(
                         event_type="hook",
                         reel_start=0.0,
-                        reel_end=3.0,
+                        reel_end=5.0,
                         text=fallback_text,
                         voice_id=None,
                     )

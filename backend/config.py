@@ -65,8 +65,8 @@ CLIP_DURATION_SOFT_MIN = float(os.environ.get("CLIP_DURATION_SOFT_MIN", "10"))
 CLIP_DURATION_SOFT_MAX = float(os.environ.get("CLIP_DURATION_SOFT_MAX", "30"))
 HOOK_SECONDS = float(os.environ.get("HOOK_SECONDS", "3"))
 INSIGHT_SECONDS_MAX = float(os.environ.get("INSIGHT_SECONDS_MAX", "4"))
-MIN_OUTPUT_DURATION = int(os.environ.get("MIN_OUTPUT_DURATION", "75"))
-MAX_OUTPUT_DURATION = int(os.environ.get("MAX_OUTPUT_DURATION", "95"))
+MIN_OUTPUT_DURATION = int(os.environ.get("MIN_OUTPUT_DURATION", "90"))
+MAX_OUTPUT_DURATION = int(os.environ.get("MAX_OUTPUT_DURATION", "100"))
 # Minimum seconds of actual clip content required per group.
 # Compositor extends last clip into source if clips fall short.
 MIN_CONTENT_DURATION = float(os.environ.get("MIN_CONTENT_DURATION", "70"))
