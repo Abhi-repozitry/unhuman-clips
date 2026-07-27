@@ -207,15 +207,12 @@ class TestEnforceClipPacing:
 
     def test_swaps_short_ending(self):
         groups = [{"source_clips": [
-            {"source_start": 0.0, "source_end": 10.0, "reason": "LONG: buildup"},
-            {"source_start": 20.0, "source_end": 30.0, "reason": "LONG: climax"},
-            {"source_start": 40.0, "source_end": 43.0, "reason": "SHORT: quick beat"},
+            {"source_start": 0.0, "source_end": 18.0, "reason": "LONG: buildup"},
+            {"source_start": 20.0, "source_end": 40.0, "reason": "LONG: climax"},
+            {"source_start": 45.0, "source_end": 48.0, "reason": "SHORT: quick beat"},
         ]}]
         adjustments = enforce_clip_pacing(groups)
-        assert adjustments > 0
-        # Last clip should no longer be SHORT
-        last_dur = groups[0]["source_clips"][-1]["source_end"] - groups[0]["source_clips"][-1]["source_start"]
-        assert last_dur > 5.0
+        assert adjustments > 0  # back-to-back LONG trimmed
 
     def test_no_change_for_already_diverse(self):
         groups = [{"source_clips": [
@@ -224,7 +221,7 @@ class TestEnforceClipPacing:
             {"source_start": 30.0, "source_end": 48.0, "reason": "LONG: ending"},
         ]}]
         adjustments = enforce_clip_pacing(groups)
-        assert adjustments == 0
+        assert adjustments > 0  # LONG ending swapped (payoff = SHORT/MEDIUM)
 
     def test_trims_back_to_back_long(self):
         groups = [{"source_clips": [
@@ -233,9 +230,9 @@ class TestEnforceClipPacing:
         ]}]
         adjustments = enforce_clip_pacing(groups)
         assert adjustments > 0
-        # At least one should be trimmed to <=15s
+        # At least one should be trimmed to <=10s
         durs = [c["source_end"] - c["source_start"] for c in groups[0]["source_clips"]]
-        assert any(d <= 15.0 for d in durs)
+        assert any(d <= 10.0 for d in durs)
 
 
 class TestRepairClipDiversity:

@@ -6,7 +6,7 @@ Accepted
 
 ## Context
 
-YouTube videos range from 2 minutes to 2+ hours. A single output reel (90–180s) cannot capture the full content of longer videos. Users want multiple distinct reels from a single source, each telling a different story arc.
+YouTube videos range from 2 minutes to 2+ hours. A single output reel (75–95s) cannot capture the full content of longer videos. Users want multiple distinct reels from a single source, each telling a different story arc.
 
 The LLM needs to understand the full transcript and select clips that form coherent narratives, not just extract random segments.
 

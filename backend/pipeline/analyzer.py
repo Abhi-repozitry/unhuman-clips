@@ -785,10 +785,10 @@ FILLER REMOVAL — aggressively cut:
 Trim clips to the minimum that delivers the moment. Shorter is almost always better.
 
 CLIP MIX
-- SHORT 3-5s, MEDIUM 6-15s, LONG 16-30s — mix them for pacing.
+- SHORT 3-5s, MEDIUM 6-10s, LONG 11-15s — mix them for pacing.
 - No back-to-back LONG clips. No 3+ SHORT in a row.
 - Strongest moment must be in the final 30% of the reel.
-- Final clip must be MEDIUM or LONG (never end on a SHORT).
+- Final clip must be SHORT or MEDIUM — payoff moments (winner reveal, outcome) are typically quick, not long builds.
 - Never < 3.0s per clip.
 - Prefer SHOW THEN EXPLAIN: visual action first, commentary after.
 
@@ -919,18 +919,18 @@ def select_reel_plan(
     max_groups = _compute_group_count_ceiling(source_duration)
     min_groups = _compute_group_count_floor(source_duration)
 
-    # Duration targets — must land between 90-150s for output compliance
-    if source_duration < 90:
+    # Duration targets — must land between 75-95s for output compliance
+    if source_duration < 75:
         reel_dur_min = max(45, int(source_duration * 0.8))
-        reel_dur_max = min(int(source_duration * 0.95), 90)
-    elif source_duration < 150:
-        reel_dur_min = 90
-        reel_dur_max = min(int(source_duration * 0.95), 150)
+        reel_dur_max = min(int(source_duration * 0.95), 75)
+    elif source_duration < 95:
+        reel_dur_min = 75
+        reel_dur_max = min(int(source_duration * 0.95), 95)
     else:
-        reel_dur_min = 90
-        reel_dur_max = 150
-    if reel_dur_max - reel_dur_min < 30:
-        reel_dur_max = reel_dur_min + 30
+        reel_dur_min = 75
+        reel_dur_max = 95
+    if reel_dur_max - reel_dur_min < 20:
+        reel_dur_max = reel_dur_min + 20
     reel_dur_max = min(reel_dur_max, int(MAX_OUTPUT_DURATION))
 
     # ── Python: semantic blocks + importance ──

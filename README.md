@@ -2,7 +2,7 @@
 
 **Automated vertical short-form video clip generator from long YouTube videos.**
 
-Paste a YouTube URL. Get multiple 90–180 second vertical reels with AI-selected clips, narrated hooks, commentary overlays, and ASS captions — all composited with VAD-driven audio ducking.
+Paste a YouTube URL. Get multiple 75–95 second vertical reels with AI-selected clips, narrated hooks, commentary overlays, and ASS captions — all composited with VAD-driven audio ducking.
 
 ## Architecture
 
@@ -103,8 +103,8 @@ All settings are configured via environment variables in `backend/.env`. See [do
 | `NVIDIA_API_KEY` | *(required)* | NVIDIA API key for LLM analysis |
 | `FFMPEG_PATH` | `C:\Projects\...\ffmpeg.exe` | Path to ffmpeg binary |
 | `TTS_VOICE` | `en-US-ChristopherNeural` | Edge-TTS voice for narration |
-| `MAX_OUTPUT_DURATION` | `180` | Maximum reel duration (seconds) |
-| `MIN_OUTPUT_DURATION` | `90` | Minimum reel duration (seconds) |
+| `MAX_OUTPUT_DURATION` | `95` | Maximum reel duration (seconds) |
+| `MIN_OUTPUT_DURATION` | `75` | Minimum reel duration (seconds) |
 
 ## API Endpoints
 
