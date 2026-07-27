@@ -162,6 +162,7 @@ def call_llm_sync(
                     "reasoning_effort": reasoning_effort,
                 }
                 kwargs["response_format"] = {"type": "json_object"}
+                kwargs["stream_options"] = {"include_usage": True}
 
                 raw = None
                 token_count = ""
@@ -169,6 +170,7 @@ def call_llm_sync(
                     kwargs["stream"] = True
                     response = client.chat.completions.create(**kwargs)
                     full_content = ""
+                    reasoning_content = ""
                     chunk_count = 0
                     chunk = None
                     for chunk in response:
@@ -179,7 +181,15 @@ def call_llm_sync(
                                 chunk_count += 1
                                 if chunk_count % 10 == 0 and reporter and interactions is not None:
                                     reporter.set_stage_data_key("llm_interactions", [i.model_dump() for i in interactions])
-                    raw = full_content.strip()
+                            if delta and getattr(delta, "reasoning_content", None):
+                                reasoning_content += delta.reasoning_content
+                    if full_content.strip():
+                        raw = full_content.strip()
+                    elif reasoning_content.strip():
+                        raw = reasoning_content.strip()
+                        logger.warning(f"LLM returned only reasoning_content ({len(reasoning_content)} chars), using as response")
+                    else:
+                        raw = ""
                     usage = getattr(chunk, 'usage', None) if chunk else None
                     if usage:
                         token_count = f" ({usage.completion_tokens} out / {usage.prompt_tokens} in tokens)"

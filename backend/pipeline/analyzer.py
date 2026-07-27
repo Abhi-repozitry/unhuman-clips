@@ -1037,7 +1037,7 @@ def select_reel_plan(
             {"role": "user", "content": _prompt_narration_writer(video_title, groups)},
         ],
         progress_cb, reporter, interactions, stage_name="narration_writer",
-        max_tokens=16384,
+        max_tokens=32768,
     )
     narr_plan = _parse_json_response(raw3)
     narr_by_idx = {
