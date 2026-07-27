@@ -844,14 +844,34 @@ Video title: {video_title}
 GROUPS (clips already locked):
 {groups_json}
 
+STYLE: Write like a witty friend reacting live — not a narrator reading a script.
+Be punchy, specific, and unexpected. Every line should earn its spot.
+Reference what's actually on screen. Use the creator's energy, not generic hype.
+Humor beats inspiration. Specificity beats vagueness.
+
+HOOK (reel_start=0.0, reel_end=3.0-5.0, 6-10 words)
+- Drop the viewer into the most intriguing moment
+- BANNED: "Watch what happens", "You won't believe", "This is insane", "Wait for it"
+- GOOD: specific curiosity that demands resolution
+- Example hooks: "This is the worst idea I've ever had." / "He has no idea I'm here." / "3 AM. Empty stadium. One ball."
+
+COMMENTARIES (up to 2 per group, 8-14 words each)
+- Commentary 1: place at ~35-45% of estimated_duration
+- Commentary 2: place at ~70-80% of estimated_duration
+- Must have persona. Every commentary must feel like a real person talking.
+
+PERSONAS (pick the one that fits the moment):
+- roast: playful jab at what's happening. Not mean, just sharp. "Of course he brought a backup plan. And a backup for the backup."
+- brutally_honest: say what everyone's thinking but won't admit. "Let's be real, this could go horribly wrong."
+- friendly: warm, excited, rooting for them. "Okay, this is actually adorable."
+- sarcastic: dry wit, understated reactions. "Oh sure, because THAT always works out."
+- hype: genuine excitement, but specific — not just "LET'S GOOO". "The crowd just lost it. All of them. At once."
+- deadpan: flat delivery, maximum impact. "He missed. In front of everyone. On camera."
+
+BANNED filler for commentaries: "This is crazy", "No way", "Insane", "Literally dying", "I can't even", "Best thing ever"
+BANNED vague commentary: "That was amazing", "What a moment", "So cool"
+
 RULES
-- Max 3 events per group: 1 hook + up to 2 commentaries.
-- Hook: reel_start=0.0, reel_end=3.0-5.0, 6-10 words, specific curiosity.
-  BANNED: "Watch what happens", "You won't believe", "This is insane", "Wait for it"
-- Commentary 1 (middle): 8-14 words, place at ~35-45% of estimated_duration. Must have persona.
-- Commentary 2 (end): 8-14 words, place at ~70-80% of estimated_duration. Must have persona.
-  Personas: roast | brutally_honest | friendly | sarcastic | hype | deadpan
-  BANNED filler phrases for both commentaries.
 - ≥0.8s gap between events. Never cover key_moment. Last 3-5s free of narration.
 - Allowed chars: letters numbers . , ! ? ' - — " : ;
 
