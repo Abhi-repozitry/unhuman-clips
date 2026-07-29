@@ -117,10 +117,6 @@ def _compute_importance(
     silence_before: bool,
     black: bool,
     freeze: bool,
-    has_question: bool = False,
-    has_exclamation: bool = False,
-    has_emphasis: bool = False,
-    ocr_confidence: float = 0.0,
 ) -> float:
     """Deterministic importance 0–100. Python calculates; LLM only ranks editorially."""
     score = 0.0
@@ -131,15 +127,12 @@ def _compute_importance(
         # typical speech ~-20 to -10; map roughly
         vol_norm = max(0.0, min(1.0, (volume_db + 40) / 30.0))
         score += vol_norm * 15.0
-    # OCR = strong key-moment signal (0–15, weighted by confidence)
+    # OCR = strong key-moment signal (0–15)
     if has_ocr:
-        score += max(5.0, ocr_confidence * 15.0)
+        score += 15.0
     # Natural cut point (0–10)
     if silence_before:
         score += 10.0
-    # Engagement signals — questions, exclamations, emphasis (0–20)
-    engagement = (8.0 if has_question else 0.0) + (7.0 if has_exclamation else 0.0) + (5.0 if has_emphasis else 0.0)
-    score += min(20.0, engagement)
     # Penalties
     if black:
         score -= 25.0
@@ -170,7 +163,6 @@ def _build_semantic_blocks(
                 "energy": float(getattr(seg, "speech_energy", 0.0) or 0.0),
                 "volume_db": getattr(seg.metrics, "volume_db", None) if hasattr(seg, "metrics") else None,
                 "ocr": list(seg.ocr) if getattr(seg, "ocr", None) else [],
-                "ocr_confidence": float(getattr(seg, "ocr_confidence", 0.0) or 0.0),
                 "silence_before": bool(getattr(seg, "silence_before", False)),
                 "black": bool(getattr(seg.metrics, "black_frame", False)) if hasattr(seg, "metrics") else False,
                 "freeze": bool(getattr(seg.metrics, "freeze_detected", False)) if hasattr(seg, "metrics") else False,
@@ -231,12 +223,8 @@ def _build_semantic_blocks(
         has_emphasis = any(g["has_emphasis"] for g in group)
         word_densities = [g["word_density"] for g in group if g["word_density"] > 0]
         avg_word_density = sum(word_densities) / len(word_densities) if word_densities else 0.0
-        # OCR confidence: use max confidence from segments with OCR
-        ocr_confs = [g.get("ocr_confidence", 0.0) for g in group if g.get("ocr")]
-        max_ocr_confidence = max(ocr_confs) if ocr_confs else 0.0
         importance = _compute_importance(
-            avg_energy, volume_db, bool(ocr), silence_before, black, freeze,
-            has_question, has_exclamation, has_emphasis, max_ocr_confidence
+            avg_energy, volume_db, bool(ocr), silence_before, black, freeze
         )
         blocks.append(SemanticBlock(
             block_id=len(blocks),
@@ -797,10 +785,10 @@ FILLER REMOVAL — aggressively cut:
 Trim clips to the minimum that delivers the moment. Shorter is almost always better.
 
 CLIP MIX
-- SHORT ≤6s, MEDIUM 7-15s, LONG 16-20s — mix them for pacing.
+- SHORT 3-5s, MEDIUM 6-15s, LONG 16-30s — mix them for pacing.
 - No back-to-back LONG clips. No 3+ SHORT in a row.
 - Strongest moment must be in the final 30% of the reel.
-- Final clip must be MEDIUM — payoff moments need enough time for the reveal.
+- Final clip must be MEDIUM or LONG (never end on a SHORT).
 - Never < 3.0s per clip.
 - Prefer SHOW THEN EXPLAIN: visual action first, commentary after.
 
@@ -856,34 +844,14 @@ Video title: {video_title}
 GROUPS (clips already locked):
 {groups_json}
 
-STYLE: Write like a witty friend reacting live — not a narrator reading a script.
-Be punchy, specific, and unexpected. Every line should earn its spot.
-Reference what's actually on screen. Use the creator's energy, not generic hype.
-Humor beats inspiration. Specificity beats vagueness.
-
-HOOK (reel_start=0.0, reel_end=3.0-5.0, 6-10 words)
-- Drop the viewer into the most intriguing moment
-- BANNED: "Watch what happens", "You won't believe", "This is insane", "Wait for it"
-- GOOD: specific curiosity that demands resolution
-- Example hooks: "This is the worst idea I've ever had." / "He has no idea I'm here." / "3 AM. Empty stadium. One ball."
-
-COMMENTARIES (up to 2 per group, 8-14 words each)
-- Commentary 1: place at ~35-45% of estimated_duration
-- Commentary 2: place at ~70-80% of estimated_duration
-- Must have persona. Every commentary must feel like a real person talking.
-
-PERSONAS (pick the one that fits the moment):
-- roast: playful jab at what's happening. Not mean, just sharp. "Of course he brought a backup plan. And a backup for the backup."
-- brutally_honest: say what everyone's thinking but won't admit. "Let's be real, this could go horribly wrong."
-- friendly: warm, excited, rooting for them. "Okay, this is actually adorable."
-- sarcastic: dry wit, understated reactions. "Oh sure, because THAT always works out."
-- hype: genuine excitement, but specific — not just "LET'S GOOO". "The crowd just lost it. All of them. At once."
-- deadpan: flat delivery, maximum impact. "He missed. In front of everyone. On camera."
-
-BANNED filler for commentaries: "This is crazy", "No way", "Insane", "Literally dying", "I can't even", "Best thing ever"
-BANNED vague commentary: "That was amazing", "What a moment", "So cool"
-
 RULES
+- Max 3 events per group: 1 hook + up to 2 commentaries.
+- Hook: reel_start=0.0, reel_end=2.5-4.0, 6-10 words, specific curiosity.
+  BANNED: "Watch what happens", "You won't believe", "This is insane", "Wait for it"
+- Commentary 1 (middle): 8-14 words, place at ~35-45% of estimated_duration. Must have persona.
+- Commentary 2 (end): 8-14 words, place at ~70-80% of estimated_duration. Must have persona.
+  Personas: roast | brutally_honest | friendly | sarcastic | hype | deadpan
+  BANNED filler phrases for both commentaries.
 - ≥0.8s gap between events. Never cover key_moment. Last 3-5s free of narration.
 - Allowed chars: letters numbers . , ! ? ' - — " : ;
 
@@ -893,7 +861,7 @@ OUTPUT — STRICT JSON ONLY
     {{
       "group_index": 0,
       "narration_events": [
-        {{"event_type": "hook", "reel_start": 0.0, "reel_end": 5.0, "text": "...", "persona": null, "voice_id": null}},
+        {{"event_type": "hook", "reel_start": 0.0, "reel_end": 3.0, "text": "...", "persona": null, "voice_id": null}},
         {{"event_type": "commentary", "reel_start": 35.0, "reel_end": 38.0, "text": "...", "persona": "roast", "voice_id": null}},
         {{"event_type": "commentary", "reel_start": 70.0, "reel_end": 73.0, "text": "...", "persona": "hype", "voice_id": null}}
       ]
@@ -951,18 +919,18 @@ def select_reel_plan(
     max_groups = _compute_group_count_ceiling(source_duration)
     min_groups = _compute_group_count_floor(source_duration)
 
-    # Duration targets — must land between MIN-MAX_OUTPUT_DURATION for output compliance
-    if source_duration < MIN_OUTPUT_DURATION:
+    # Duration targets — must land between 90-150s for output compliance
+    if source_duration < 90:
         reel_dur_min = max(45, int(source_duration * 0.8))
-        reel_dur_max = min(int(source_duration * 0.95), MIN_OUTPUT_DURATION)
-    elif source_duration < MAX_OUTPUT_DURATION:
-        reel_dur_min = MIN_OUTPUT_DURATION
-        reel_dur_max = min(int(source_duration * 0.95), MAX_OUTPUT_DURATION)
+        reel_dur_max = min(int(source_duration * 0.95), 90)
+    elif source_duration < 150:
+        reel_dur_min = 90
+        reel_dur_max = min(int(source_duration * 0.95), 150)
     else:
-        reel_dur_min = MIN_OUTPUT_DURATION
-        reel_dur_max = MAX_OUTPUT_DURATION
-    if reel_dur_max - reel_dur_min < 20:
-        reel_dur_max = reel_dur_min + 20
+        reel_dur_min = 90
+        reel_dur_max = 150
+    if reel_dur_max - reel_dur_min < 30:
+        reel_dur_max = reel_dur_min + 30
     reel_dur_max = min(reel_dur_max, int(MAX_OUTPUT_DURATION))
 
     # ── Python: semantic blocks + importance ──
@@ -1069,7 +1037,7 @@ def select_reel_plan(
             {"role": "user", "content": _prompt_narration_writer(video_title, groups)},
         ],
         progress_cb, reporter, interactions, stage_name="narration_writer",
-        max_tokens=32768,
+        max_tokens=16384,
     )
     narr_plan = _parse_json_response(raw3)
     narr_by_idx = {
