@@ -10,7 +10,12 @@ import logging
 import queue
 from typing import Any, Callable
 
-from backend.config import GPU_SEMAPHORE_SIZE, get_job_working_dir
+from backend.config import (
+    AVAILABLE_MODELS,
+    GPU_SEMAPHORE_SIZE,
+    NVIDIA_MODEL,
+    get_job_working_dir,
+)
 from backend.models import JobStatus, LLMInteraction, OutputReel, ReelPlan, VideoJob
 from backend.pipeline.checkpoint import PipelineCheckpoint
 from backend.pipeline.downloader import download_video, validate_downloaded_video
@@ -74,9 +79,9 @@ class QueueManager:
         except queue.Full:
             pass  # Drop oldest under backpressure
 
-    def add_job(self, url: str, generate_captions: bool = True) -> VideoJob:
+    def add_job(self, url: str, generate_captions: bool = True, model: str = "stepfun-ai/step-3.7-flash") -> VideoJob:
         """Create a new job, enqueue it, and return the job object."""
-        job = VideoJob(url=url, generate_captions=generate_captions)
+        job = VideoJob(url=url, generate_captions=generate_captions, model=model)
         self.jobs[job.id] = job
         self.queue.put_nowait(job.id)
         # Immediately enqueue a broadcast so the frontend sees the new job
@@ -93,6 +98,18 @@ class QueueManager:
             del self.jobs[job_id]
             return True
         return False
+
+    def cleanup_old_jobs(self, max_age_hours: float = 24.0) -> int:
+        """Remove completed/error jobs older than max_age_hours. Returns count removed."""
+        from datetime import datetime, timedelta, timezone
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
+        to_remove = []
+        for job_id, job in self.jobs.items():
+            if job.status in ("DONE", "ERROR") and job.created_at.replace(tzinfo=timezone.utc) < cutoff:
+                to_remove.append(job_id)
+        for job_id in to_remove:
+            del self.jobs[job_id]
+        return len(to_remove)
 
     async def broadcast_drain_loop(self, broadcast_fn: Callable[[VideoJob], Any]) -> None:
         """Event-loop coroutine: poll the thread-safe queue and send to WebSocket clients.
@@ -306,11 +323,15 @@ class QueueManager:
 
             video_description = result.get("description", "")
             try:
+                # Resolve model: use the selected model from AVAILABLE_MODELS, fallback to NVIDIA_MODEL
+                model_key = job.model if job.model else "stepfun-ai/step-3.7-flash"
+                selected_model = AVAILABLE_MODELS.get(model_key, NVIDIA_MODEL)
+
                 reel_plan = await asyncio.wait_for(
                     asyncio.to_thread(
                         select_reel_plan, job.transcript, job.title or "", video_description,
                         analyzer_progress, reporter, llm_interactions,
-                        rich_timeline=job.rich_timeline,
+                        rich_timeline=job.rich_timeline, model=selected_model,
                     ),
                     timeout=2700.0,
                 )

@@ -18,7 +18,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from backend.config import OUTPUTS_DIR
+from backend.config import AVAILABLE_MODELS, OUTPUTS_DIR
 from backend.logging_config import setup_logging
 from backend.models import VideoJob
 from backend.queue_manager import QueueManager
@@ -147,6 +147,7 @@ FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend" / "renderer"
 class CreateJobRequest(BaseModel):
     url: str
     generate_captions: bool = True
+    model: str = "stepfun-ai/step-3.7-flash"
 
 
 def _check_rate_limit() -> bool:
@@ -177,7 +178,7 @@ async def create_job(body: CreateJobRequest):
             status_code=429,
             content={"error": "Rate limit exceeded. Try again later."},
         )
-    job = queue_manager.add_job(body.url, generate_captions=body.generate_captions)
+    job = queue_manager.add_job(body.url, generate_captions=body.generate_captions, model=body.model)
     return job
 
 
@@ -264,6 +265,37 @@ async def set_mode(body: ModeRequest):
     return {"mode": body.mode, "fast_mode": cfg.FAST_MODE}
 
 
+# --- Model config endpoints ---
+
+class ModelRequest(BaseModel):
+    model: str  # "default" or "stepfun-ai/step-3.7-flash"
+
+
+@app.get("/config/model")
+async def get_model():
+    """Return current model configuration."""
+    import backend.config as cfg
+    return {
+        "model": cfg.NVIDIA_MODEL,
+        "available_models": AVAILABLE_MODELS,
+    }
+
+
+@app.put("/config/model")
+async def set_model(body: ModelRequest):
+    """Switch the LLM model for analysis."""
+    import backend.config as cfg
+    if body.model not in AVAILABLE_MODELS:
+        return JSONResponse(
+            status_code=400,
+            content={"error": f"model must be one of: {', '.join(AVAILABLE_MODELS.keys())}"},
+        )
+    resolved_model = AVAILABLE_MODELS[body.model]
+    cfg.NVIDIA_MODEL = resolved_model
+    logger.info("LLM model set to: %s (resolved: %s)", body.model, resolved_model)
+    return {"model": body.model, "resolved_model": resolved_model}
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await connection_manager.connect(websocket)
@@ -283,7 +315,9 @@ async def websocket_endpoint(websocket: WebSocket):
 
 @app.get("/{full_path:path}")
 async def serve_frontend(full_path: str):
-    file_path = FRONTEND_DIR / full_path
+    file_path = (FRONTEND_DIR / full_path).resolve()
+    if not str(file_path).startswith(str(FRONTEND_DIR.resolve())):
+        return JSONResponse(status_code=403, content={"error": "forbidden"})
     if file_path.exists() and file_path.is_file():
         return FileResponse(str(file_path))
     return FileResponse(str(FRONTEND_DIR / "index.html"))

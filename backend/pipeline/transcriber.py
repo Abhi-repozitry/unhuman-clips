@@ -59,6 +59,19 @@ def _prepare_cuda_runtime_libraries() -> list[str]:
         )
 
     lib_dirs: list[Path] = []
+    # Prefer torch's bundled CUDA libraries over pip nvidia packages to avoid
+    # version mismatches (e.g. pip cublas missing cublasLtGetEnvironmentMode).
+    try:
+        import torch as _torch
+        torch_lib = Path(_torch.__file__).resolve().parent / "lib"
+        if torch_lib.is_dir():
+            for f in torch_lib.iterdir():
+                if f.suffix == nvidia_lib_ext and ("cuda" in f.name.lower() or "cublas" in f.name.lower() or "cudnn" in f.name.lower() or "nvrtc" in f.name.lower() or "cudart" in f.name.lower()):
+                    if torch_lib not in lib_dirs:
+                        lib_dirs.append(torch_lib)
+                    break
+    except ImportError:
+        pass
     for site_packages in candidate_site_packages:
         nvidia_dir = site_packages / "nvidia"
         if not nvidia_dir.exists():
@@ -88,20 +101,19 @@ def _prepare_cuda_runtime_libraries() -> list[str]:
             os.environ["LD_LIBRARY_PATH"] = ":".join(dict.fromkeys(merged))
 
     loaded: list[str] = []
+    # NOTE: Do NOT preload cublas/cublasLt via ctypes.CDLL — CTranslate2 manages
+    # its own cublas loading. Force-loading a mismatched version (e.g. from pip
+    # nvidia packages) causes "entry point not found" errors.
     if _is_windows():
         preferred_names = (
             "cudart64_12.dll",
             "nvrtc64_120_0.dll",
-            "cublasLt64_12.dll",
-            "cublas64_12.dll",
             "cudnn64_9.dll",
         )
     else:
         preferred_names = (
             "libcudart.so.12",
             "libnvrtc.so.12",
-            "libcublasLt.so.12",
-            "libcublas.so.12",
             "libcudnn.so.9",
         )
     for name in preferred_names:
@@ -123,6 +135,7 @@ def _prepare_cuda_runtime_libraries() -> list[str]:
 
 _cuda_preloaded = False
 _model_lock = threading.Lock()
+_model_load_failed = False
 
 from backend.config import WHISPER_MODEL_SIZE, WHISPER_COMPUTE_TYPE_CUDA, WHISPER_COMPUTE_TYPE_CPU
 
@@ -171,16 +184,17 @@ def _load_model():
 
 def _ensure_model():
     """Lazily load the Whisper model on first transcription call."""
-    global _model, _model_loaded
-    if _model_loaded:
+    global _model, _model_loaded, _model_load_failed
+    if _model_loaded or _model_load_failed:
         return
     with _model_lock:
-        if _model_loaded:
+        if _model_loaded or _model_load_failed:
             return
         try:
             _load_model()
             _model_loaded = True
         except Exception as e:
+            _model_load_failed = True
             logger.error(f"Whisper model initialization failed: {e}")
             logger.info("Transcription will fail at runtime - check CUDA/cuDNN installation")
 

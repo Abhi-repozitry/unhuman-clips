@@ -17,6 +17,7 @@ __all__ = [
     "get_job_working_dir", "validate_config", "cleanup_stale_files",
     "FFMPEG_PATH", "FFPROBE_PATH",
     "NVIDIA_API_KEY", "NVIDIA_BASE_URL", "NVIDIA_MODEL", "NVIDIA_MODEL_FALLBACK",
+    "AVAILABLE_MODELS",
     "MAX_INPUT_TOKENS", "MAX_OUTPUT_TOKENS",
     "MIN_CONTENT_DURATION",
     "WHISPER_MODEL_SIZE", "WHISPER_COMPUTE_TYPE_CUDA", "WHISPER_COMPUTE_TYPE_CPU",
@@ -55,6 +56,18 @@ NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
 NVIDIA_MODEL = os.environ.get("NVIDIA_MODEL", "openai/gpt-oss-120b")
 NVIDIA_MODEL_FALLBACK = os.environ.get("NVIDIA_MODEL_FALLBACK", "openai/gpt-oss-120b")
 
+# Available models for UI selection — maps display key to actual model ID
+AVAILABLE_MODELS = {
+    "stepfun-ai/step-3.7-flash": "stepfun-ai/step-3.7-flash",
+    "gpt-oss-120b": NVIDIA_MODEL,
+}
+
+# Cross-fallback map: when primary model fails, fall back to the other model
+MODEL_FALLBACK_MAP = {
+    "stepfun-ai/step-3.7-flash": NVIDIA_MODEL,
+    "gpt-oss-120b": "stepfun-ai/step-3.7-flash",
+}
+
 MAX_INPUT_TOKENS = int(os.environ.get("MAX_INPUT_TOKENS", "80000"))
 MAX_OUTPUT_TOKENS = int(os.environ.get("MAX_OUTPUT_TOKENS", "16384"))
 REASONING_EFFORT = os.environ.get("REASONING_EFFORT", "high")
@@ -63,19 +76,19 @@ CLIP_COUNT_MIN = int(os.environ.get("CLIP_COUNT_MIN", "6"))
 CLIP_COUNT_MAX = int(os.environ.get("CLIP_COUNT_MAX", "12"))
 CLIP_DURATION_SOFT_MIN = float(os.environ.get("CLIP_DURATION_SOFT_MIN", "10"))
 CLIP_DURATION_SOFT_MAX = float(os.environ.get("CLIP_DURATION_SOFT_MAX", "30"))
-HOOK_SECONDS = float(os.environ.get("HOOK_SECONDS", "3"))
+HOOK_SECONDS = float(os.environ.get("HOOK_SECONDS", "5"))
 INSIGHT_SECONDS_MAX = float(os.environ.get("INSIGHT_SECONDS_MAX", "4"))
 MIN_OUTPUT_DURATION = int(os.environ.get("MIN_OUTPUT_DURATION", "90"))
-MAX_OUTPUT_DURATION = int(os.environ.get("MAX_OUTPUT_DURATION", "100"))
+MAX_OUTPUT_DURATION = int(os.environ.get("MAX_OUTPUT_DURATION", "120"))
 # Minimum seconds of actual clip content required per group.
 # Compositor extends last clip into source if clips fall short.
 MIN_CONTENT_DURATION = float(os.environ.get("MIN_CONTENT_DURATION", "70"))
 
 OUTPUT_WIDTH = 1080
 OUTPUT_HEIGHT = 1350
-OUTPUT_FPS = 30
+OUTPUT_FPS = int(os.environ.get("OUTPUT_FPS", "60"))
 
-DOWNLOAD_MAX_HEIGHT = int(os.environ.get("DOWNLOAD_MAX_HEIGHT", "1080"))
+DOWNLOAD_MAX_HEIGHT = int(os.environ.get("DOWNLOAD_MAX_HEIGHT", "1440"))
 
 FFMPEG_PATH = r"C:\Projects\unhuman-clips\ffmpeg\ffmpeg-8.1.2-full_build\bin\ffmpeg.exe"
 FFPROBE_PATH = r"C:\Projects\unhuman-clips\ffmpeg\ffmpeg-8.1.2-full_build\bin\ffprobe.exe"

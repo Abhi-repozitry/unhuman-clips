@@ -29,8 +29,9 @@ All settings are configured via environment variables in `backend/.env`. The ser
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `DOWNLOAD_MAX_HEIGHT` | `1080` | Max video resolution to download |
-| `DOWNLOAD_FORMAT` | `bestvideo[height<=1080]+bestaudio/best[height<=1080]` | yt-dlp format selector |
+| `DOWNLOAD_MAX_HEIGHT` | `1440` | Max video resolution to download |
+| `OUTPUT_FPS` | `60` | Output video frame rate (supports 30 or 60) |
+| `DOWNLOAD_FORMAT` | `bestvideo[height<=1440][fps<=OUTPUT_FPS]+bestaudio/bestvideo[height<=1440]+bestaudio/best[height<=1440]` | yt-dlp format selector (uses OUTPUT_FPS value) |
 | `MAX_OUTPUT_DURATION` | `95` | Maximum output reel duration (seconds) |
 | `MIN_OUTPUT_DURATION` | `75` | Minimum output reel duration (seconds) |
 | `TARGET_GROUP_DURATION` | `120` | Ideal group duration for LLM planning (seconds) |
@@ -133,7 +134,8 @@ NVIDIA_MODEL=openai/gpt-oss-120b
 NVIDIA_MODEL_FALLBACK=openai/gpt-oss-120b
 
 # Video
-DOWNLOAD_MAX_HEIGHT=1080
+DOWNLOAD_MAX_HEIGHT=1440
+OUTPUT_FPS=60
 MAX_OUTPUT_DURATION=95
 MIN_OUTPUT_DURATION=75
 

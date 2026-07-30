@@ -39,6 +39,7 @@ from backend.config import (
     MAX_OUTPUT_DURATION,
     MAX_OUTPUT_TOKENS,
     MIN_OUTPUT_DURATION,
+    MODEL_FALLBACK_MAP,
     NVIDIA_API_KEY,
     NVIDIA_BASE_URL,
     NVIDIA_MODEL,
@@ -411,15 +412,19 @@ def _call_llm(
     stage_name: str = "reel_plan",
     max_tokens: int = MAX_OUTPUT_TOKENS,
     reasoning_effort: str = REASONING_EFFORT,
+    model: str | None = None,
 ) -> str:
     if not NVIDIA_API_KEY:
         raise RuntimeError(
             "NVIDIA_API_KEY is not set. Skipping LLM analysis and using local fallback."
         )
 
-    models_to_try = [NVIDIA_MODEL]
-    if NVIDIA_MODEL_FALLBACK and NVIDIA_MODEL_FALLBACK != NVIDIA_MODEL:
-        models_to_try.append(NVIDIA_MODEL_FALLBACK)
+    primary_model = model if model else NVIDIA_MODEL
+    models_to_try = [primary_model]
+    # Use cross-fallback map: each model falls back to the other
+    fallback = MODEL_FALLBACK_MAP.get(primary_model, NVIDIA_MODEL_FALLBACK)
+    if fallback and fallback != primary_model:
+        models_to_try.append(fallback)
 
     last_error = None
     for model in models_to_try:
@@ -846,14 +851,21 @@ GROUPS (clips already locked):
 
 RULES
 - Max 3 events per group: 1 hook + up to 2 commentaries.
-- Hook: reel_start=0.0, reel_end=2.5-4.0, 6-10 words, specific curiosity.
-  BANNED: "Watch what happens", "You won't believe", "This is insane", "Wait for it"
-- Commentary 1 (middle): 8-14 words, place at ~35-45% of estimated_duration. Must have persona.
-- Commentary 2 (end): 8-14 words, place at ~70-80% of estimated_duration. Must have persona.
+- Hook: reel_start=0.0, reel_end=2.0-3.0, 4-7 words, specific curiosity.
+  BANNED: "Watch what happens", "You won't believe", "This is insane", "Wait for it",
+  "No way this is real", "I can't believe it", "This is crazy", "Look at this",
+  "Oh my god", "Bro what"
+- Commentary 1 (middle): 4-6 words, place at ~35-45% of estimated_duration. Must have persona.
+- Commentary 2 (end): 4-6 words, place at ~70-80% of estimated_duration. Must have persona.
   Personas: roast | brutally_honest | friendly | sarcastic | hype | deadpan
   BANNED filler phrases for both commentaries.
+- Punchy style: short, sharp, impactful. Think one-liner, not sentence.
+- Commentary must REACT to what is on screen, not DESCRIBE it.
+- Use power words: destroyed, insane, genius, why, actually, never
+- No filler: like, basically, honestly, so, well, you know
 - ≥0.8s gap between events. Never cover key_moment. Last 3-5s free of narration.
 - Allowed chars: letters numbers . , ! ? ' - — " : ;
+- BANNED chars: / \ | @ # $ % ^ & * ( ) [ ] {{ }} < > ~ `
 
 OUTPUT — STRICT JSON ONLY
 {{
@@ -861,9 +873,9 @@ OUTPUT — STRICT JSON ONLY
     {{
       "group_index": 0,
       "narration_events": [
-        {{"event_type": "hook", "reel_start": 0.0, "reel_end": 3.0, "text": "...", "persona": null, "voice_id": null}},
-        {{"event_type": "commentary", "reel_start": 35.0, "reel_end": 38.0, "text": "...", "persona": "roast", "voice_id": null}},
-        {{"event_type": "commentary", "reel_start": 70.0, "reel_end": 73.0, "text": "...", "persona": "hype", "voice_id": null}}
+        {{"event_type": "hook", "reel_start": 0.0, "reel_end": 2.5, "text": "...", "persona": null, "voice_id": null}},
+        {{"event_type": "commentary", "reel_start": 35.0, "reel_end": 36.5, "text": "...", "persona": "roast", "voice_id": null}},
+        {{"event_type": "commentary", "reel_start": 70.0, "reel_end": 71.5, "text": "...", "persona": "hype", "voice_id": null}}
       ]
     }}
   ]
@@ -890,6 +902,10 @@ Check for:
 - groups that don't stand alone (require context from another reel)
 - hook clips that are introductions instead of curiosity triggers
 - clips showing then explaining instead of explaining then showing (prefer show-first)
+- commentary text longer than 6 words (trim to 4-6 words, punchy)
+- commentary that DESCRIBES instead of REACTS (should feel like a one-liner)
+- banned characters in narration: / \ | @ # $ % ^ & * ( ) [ ] {{ }} < > ~ `
+- filler words in narration: like, basically, honestly, so, well, you know
 
 Return the FULL revised plan as STRICT JSON with the same schema:
 structure_analysis (if present), ranked_segments (optional), reel_groups (with source_clips + narration_events), explanations.
@@ -908,6 +924,7 @@ def select_reel_plan(
     reporter: Any = None,
     interactions: list[LLMInteraction] | None = None,
     rich_timeline: RichTimeline | None = None,
+    model: str | None = None,
 ) -> ReelPlan:
     if progress_cb:
         progress_cb("Building semantic blocks...", 5)
@@ -968,7 +985,7 @@ def select_reel_plan(
             )},
         ],
         progress_cb, reporter, interactions, stage_name="structure_planner",
-        max_tokens=32768,
+        max_tokens=32768, model=model,
     )
     structure = _parse_json_response(raw1)
     sa = structure.get("structure_analysis", structure)
@@ -1012,7 +1029,7 @@ def select_reel_plan(
             )},
         ],
         progress_cb, reporter, interactions, stage_name="clip_planner",
-        max_tokens=65536,
+        max_tokens=65536, model=model,
     )
     clips_plan = _parse_json_response(raw2)
     groups = clips_plan.get("reel_groups", [])
@@ -1037,7 +1054,7 @@ def select_reel_plan(
             {"role": "user", "content": _prompt_narration_writer(video_title, groups)},
         ],
         progress_cb, reporter, interactions, stage_name="narration_writer",
-        max_tokens=16384,
+        max_tokens=65536, model=model,
     )
     narr_plan = _parse_json_response(raw3)
     narr_by_idx = {
@@ -1068,7 +1085,7 @@ def select_reel_plan(
                     {"role": "user", "content": _prompt_critic(draft, reel_dur_min, reel_dur_max)},
                 ],
                 progress_cb, reporter, interactions, stage_name="critic",
-                max_tokens=32768,
+                max_tokens=32768, model=model,
             )
             revised = _parse_json_response(raw4)
             revised_groups = revised.get("reel_groups", [])

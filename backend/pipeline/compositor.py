@@ -138,7 +138,8 @@ def _run_ffmpeg(
 
 def _ass_filter(path: str) -> str:
     filename = Path(path).name
-    return f"ass=filename={filename}"
+    escaped = filename.replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
+    return f"ass='{escaped}'"
 
 
 def _concat_demuxer(
@@ -421,6 +422,20 @@ def _get_video_duration_seconds(video_path: str) -> float:
         return 0.0
 
 
+def _measure_precut_durations(clip_paths: list[str]) -> float:
+    """Measure actual total duration of pre-cut clip files via ffprobe.
+
+    This avoids relying on source_clips metadata which may have been expanded
+    after the clips were cut, causing a metadata/file duration mismatch.
+    """
+    total = 0.0
+    for p in clip_paths:
+        dur = _get_video_duration_seconds(p)
+        if dur > 0:
+            total += dur
+    return total
+
+
 def compose_group(
     job_id: str,
     group_idx: int,
@@ -529,7 +544,23 @@ def compose_group(
     if progress_cb:
         progress_cb(f"Group {group_idx+1}: Building continuous video from {n_clips} clips...", 5)
 
-    total_clip_duration = sum(clip["source_end"] - clip["source_start"] for clip in source_clips)
+    # When using pre-cut clips, measure actual file durations instead of relying
+    # on source_clips metadata which may have been expanded AFTER the clips were cut.
+    # This prevents the metadata/file mismatch that causes -shortest truncation.
+    metadata_clip_duration = sum(clip["source_end"] - clip["source_start"] for clip in source_clips)
+    if use_precut:
+        actual_file_duration = _measure_precut_durations(group_clip_paths)
+        if actual_file_duration > 0:
+            total_clip_duration = actual_file_duration
+            logger.info(
+                f"Group {group_idx}: Measured actual clip file duration: {total_clip_duration:.1f}s "
+                f"(metadata claimed {metadata_clip_duration:.1f}s)"
+            )
+        else:
+            total_clip_duration = metadata_clip_duration
+            logger.warning(f"Group {group_idx}: Could not measure clip files, falling back to metadata: {total_clip_duration:.1f}s")
+    else:
+        total_clip_duration = metadata_clip_duration
     
     max_narration_end = 0.0
     if narration_audio:
@@ -819,13 +850,16 @@ def compose_group(
     output_path = working_dir / f"group_{group_idx}_output.mp4"
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # Final mux: combine video + audio.  Do NOT use -shortest — it silently
+    # truncates when container metadata is inaccurate.  Use -t as a safety cap
+    # so the output never exceeds target_duration.
     ffmpeg_final = [
         get_ffmpeg(), "-loglevel", "error",
         "-i", str(video_output),
         "-i", str(mixed_audio_output),
         "-map", "0:v", "-map", "1:a",
-        "-c:v", "copy", "-c:a", "aac", "-ar", "44100", "-ac", "2",
-        "-shortest",
+        "-c:v", "copy", "-c:a", "aac", "-ar", "44100", "-ac", 2,
+        "-t", f"{target_duration:.3f}",
         "-y", str(output_path)
     ]
     _run_ffmpeg(ffmpeg_final, f"Group {group_idx} final mux")
@@ -834,6 +868,38 @@ def compose_group(
     if progress_cb:
         progress_cb(f"Group {group_idx+1}: Done ({actual_duration:.1f}s)", 100)
     logger.info(f"Group {group_idx} output: {output_path.name} (final video duration: {actual_duration:.1f}s)")
+
+    # Safety: if output is still shorter than MIN_OUTPUT_DURATION, retry with
+    # explicit re-encode to force correct duration (fixes container metadata issues).
+    if actual_duration < float(MIN_OUTPUT_DURATION) - 2.0:
+        logger.warning(
+            f"Group {group_idx}: Output {actual_duration:.1f}s is below {MIN_OUTPUT_DURATION}s — "
+            f"retrying final mux with re-encode to force duration"
+        )
+        retry_path = working_dir / f"group_{group_idx}_output_retry.mp4"
+        ffmpeg_retry = [
+            get_ffmpeg(), "-loglevel", "error",
+            "-i", str(video_output),
+            "-i", str(mixed_audio_output),
+            "-map", "0:v", "-map", "1:a",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "fast", "-crf", "23",
+            "-c:a", "aac", "-ar", "44100", "-ac", 2,
+            "-t", f"{target_duration:.3f}",
+            "-y", str(retry_path)
+        ]
+        _run_ffmpeg(ffmpeg_retry, f"Group {group_idx} final mux (retry)")
+        retry_duration = _get_video_duration_seconds(str(retry_path))
+        if retry_duration > actual_duration:
+            import shutil
+            shutil.move(str(retry_path), str(output_path))
+            actual_duration = retry_duration
+            logger.info(f"Group {group_idx}: Retry produced {actual_duration:.1f}s output")
+        else:
+            try:
+                retry_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
     if abs(actual_duration - target_duration) > 2.0:
         logger.warning(f"Group {group_idx}: FINAL OUTPUT duration {actual_duration:.1f}s deviates from target {target_duration:.1f}s by {abs(actual_duration - target_duration):.1f}s — check audio/video alignment!")
 

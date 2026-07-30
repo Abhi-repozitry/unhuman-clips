@@ -82,11 +82,13 @@ def call_llm_sync(
     - temperature=0.0 for determinism where possible
     - reasoning_effort controls model thinking depth ('low'/'medium'/'high')
     """
-    from backend.config import NVIDIA_MODEL_FALLBACK
+    from backend.config import MODEL_FALLBACK_MAP, NVIDIA_MODEL_FALLBACK
 
     models_to_try = [model]
-    if NVIDIA_MODEL_FALLBACK and NVIDIA_MODEL_FALLBACK != model:
-        models_to_try.append(NVIDIA_MODEL_FALLBACK)
+    # Use cross-fallback map: each model falls back to the other
+    fallback = MODEL_FALLBACK_MAP.get(model, NVIDIA_MODEL_FALLBACK)
+    if fallback and fallback != model:
+        models_to_try.append(fallback)
 
     # Exponential backoff: 1s, 3s, 6s, 10s
     backoff_delays = [1, 3, 6, 10]
@@ -304,6 +306,10 @@ def cached_call_llm_sync(
     key = _cache_key(messages, model, reasoning_effort)
     now = time.monotonic()
 
+    # Periodically clean up expired cache entries
+    if len(_llm_cache) > 100:
+        _cleanup_expired_cache()
+
     if key in _llm_cache:
         cached_time, cached_val = _llm_cache[key]
         if now - cached_time < _LLM_CACHE_TTL:
@@ -335,3 +341,11 @@ def cached_call_llm_sync(
 def clear_llm_cache():
     """Clear the LLM response cache."""
     _llm_cache.clear()
+
+
+def _cleanup_expired_cache():
+    """Remove expired entries from the LLM cache."""
+    now = time.monotonic()
+    expired = [k for k, (t, _) in _llm_cache.items() if now - t >= _LLM_CACHE_TTL]
+    for k in expired:
+        del _llm_cache[k]

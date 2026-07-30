@@ -187,3 +187,4 @@ class VideoJob(BaseModel):
     num_output_groups: int = 1
     current_group_index: int = 0
     generate_captions: bool = True
+    model: str = "stepfun-ai/step-3.7-flash"

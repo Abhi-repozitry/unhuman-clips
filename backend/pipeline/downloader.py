@@ -16,7 +16,7 @@ from typing import Any, Callable
 
 import yt_dlp
 
-from backend.config import DOWNLOAD_MAX_HEIGHT, FFMPEG_PATH
+from backend.config import DOWNLOAD_MAX_HEIGHT, FFMPEG_PATH, OUTPUT_FPS
 from backend.ffmpeg_utils import get_ffmpeg, get_ffprobe
 
 __all__ = ["download_video", "validate_downloaded_video"]
@@ -104,13 +104,14 @@ def download_video(
     # selects split streams, we fail with a clear error instead of continuing
     # with stale/invalid artifacts.
     if ffmpeg_available:
-        format_selector = f"bestvideo[height<={DOWNLOAD_MAX_HEIGHT}]+bestaudio/best[height<={DOWNLOAD_MAX_HEIGHT}]/best"
+        format_selector = f"bestvideo[height<={DOWNLOAD_MAX_HEIGHT}][fps<={OUTPUT_FPS}]+bestaudio/bestvideo[height<={DOWNLOAD_MAX_HEIGHT}]+bestaudio/best[height<={DOWNLOAD_MAX_HEIGHT}]/best"
         postprocessors = None
     else:
         # Try a progressive MP4 that already contains both video+audio.
         # If none exists, yt-dlp may still fall back to split formats; we'll detect
-        # that after download and raise a clear error.
-        format_selector = f"best[ext=mp4][height<={DOWNLOAD_MAX_HEIGHT}][vcodec!=none][acodec!=none]/best[ext=mp4][height<={DOWNLOAD_MAX_HEIGHT}]/best[height<={DOWNLOAD_MAX_HEIGHT}]/best"
+        # that after download and raise a clear error instead of continuing
+        # with stale/invalid artifacts.
+        format_selector = f"best[ext=mp4][height<={DOWNLOAD_MAX_HEIGHT}][fps<={OUTPUT_FPS}][vcodec!=none][acodec!=none]/best[ext=mp4][height<={DOWNLOAD_MAX_HEIGHT}][vcodec!=none][acodec!=none]/best[ext=mp4][height<={DOWNLOAD_MAX_HEIGHT}]/best[height<={DOWNLOAD_MAX_HEIGHT}]/best"
         postprocessors = []
 
     # Cookie file for YouTube auth — check multiple standard locations
