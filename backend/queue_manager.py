@@ -13,7 +13,7 @@ from typing import Any, Callable
 from backend.config import (
     AVAILABLE_MODELS,
     GPU_SEMAPHORE_SIZE,
-    NVIDIA_MODEL,
+    OPENCODE_MODEL,
     get_job_working_dir,
 )
 from backend.models import JobStatus, LLMInteraction, OutputReel, ReelPlan, VideoJob
@@ -79,7 +79,7 @@ class QueueManager:
         except queue.Full:
             pass  # Drop oldest under backpressure
 
-    def add_job(self, url: str, generate_captions: bool = True, model: str = "stepfun-ai/step-3.7-flash") -> VideoJob:
+    def add_job(self, url: str, generate_captions: bool = True, model: str = "mimo-v2.5-free") -> VideoJob:
         """Create a new job, enqueue it, and return the job object."""
         job = VideoJob(url=url, generate_captions=generate_captions, model=model)
         self.jobs[job.id] = job
@@ -98,6 +98,29 @@ class QueueManager:
             del self.jobs[job_id]
             return True
         return False
+
+    def retry_job(self, job_id: str) -> bool:
+        """Retry a failed job by resetting its status and re-enqueuing it.
+
+        Returns True if job was found and retried, False otherwise.
+        """
+        if job_id not in self.jobs:
+            return False
+        job = self.jobs[job_id]
+        if job.status not in ("ERROR", "DONE"):
+            return False
+        # Reset job state for retry
+        job.status = JobStatus.QUEUED
+        job.error = None
+        job.progress = 0
+        job.stage_index = 0
+        job.current_stage = None
+        job.sub_stage = None
+        job.sub_stage_progress = 0
+        # Keep existing data (transcript, reel_plan, etc.) for checkpoint resume
+        self.queue.put_nowait(job.id)
+        self.enqueue_broadcast(job)
+        return True
 
     def cleanup_old_jobs(self, max_age_hours: float = 24.0) -> int:
         """Remove completed/error jobs older than max_age_hours. Returns count removed."""
@@ -323,22 +346,30 @@ class QueueManager:
 
             video_description = result.get("description", "")
             try:
-                # Resolve model: use the selected model from AVAILABLE_MODELS, fallback to NVIDIA_MODEL
-                model_key = job.model if job.model else "stepfun-ai/step-3.7-flash"
-                selected_model = AVAILABLE_MODELS.get(model_key, NVIDIA_MODEL)
+                # Resolve model: use the selected model from AVAILABLE_MODELS, fallback to OPENCODE_MODEL
+                model_key = job.model if job.model else "mimo-v2.5-free"
+                selected_model = AVAILABLE_MODELS.get(model_key, OPENCODE_MODEL)
+
+                # Determine resume_from stage based on existing intermediate checkpoints
+                resume_from = None
+                if ckpt.has_stage("analyze_clips"):
+                    resume_from = "narration_writer"  # Skip structure + clip planner
+                elif ckpt.has_stage("analyze_structure"):
+                    resume_from = "clip_planner"  # Skip structure planner only
 
                 reel_plan = await asyncio.wait_for(
                     asyncio.to_thread(
                         select_reel_plan, job.transcript, job.title or "", video_description,
                         analyzer_progress, reporter, llm_interactions,
                         rich_timeline=job.rich_timeline, model=selected_model,
+                        checkpoint=ckpt, resume_from=resume_from,
                     ),
                     timeout=2700.0,
                 )
             except asyncio.TimeoutError:
                 raise RuntimeError(
                     "ANALYZING exceeded 45-minute hard ceiling — LLM never responded "
-                    "in time even after retries. Check NVIDIA API status."
+                    "in time even after retries. Check OpenCode API status."
                 )
             ckpt.save_stage("analyze", {"reel_plan": reel_plan.model_dump()})
 

@@ -35,16 +35,15 @@ from backend.config import (
     CLIP_DURATION_SOFT_MIN,
     HOOK_SECONDS,
     INSIGHT_SECONDS_MAX,
-    MAX_INPUT_TOKENS,
+
     MAX_OUTPUT_DURATION,
     MAX_OUTPUT_TOKENS,
     MIN_OUTPUT_DURATION,
     MODEL_FALLBACK_MAP,
-    NVIDIA_API_KEY,
-    NVIDIA_BASE_URL,
-    NVIDIA_MODEL,
-    NVIDIA_MODEL_FALLBACK,
-    REASONING_EFFORT,
+    OPENCODE_API_KEY,
+    OPENCODE_BASE_URL,
+    OPENCODE_MODEL,
+    OPENCODE_MODEL_FALLBACK,
 )
 from backend.models import LLMInteraction, ReelPlan, RichTimeline
 from backend.pipeline.plan_validator import finalize_edit
@@ -79,10 +78,29 @@ class SemanticBlock:
     has_exclamation: bool = False
     has_emphasis: bool = False
     word_density: float = 0.0
+    # Gen-Z engagement signals
+    has_vulgarity: bool = False
+    has_flirting: bool = False
+    has_drama: bool = False
+    has_bold_statement: bool = False
+    has_high_stakes: bool = False
+    has_spectacle: bool = False
+    has_elimination: bool = False
+    has_comedy: bool = False
+    has_tea: bool = False
+    has_reaction: bool = False
 
     @property
     def duration(self) -> float:
         return max(0.0, self.end - self.start)
+
+    @property
+    def engagement_score(self) -> float:
+        """Composite engagement signal score (0-10). Higher = more viral potential."""
+        return float(self.has_vulgarity + self.has_flirting + self.has_drama
+                     + self.has_bold_statement + self.has_high_stakes
+                     + self.has_spectacle + self.has_elimination
+                     + self.has_comedy + self.has_tea + self.has_reaction)
 
     def summary_line(self) -> str:
         energy_bar = "█" * int(self.speech_energy * 10) + "░" * (10 - int(self.speech_energy * 10))
@@ -100,6 +118,26 @@ class SemanticBlock:
             flags.append("!")
         if self.has_emphasis:
             flags.append("CAPS")
+        if self.has_vulgarity:
+            flags.append("VULGAR")
+        if self.has_flirting:
+            flags.append("FLIRT")
+        if self.has_drama:
+            flags.append("DRAMA")
+        if self.has_bold_statement:
+            flags.append("BOLD")
+        if self.has_high_stakes:
+            flags.append("STAKES")
+        if self.has_spectacle:
+            flags.append("WOW")
+        if self.has_elimination:
+            flags.append("ELIM")
+        if self.has_comedy:
+            flags.append("FUNNY")
+        if self.has_tea:
+            flags.append("TEA")
+        if self.has_reaction:
+            flags.append("REACT")
         flag_str = f" [{', '.join(flags)}]" if flags else ""
         vol = f" vol={self.volume_db:.1f}dB" if self.volume_db is not None else ""
         wps = f" wps={self.word_density:.1f}" if self.word_density > 0 else ""
@@ -142,6 +180,150 @@ def _compute_importance(
     return max(0.0, min(100.0, score))
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Gen-Z engagement signal detection (keyword-based)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_VULGARITY_KEYWORDS = {
+    # Sexual/physical attraction
+    "sexy", "hot", "fine", "thick", "bad", "body", "ass", "tits", "babe",
+    "attractive", "physical", "looks", "appearance", "face", "smile",
+    # Dating/relationship crude
+    "hookup", "situationship", "red flag", "green flag", "ick", "std",
+    "body count", "onlyfans", "slut", "whore", "player", "fuckboy",
+    # Crude humor
+    "ugly", "mid", "fugly", "butterface", "roasted", "destroyed",
+}
+
+_FLIRTING_KEYWORDS = {
+    # Romantic interest
+    "date", "dating", "match", "couple", "together", "relationship",
+    "boyfriend", "girlfriend", "crush", "flirt", "flirting", "rizz",
+    "charm", "charming", "smooth", "game", "pull", "slide",
+    # Physical affection
+    "kiss", "kissing", "hug", "hold", "touch", "cuddle", "snuggle",
+    "chemistry", "connection", "vibe", "energy", "attraction",
+    # Dating show specific
+    "pop", "balloon", "match", "no match", "compatible", "single",
+    "looking for", "type", "preference", "standard",
+}
+
+_DRAMA_KEYWORDS = {
+    # Conflict
+    "hate", "argue", "fight", "disagree", "problem", "issue",
+    "mad", "angry", "furious", "annoyed", "pissed", "done",
+    "leave", "walk away", "get out", "shut up", "stupid", "dumb",
+    # Rejection
+    "no", "nah", "not interested", "not feeling", "not my type",
+    "pop", "popped", "rejected", "denied", "turned down",
+    # Confrontation
+    "really", "seriously", "are you serious", "no way", "excuse me",
+    "how dare", "unbelievable", "ridiculous", "absurd",
+}
+
+_BOLD_STATEMENT_KEYWORDS = {
+    # Strong opinions / hot takes
+    "only", "never", "always", "must", "require", "demand",
+    "settling", "lowering", "compromise", "worth", "deserve",
+    "standard", "requirement", "condition", "rule",
+    # Extreme declarations
+    "best", "worst", "greatest", "ugliest", "prettiest",
+    "perfect", "ideal", "dream", "nightmare", "dealbreaker",
+    # Confidence / arrogance
+    "king", "queen", "prize", "catch", "upgrade", "downgrade",
+    "out of your league", "too good", "above you", "beneath me",
+    # Unhinged takes
+    "controversial", "unpopular opinion", "hot take", "hear me out",
+    "i would rather", "i'd rather", "i refuse", "i will never",
+}
+
+# Challenge/stunt/competition engagement signals
+_HIGH_STAKES_KEYWORDS = {
+    "money", "cash", "prize", "win", "winner", "winn", "dollars", "thousand", "million",
+    "last to leave", "eliminated", "elimination", "final", "finals",
+    "challenge", "compete", "competition", "contest", "stakes",
+    "whoever", "takes all", "winner takes", "loser", "loses",
+    "bet", "wager", "risk", "reward", "incentive",
+}
+_SPECTACLE_KEYWORDS = {
+    "insane", "crazy", "unbelievable", "impossible", "never before",
+    "record", "biggest", "largest", "most expensive", "extreme",
+    "first time", "nobody has", "never seen", "mind blown", "jaw drop",
+    "holy", "oh my god", "no way", "what the", "this is",
+}
+_ELIMINATION_KEYWORDS = {
+    "eliminated", "you're out", "you are out", "voted off", "kicked out",
+    "last to leave", "going home", "game over", "disqualified",
+    "removed", "banished", "exiled", "sent home", "packing",
+    "done", "finished", "over", "out of here", "bye",
+}
+
+# Comedy/skit engagement signals
+_COMEDY_KEYWORDS = {
+    "funny", "hilarious", "laugh", "joke", "prank", "comedy", "skit",
+    "relatable", "literally me", "that's so me", "me irl", "when you",
+    "plot twist", "twist", "unexpected", "nobody expected", "wait for it",
+    "dead", "i'm dead", "dying", "can't breathe", "lmao", "rofl",
+}
+
+# Podcast/commentary/tea engagement signals
+_TEA_KEYWORDS = {
+    "receipts", "exposed", "exposing", "the truth", "let me tell you",
+    "allegedly", "rumor", "gossip", "spill", "tea", "shade", "throw shade",
+    "called out", "called out", "nobody is talking", "the real story",
+    "behind the scenes", "secret", "hidden", "confessed", "admitted",
+    "controversy", "scandal", "caught", "busted", "lied", "lying",
+}
+
+# Reaction/review engagement signals
+_REACTION_KEYWORDS = {
+    "terrible", "amazing", "overrated", "underrated", "garbage", "masterpiece",
+    "worst", "best", "destroyed", "obliterated", "cooked", "bodied",
+    "cringe", "based", "take", "hot take", "unpopular", "controversial",
+    "roast", "roasted", "ratio", "L", "W", "massive W", "biggest L",
+    "hate", "love", "obsessed", "addicted", "fan", "stanning",
+}
+
+
+def _detect_engagement_signals(text: str) -> dict[str, bool]:
+    """Detect engagement signals from transcript text.
+
+    Works across dating, challenge, comedy, podcast, and reaction content.
+    Returns dict with 10 boolean signal keys.
+    """
+    if not text:
+        return {k: False for k in (
+            "has_vulgarity", "has_flirting", "has_drama", "has_bold_statement",
+            "has_high_stakes", "has_spectacle", "has_elimination",
+            "has_comedy", "has_tea", "has_reaction",
+        )}
+
+    text_lower = text.lower()
+    words = set(text_lower.split())
+
+    def _match_any(keywords: set[str]) -> bool:
+        for kw in keywords:
+            if " " in kw:
+                if kw in text_lower:
+                    return True
+            elif kw in words:
+                return True
+        return False
+
+    return {
+        "has_vulgarity": _match_any(_VULGARITY_KEYWORDS),
+        "has_flirting": _match_any(_FLIRTING_KEYWORDS),
+        "has_drama": _match_any(_DRAMA_KEYWORDS),
+        "has_bold_statement": _match_any(_BOLD_STATEMENT_KEYWORDS),
+        "has_high_stakes": _match_any(_HIGH_STAKES_KEYWORDS),
+        "has_spectacle": _match_any(_SPECTACLE_KEYWORDS),
+        "has_elimination": _match_any(_ELIMINATION_KEYWORDS),
+        "has_comedy": _match_any(_COMEDY_KEYWORDS),
+        "has_tea": _match_any(_TEA_KEYWORDS),
+        "has_reaction": _match_any(_REACTION_KEYWORDS),
+    }
+
+
 def _build_semantic_blocks(
     rich_timeline: RichTimeline | None,
     transcript: list[dict],
@@ -172,6 +354,10 @@ def _build_semantic_blocks(
                 "has_emphasis": bool(getattr(seg, "has_emphasis", False)),
                 "word_density": float(getattr(seg, "word_density", 0.0) or 0.0),
             })
+        # Detect engagement signals from text after building items
+        for item in items:
+            signals = _detect_engagement_signals(item["text"])
+            item.update(signals)
     else:
         items = []
         for i, entry in enumerate(transcript):
@@ -191,6 +377,10 @@ def _build_semantic_blocks(
                 "has_emphasis": False,
                 "word_density": 0.0,
             })
+        # Detect engagement signals from text
+        for item in items:
+            signals = _detect_engagement_signals(item["text"])
+            item.update(signals)
 
     if not items:
         return []
@@ -219,14 +409,30 @@ def _build_semantic_blocks(
         silence_before = group[0]["silence_before"]
         black = any(g["black"] for g in group)
         freeze = any(g["freeze"] for g in group)
-        has_question = any(g["has_question"] for g in group)
-        has_exclamation = any(g["has_exclamation"] for g in group)
-        has_emphasis = any(g["has_emphasis"] for g in group)
-        word_densities = [g["word_density"] for g in group if g["word_density"] > 0]
+        has_question = any(g.get("has_question", False) for g in group)
+        has_exclamation = any(g.get("has_exclamation", False) for g in group)
+        has_emphasis = any(g.get("has_emphasis", False) for g in group)
+        has_vulgarity = any(g.get("has_vulgarity", False) for g in group)
+        has_flirting = any(g.get("has_flirting", False) for g in group)
+        has_drama = any(g.get("has_drama", False) for g in group)
+        has_bold_statement = any(g.get("has_bold_statement", False) for g in group)
+        has_high_stakes = any(g.get("has_high_stakes", False) for g in group)
+        has_spectacle = any(g.get("has_spectacle", False) for g in group)
+        has_elimination = any(g.get("has_elimination", False) for g in group)
+        has_comedy = any(g.get("has_comedy", False) for g in group)
+        has_tea = any(g.get("has_tea", False) for g in group)
+        has_reaction = any(g.get("has_reaction", False) for g in group)
+        word_densities = [g["word_density"] for g in group if g.get("word_density", 0) > 0]
         avg_word_density = sum(word_densities) / len(word_densities) if word_densities else 0.0
         importance = _compute_importance(
             avg_energy, volume_db, bool(ocr), silence_before, black, freeze
         )
+        # Boost importance for high-engagement blocks (up to +30, 3 per signal)
+        engagement_count = (has_vulgarity + has_flirting + has_drama + has_bold_statement
+                           + has_high_stakes + has_spectacle + has_elimination
+                           + has_comedy + has_tea + has_reaction)
+        engagement_boost = min(30.0, engagement_count * 3.0)
+        importance = max(0.0, min(100.0, importance + engagement_boost))
         blocks.append(SemanticBlock(
             block_id=len(blocks),
             start=start,
@@ -245,6 +451,16 @@ def _build_semantic_blocks(
             has_exclamation=has_exclamation,
             has_emphasis=has_emphasis,
             word_density=avg_word_density,
+            has_vulgarity=has_vulgarity,
+            has_flirting=has_flirting,
+            has_drama=has_drama,
+            has_bold_statement=has_bold_statement,
+            has_high_stakes=has_high_stakes,
+            has_spectacle=has_spectacle,
+            has_elimination=has_elimination,
+            has_comedy=has_comedy,
+            has_tea=has_tea,
+            has_reaction=has_reaction,
         ))
 
     for item in items[1:]:
@@ -411,18 +627,17 @@ def _call_llm(
     interactions: list[LLMInteraction] | None = None,
     stage_name: str = "reel_plan",
     max_tokens: int = MAX_OUTPUT_TOKENS,
-    reasoning_effort: str = REASONING_EFFORT,
     model: str | None = None,
 ) -> str:
-    if not NVIDIA_API_KEY:
+    if not OPENCODE_API_KEY:
         raise RuntimeError(
-            "NVIDIA_API_KEY is not set. Skipping LLM analysis and using local fallback."
+            "OPENCODE_API_KEY is not set. Skipping LLM analysis and using local fallback."
         )
 
-    primary_model = model if model else NVIDIA_MODEL
+    primary_model = model if model else OPENCODE_MODEL
     models_to_try = [primary_model]
     # Use cross-fallback map: each model falls back to the other
-    fallback = MODEL_FALLBACK_MAP.get(primary_model, NVIDIA_MODEL_FALLBACK)
+    fallback = MODEL_FALLBACK_MAP.get(primary_model, OPENCODE_MODEL_FALLBACK)
     if fallback and fallback != primary_model:
         models_to_try.append(fallback)
 
@@ -433,15 +648,14 @@ def _call_llm(
             raw_content = call_llm_sync(
                 messages=messages,
                 model=model,
-                api_key=NVIDIA_API_KEY,
-                base_url=NVIDIA_BASE_URL,
+                api_key=OPENCODE_API_KEY,
+                base_url=OPENCODE_BASE_URL,
                 temperature=0.0,
                 max_tokens=max_tokens,
                 timeout=480.0,
                 reporter=reporter,
                 interactions=interactions,
                 stage_name=stage_name,
-                reasoning_effort=reasoning_effort,
             )
             if reporter and interactions is not None:
                 reporter.set_stage_data_key(
@@ -455,12 +669,18 @@ def _call_llm(
                     f.write(raw_content)
             except Exception as log_e:
                 logger.warning(f"Failed to write LLM debug log: {log_e}")
-            return raw_content.strip()
+            stripped = raw_content.strip()
+            if not stripped:
+                raise RuntimeError(
+                    f"LLM returned empty response for stage '{stage_name}'. "
+                    f"Raw length: {len(raw_content)}. Check debug log: {debug_path}"
+                )
+            return stripped
         except Exception as e:
             logger.warning(f"LLM call failed ({stage_name}) model={model}: {e}")
             last_error = e
 
-    raise RuntimeError(f"All NVIDIA models failed ({stage_name}). Last error: {last_error}") from last_error
+    raise RuntimeError(f"All OpenCode models failed ({stage_name}). Last error: {last_error}") from last_error
 
 
 def _try_repair_truncated_json(text: str) -> str:
@@ -519,6 +739,9 @@ def _try_repair_truncated_json(text: str) -> str:
 
 def _extract_json_object(text: str) -> str:
     t = text.strip()
+    if not t:
+        logger.error("Empty text passed to _extract_json_object")
+        raise ValueError("No JSON object found in LLM response (empty input).")
     fence_match = re.search(r"```(?:json)?\s*(\{[\s\S]*\})\s*```", t, re.IGNORECASE)
     if fence_match:
         return fence_match.group(1).strip()
@@ -528,9 +751,11 @@ def _extract_json_object(text: str) -> str:
         t = t[len("```"):].strip()
     if t.endswith("```"):
         t = t[:-len("```")].strip()
-    # Strip <thinking> blocks from reasoning models
+    # Strip <thinking> blocks from reasoning models (greedy match to handle nested tags)
     t = re.sub(r"<thinking>[\s\S]*?</thinking>\s*", "", t, flags=re.IGNORECASE)
     t = re.sub(r"<think>[\s\S]*?</think>\s*", "", t, flags=re.IGNORECASE)
+    # Also strip <think> blocks that may not be properly closed
+    t = re.sub(r"<think>[\s\S]*$", "", t, flags=re.IGNORECASE)
     t = t.strip()
     # Try to find the LAST valid JSON object (reasoning models prepend thinking text)
     last_brace = t.rfind("}")
@@ -646,18 +871,19 @@ def _prompt_structure_planner(
     max_groups: int,
     block_usable_hints: str,
 ) -> str:
-    return f"""You are an editorial structure planner for YouTube Shorts.
-Your ONLY job: identify the strongest standalone story units worth turning into individual Shorts.
+    return f"""You are a viral Shorts editor. Your ONLY job: find the moments that make people STOP SCROLLING.
 Do NOT select clips. Do NOT write narration.
+You are NOT dividing a video into chapters. You are extracting dopamine hits.
 
-You think like a professional editor, not a chapter detector.
-Chapters mirror the source. Editorial units tell complete stories.
+Think like a viewer, not a creator. A viewer decides in 1-2 seconds whether to stay.
+The FIRST thing visible on screen must be visually striking, emotionally charged, or curiosity-inducing.
+If the first 4-6 seconds are someone talking to camera with no context — it's not a hook. Merge it.
 
 SOURCE
 Title: {video_title}
 Description: {video_description[:4000]}
 Duration: {source_duration:.1f}s
-Max groups allowed: {max_groups} (this is a CEILING, not a goal — produce {min_groups}-{max_groups} strong standalone stories)
+Max groups: {max_groups} (CEILING — produce {min_groups}-{max_groups} only if each is genuinely addictive)
 
 SEMANTIC BLOCKS (pre-scored by Python — imp=importance 0-100):
 {blocks_text}
@@ -665,50 +891,167 @@ SEMANTIC BLOCKS (pre-scored by Python — imp=importance 0-100):
 PRECOMPUTED USABLE SECONDS BY REGION:
 {block_usable_hints}
 
-EDITORIAL SCORING — before grouping, score each candidate section on:
-- Emotional intensity (0-10): crowd gasps, player reactions, stakes
-- Novelty (0-10): unexpected outcome, never-seen-before moment
-- Stakes (0-10): what is at risk for the participants
-- Visual action (0-10): motion, spectacle, physical comedy
-- Surprise (0-10): twist, reversal, unexpected winner
-- Payoff clarity (0-10): is there a clear result/reveal
+═══════════════════════════════════════════════════════
+STEP 1: HOOK AUDIT — before grouping, scan every block
+═══════════════════════════════════════════════════════
 
-Only sections scoring ≥5 average deserve standalone reels.
+For each candidate unit, ask ONLY about the first 4-6 seconds:
+- Is there a visually striking moment? (shock, spectacle, unusual visual)
+- Is there an emotional spike? (anger, excitement, fear, surprise)
+- Is there a curiosity gap? (unexplained action, mid-sentence start, unexpected visual)
+- Is there an ENGAGEMENT SIGNAL? ([DRAMA] [BOLD] [FLIRT] [VULGAR] [STAKES] [WOW] [ELIM] [FUNNY] [TEA] [REACT] flags in the blocks)
+- Does it start with DEAD AIR, INTRO, or SETUP? → This unit needs a different entry point.
 
-GROUPING RULES
-1. Classify video_type.
-2. For each candidate unit, reason about its internal arc:
-   - Setup: what is established or promised
-   - Conflict: what tension or challenge builds
-   - Peak: the climax, reveal, or payoff
-   - Resolution: the actual outcome, winner reveal, result, or aftermath (REQUIRED — every unit must end by showing what happened)
-3. A unit is ONLY a group if it has a complete arc (setup → peak → resolution).
-4. If a section has setup but no payoff, merge it with adjacent content that provides the payoff.
-5. Never split a challenge/contest if the climax immediately follows — keep them as one unit.
-6. Never combine two unrelated climaxes into one group — they are separate stories.
-7. Would someone watch this as a standalone Short? If not, merge it.
-8. Avoid groups that are just "introduction" or "setup" with no payoff.
-9. The max groups ({max_groups}) is a hard limit. Fewer strong groups always beats more weak ones.
-10. Produce {min_groups}-{max_groups} groups if content supports it. ALWAYS produce at least {min_groups} group(s).
-11. Every group MUST end at or after the moment the viewer sees the outcome. If a challenge ends at 5:00, the group must extend past 5:00 to capture the result.
+If the best entry point is NOT at the start of the section, shift the unit boundary to start at the hook moment. Content before the hook is MERGED with whatever comes before it.
 
-THINK INTERNALLY about each unit's arc before outputting. Only output the final boundaries.
+═══════════════════════════════════════════════════════
+STEP 2: ARC VALIDATION — every unit must pass ALL tests
+═══════════════════════════════════════════════════════
+
+A unit is KEEPABLE only if it has ALL four:
+
+1. HOOK (first 4-6s): A moment that makes someone stop scrolling
+   - NOT: "Hey guys welcome back", introductions, slow fade-ins, setup without context
+   - YES: mid-action start, crowd already reacting, person already panicking, visual spectacle, unexpected statement
+   - The hook must be long enough to establish curiosity but short enough to not feel slow
+
+2. ESCALATION (middle): Tension that RISES, not flat
+   - Each block should feel like stakes are increasing
+   - If 3+ blocks feel the same intensity → compress them into fewer clips
+   - Dead air, repeated explanations, waiting = must be cut
+
+3. PEAK (final 30%): The moment everyone came for
+   - Winner declared, record broken, prank revealed, reaction explosion
+   - This is what the thumbnail would show
+
+4. PAYOFF (last 5-10s): Resolution that satisfies
+   - NOT: cut mid-sentence, fade to black, host saying "that's it"
+   - YES: clear result, winner celebration, aftermath reaction, emotional landing
+
+═══════════════════════════════════════════════════════
+STEP 3: SCORING — rate each candidate unit
+═══════════════════════════════════════════════════════
+
+Rate each dimension 0-10 with these ANCHORS:
+
+HOOK POTENTIAL (first 4-6 seconds):
+  0 = starts with intro/greeting/setup
+  5 = starts with talking but interesting topic
+  8 = starts mid-action or with striking visual
+  10 = starts with crowd gasping / person screaming / visual spectacle
+
+TENSION CURVE:
+  0 = flat intensity throughout
+  5 = some variation but no clear rise
+  8 = steady escalation with clear peak moment
+  10 = rollercoaster — multiple peaks building to massive payoff
+
+PAYOFF SATISFACTION:
+  0 = no clear result, ends abruptly
+  5 = result shown but underwhelming
+  8 = clear satisfying result with reaction
+  10 = moment that makes you share the video
+
+UNIQUE MOMENT:
+  0 = could be any video, generic content
+  5 = interesting but seen before
+  8 = genuinely unexpected or never-seen-before
+  10 = "I've never seen anything like this" reaction
+
+Units averaging ≥6 across these 4 dimensions are KEEPABLE.
+Units averaging <6 should be merged with adjacent content.
+
+═══════════════════════════════════════════════════════
+STEP 3B: ENGAGEMENT BOOST — Gen-Z viral triggers
+═══════════════════════════════════════════════════════
+
+Look at the BLOCK FLAGS in the semantic blocks. These are engagement signals detected by Python:
+
+- [VULGAR] = sexual/crude/provocative language → HIGH engagement (comments, shares)
+- [FLIRT] = romantic/attraction/chemistry language → HIGH engagement (will-they-won't-they suspense)
+- [DRAMA] = conflict/rejection/confrontation → HIGHEST engagement (debate, takes, opinions)
+- [BOLD] = strong opinions/hot takes/unhinged declarations → HIGH engagement (screenshot & share)
+- [STAKES] = money, prizes, winner-takes-all, high-risk challenges → HIGH engagement (suspense)
+- [WOW] = insane spectacle, never-before-seen, record-breaking → HIGH engagement (wow factor)
+- [ELIM] = elimination, voted off, last to leave → HIGH engagement (tension)
+- [FUNNY] = comedy, prank, relatable, plot twist → HIGH engagement (shares, rewatch)
+- [TEA] = gossip, exposed, receipts, scandal → HIGH engagement (comments, debate)
+- [REACT] = strong reaction, roast, hot take, L/W → HIGH engagement (comments, quote tweets)
+
+Content type auto-detection from title + blocks:
+- Dating/reality → prioritize [DRAMA] [BOLD] [FLIRT] [VULGAR]
+- Challenge/stunt → prioritize [STAKES] [WOW] [ELIM] [DRAMA]
+- Comedy/skit → prioritize [FUNNY] [TEA] [REACT]
+- Podcast/commentary → prioritize [TEA] [DRAMA] [BOLD] [REACT]
+- Reaction/review → prioritize [REACT] [DRAMA] [FUNNY]
+
+PRIORITIZATION for viral Shorts (by content type):
+
+DATING/REALITY:
+1. DRAMA → rejection moments, "oh snap" callsouts → COMMENTS
+2. BOLD → unhinged takes, controversial opinions → SHARES
+3. FLIRT → chemistry, "will they match?" → WATCH TIME
+4. VULGAR → crude humor, shock value → REWATCHES
+
+CHALLENGE/STUNT:
+1. STAKES → money, prizes, "winner takes all" → SUSPENSE
+2. WOW → insane spectacle, record-breaking → WOW FACTOR
+3. ELIM → elimination, last to leave → TENSION
+4. DRAMA → betrayal, arguments → COMMENTS
+
+COMEDY/SKIT:
+1. FUNNY → prank, relatable, plot twist → SHARES
+2. TEA → gossip, exposed, scandal → COMMENTS
+3. REACT → strong reaction, roast → DEBATE
+
+PODCAST/COMMENTARY:
+1. TEA → gossip, receipts, scandal → COMMENTS
+2. DRAMA → conflict, confrontation → DEBATE
+3. BOLD → hot takes, controversial → SHARES
+4. REACT → strong reaction → ENGAGEMENT
+
+When choosing between two otherwise equal units, PRIORITIZE the one with more engagement flags.
+A unit with 2+ engagement flags is almost always better than a unit with 0 flags.
+
+═══════════════════════════════════════════════════════
+STEP 4: MERGE DECISIONS
+═══════════════════════════════════════════════════════
+
+RULES:
+1. Classify video_type first.
+2. Every unit MUST have a complete arc: hook → escalation → peak → payoff.
+3. If a section has setup but no payoff → MERGE with adjacent content that provides the payoff.
+4. If two adjacent sections share the same climax (e.g., same challenge) → MERGE into one unit.
+5. If a section is just "introduction" or "talking head setup" → MERGE, do not keep.
+6. Never split a challenge/contest if the climax immediately follows.
+7. Never combine two unrelated climaxes into one group — they are separate stories.
+8. The max groups ({max_groups}) is a HARD limit. Fewer strong groups > more weak ones.
+9. Produce {min_groups}-{max_groups} groups IF content supports it. ALWAYS produce at least {min_groups}.
+10. Every group MUST end at or after the payoff moment. If a challenge ends at 5:00, extend past 5:00.
+
+═══════════════════════════════════════════════════════
+THINK INTERNALLY about each unit's hook → arc → payoff before outputting.
+═══════════════════════════════════════════════════════
 
 OUTPUT — STRICT JSON ONLY
 {{
   "structure_analysis": {{
-    "video_type": "challenge|listicle|podcast|tutorial|vlog|review|documentary|continuous_story|other",
+    "video_type": "challenge|comedy|listicle|podcast|tutorial|vlog|review|documentary|continuous_story|other",
     "identified_units": [
       {{
-        "name": "unit name",
+        "name": "unit name — describe the hook moment",
         "approx_start": 0.0,
         "approx_end": 90.0,
         "usable_seconds": 72,
+        "hook_block_id": 0,
+        "hook_description": "what the viewer sees in the first 4-6 seconds",
+        "peak_block_id": 5,
+        "peak_description": "the biggest moment — what the video is about",
         "kept": true
       }}
     ],
     "final_group_count": 1,
-    "reasoning": "Why this many groups. What makes each unit a complete standalone story."
+    "reasoning": "Why this many groups. For each: what is the hook, what is the escalation, what is the payoff. Why a viewer would watch the entire Short."
   }}
 }}"""
 
@@ -734,8 +1077,9 @@ def _prompt_clip_planner(
 Your ONLY job: select the strongest source clips for each group defined by the structure plan.
 Do NOT write narration text. Do NOT change the number of groups.
 
-You choose clips for maximum impact, not transcript continuity.
+You choose clips for maximum ENGAGEMENT, not transcript continuity.
 Every second must earn its place. If nothing meaningful happens, cut it.
+A 5-second clip with [DRAMA]+[BOLD] beats a 15-second clip with just [DRAMA].
 
 STRUCTURE PLAN (already decided):
 {json.dumps(structure.get("structure_analysis", structure), ensure_ascii=False, indent=2)}
@@ -746,65 +1090,162 @@ KEPT UNITS:
 SEMANTIC BLOCKS (imp = importance 0-100, peak = best moment offset):
 {blocks_text}
 {top_section}
-CRITICAL RULE — NO SOURCE OVERLAP
+═══════════════════════════════════════════════════════
+CRITICAL RULES
+═══════════════════════════════════════════════════════
+
+RULE 1 — NO SOURCE OVERLAP
 Every source timestamp may belong to ONE reel only.
 If reel A uses 20.0-35.0s, NO other reel may touch 20.0-35.0s.
 Exception: explicit recap clips (must state "RECAP" in reason).
 Violating this creates duplicate Shorts. This is the #1 rule.
 
-CLIP SELECTION PRIORITIES (ranked)
-1. Payoff — result, winner reveal, outcome, final moment (MANDATORY for last clip)
-2. Curiosity gap — "What happens next?" / "No way..." / unexpected visuals
-3. Emotional peak — crowd gasps, player reactions, shock, celebration
-4. Visual action — motion, spectacle, physical moments
-5. Stakes — what is at risk, what could go wrong
-6. Surprise — twist, reversal, unexpected result
-NEVER choose a clip just because it comes next in the transcript.
-Dialogue continuity does NOT matter. Impact does.
+RULE 2 — ENGAGEMENT DENSITY
+A clip's value = engagement flags ÷ duration.
+- 5s clip with [DRAMA]+[BOLD] = 2 flags ÷ 5s = 0.40 density ← BEST
+- 15s clip with [DRAMA] = 1 flag ÷ 15s = 0.067 density ← weak
+Prefer SHORT clips that pack multiple engagement signals.
+If a clip has no engagement flags AND is longer than 10s, it's probably filler.
 
-CLIP STORY ARC — every reel must contain within its clips:
-- Hook: the curiosity trigger (first clip)
-- Escalation: tension building (middle clips)
-- Peak: the climax or reveal (later clip)
-- Resolution: the actual outcome/result/winner reveal (REQUIRED final clip — show what happens at the end)
-The Resolution clip is NOT optional. Every reel MUST end by showing what happened.
-Find the exact moment where the winner is declared, the record is broken, the prize is awarded, or the challenge concludes. This is the payoff the viewer stays for.
+RULE 3 — EMOTIONAL JOURNEY
+Every reel must take the viewer on a ride:
+- HOOK (first 4-6s): Shock, curiosity, or spectacle that stops the scroll
+- RISE (middle): Tension building, stakes increasing, one signal per clip
+- PEAK (final 30%): The biggest moment — the reason the video exists
+- LAND (last 5-10s): Satisfying resolution that makes them want more
 
-HOOK CLIPS — chosen by curiosity, NOT earliest timestamp.
-Search the entire unit for:
-- "What happens if..." moments
-- Unexpected visuals or instant action
-- Crowd reactions before you see why
-- Oh-my-God expressions
-- Visual spectacle that makes you stop scrolling
-Avoid: introductions, greetings, "Hey guys", slow builds, setup without payoff.
-is_hook_clip=true only on the hook clip.
+RULE 4 — ANCHOR CLIP
+Every reel has ONE anchor clip — the single most engaging moment.
+This is the clip that would be the thumbnail, the screenshot, the "you HAVE to see this" moment.
+Build the reel AROUND the anchor. Hook leads to it, escalation builds to it, payoff follows it.
 
-FILLER REMOVAL — aggressively cut:
+═══════════════════════════════════════════════════════
+CLIP SELECTION — by content type
+═══════════════════════════════════════════════════════
+
+Detect content type from title + blocks, then pick clips in this priority:
+
+DATING/REALITY:
+1. [DRAMA] — rejection, confrontation, "oh snap" → COMMENTS
+2. [BOLD] — unhinged takes, controversial opinions → SHARES
+3. [FLIRT] — chemistry, "will they match?" → WATCH TIME
+4. [VULGAR] — crude humor, shock value → REWATCHES
+5. Payoff — match reveal, final moment (MANDATORY last clip)
+
+CHALLENGE/STUNT:
+1. [STAKES] — money, prizes, "winner takes all" → SUSPENSE
+2. [WOW] — insane spectacle, record-breaking → WOW FACTOR
+3. [ELIM] — elimination, last to leave → TENSION
+4. [DRAMA] — betrayal, arguments → COMMENTS
+5. Payoff — winner declared (MANDATORY last clip)
+
+COMEDY/SKIT:
+1. [FUNNY] — prank, relatable, plot twist → SHARES
+2. [TEA] — gossip, exposed, scandal → COMMENTS
+3. [REACT] — strong reaction, roast → DEBATE
+4. Payoff — punchline, twist ending (MANDATORY last clip)
+
+PODCAST/COMMENTARY:
+1. [TEA] — gossip, receipts, scandal → COMMENTS
+2. [DRAMA] — conflict, confrontation → DEBATE
+3. [BOLD] — hot takes → SHARES
+4. Payoff — final verdict (MANDATORY last clip)
+
+REACTION/REVIEW:
+1. [REACT] — strong reaction, roast, L/W → COMMENTS
+2. [DRAMA] — conflict → DEBATE
+3. [FUNNY] — comedy → SHARES
+4. Payoff — final rating (MANDATORY last clip)
+
+GENERAL (fallback):
+1. Curiosity gap — "What happens next?"
+2. Emotional peak — reactions, shock
+3. Visual action — motion, spectacle
+
+═══════════════════════════════════════════════════════
+HOOK CLIPS — the make-or-break moment
+═══════════════════════════════════════════════════════
+
+The hook clip is 4-6 seconds. It MUST:
+- Start mid-action or with a striking visual/statement
+- Create instant curiosity ("wait, what?")
+- Have at least ONE engagement flag
+
+Best hook sources by content type:
+- [DRAMA]: someone getting rejected, called out, confronted
+- [BOLD]: wild declaration, "I only...", unhinged take
+- [STAKES]: "winner takes $500K", "last to leave wins"
+- [WOW]: "this has never been done", insane spectacle
+- [ELIM]: "you're out", tense elimination
+- [FUNNY]: prank reveal, relatable moment, plot twist
+- [TEA]: gossip, exposed, receipts
+- [REACT]: strong reaction, "this is terrible/amazing"
+- [FLIRT]: unexpected chemistry, smooth line
+
+NEVER hook with: introductions, greetings, "Hey guys", slow builds, context setup.
+
+═══════════════════════════════════════════════════════
+COMMENT BAIT — clips that drive engagement
+═══════════════════════════════════════════════════════
+
+Select at least 1 clip per reel specifically designed to generate COMMENTS:
+- Controversial take → people argue in comments
+- "No way he said that" → people quote and reply
+- Rejection moment → people take sides
+- Bold opinion → people agree/disagree
+
+Select at least 1 clip per reel designed to get SHARES:
+- Screenshot-worthy moment
+- "You have to see this" visual
+- Relatable moment ("this is so me")
+- Unexpected twist
+
+═══════════════════════════════════════════════════════
+AVOID — common mistakes that kill engagement
+═══════════════════════════════════════════════════════
+
+NEVER select a clip that:
+- Has 0 engagement flags AND is longer than 10s (filler)
+- Requires context from a previous reel to understand
+- Starts with "Hey guys" or "Welcome back" (no hook)
+- Has flat energy throughout (no peak moment)
+- Ends mid-sentence or mid-action (no payoff)
+- Is just talking heads with no visual/emotional change
+- Repeats information from another clip in the same reel
+- Shows explanation BEFORE the visual action (always SHOW THEN EXPLAIN)
+
+═══════════════════════════════════════════════════════
+FILLER REMOVAL — cut ruthlessly
+═══════════════════════════════════════════════════════
+
+Aggressively remove:
 - Repeated explanations saying the same thing
 - Countdowns that go nowhere
 - Slow walking, waiting, dead air
 - Reset moments ("Okay let's try again")
-- Repeated commentary
 - Any 5+ second stretch where nothing visually or emotionally happens
 Trim clips to the minimum that delivers the moment. Shorter is almost always better.
 
-CLIP MIX
-- SHORT 3-5s, MEDIUM 6-15s, LONG 16-30s — mix them for pacing.
-- No back-to-back LONG clips. No 3+ SHORT in a row.
-- Strongest moment must be in the final 30% of the reel.
-- Final clip must be MEDIUM or LONG (never end on a SHORT).
-- Never < 3.0s per clip.
-- Prefer SHOW THEN EXPLAIN: visual action first, commentary after.
+═══════════════════════════════════════════════════════
+CLIP MIX — pacing rules
+═══════════════════════════════════════════════════════
 
-IF TWO ADJACENT CLIPS COMMUNICATE THE SAME INFORMATION
-Keep only the stronger one. Redundancy kills pacing.
+- SHORT 3-5s: punchy moments, reactions, single statements
+- MEDIUM 6-15s: conversations, interactions, mini-scenes
+- LONG 16-30s: full story arcs, complex moments, build-ups
 
-EVERY REEL STANDS ALONE
-No clip should require a previous reel for context.
-A viewer seeing this Short cold must understand what is happening.
+Rules:
+- No back-to-back LONG clips (viewer fatigue)
+- No 3+ SHORT clips in a row (feels choppy)
+- Strongest moment in the final 30% (anchor clip position)
+- Final clip must be MEDIUM or LONG (never end on SHORT)
+- Never < 3.0s per clip (too fast to register)
+- Mix types for rhythm: SHORT-MEDIUM-SHORT-MEDIUM-LONG etc.
 
+═══════════════════════════════════════════════════════
 DURATION RULES (HARD)
+═══════════════════════════════════════════════════════
+
 - Each group estimated_duration = sum of (source_end - source_start) of its clips.
 - Must be between {dur_min} and {dur_max} seconds.
 - Narration is overlaid later — it does NOT add duration.
@@ -812,13 +1253,24 @@ DURATION RULES (HARD)
 - Prefer SILENCE_BEFORE as cut points.
 - If duration is too short, expand existing clips (wider time ranges) rather than adding filler clips.
 
+═══════════════════════════════════════════════════════
 OUTPUT — STRICT JSON ONLY
+═══════════════════════════════════════════════════════
+
+Every reel_groups entry MUST include:
+- engagement_signals: list of which flags this reel contains (e.g. ["DRAMA", "BOLD"])
+- anchor_clip_index: which clip is the anchor (0-indexed)
+- emotional_journey: one-line description of the hook→rise→peak→land arc
+
 {{
   "reel_groups": [
     {{
       "group_index": 0,
-      "group_reasoning": "Short:N Medium:N Long:N, total duration, why this arc works as a standalone story.",
+      "group_reasoning": "Why this arc works: hook moment, key engagement signals, anchor clip, emotional payoff.",
       "estimated_duration_seconds": 120.0,
+      "engagement_signals": ["DRAMA", "BOLD"],
+      "anchor_clip_index": 2,
+      "emotional_journey": "Hook: rejection moment → Rise: escalating takes → Peak: bold declaration → Land: aftermath reaction",
       "reel_summary": {{
         "title": "≤60 chars — what makes this Short compelling",
         "short_description": "≤150 chars",
@@ -827,8 +1279,10 @@ OUTPUT — STRICT JSON ONLY
         "key_moment": "strongest moment — what makes someone stop scrolling"
       }},
       "source_clips": [
-        {{"source_start": 12.0, "source_end": 15.0, "reason": "HOOK: curiosity gap — ...", "is_hook_clip": true}},
-        {{"source_start": 20.0, "source_end": 32.0, "reason": "MEDIUM: escalation — ...", "is_hook_clip": false}}
+        {{"source_start": 12.0, "source_end": 17.0, "reason": "HOOK: [DRAMA] rejection moment — instant curiosity", "is_hook_clip": true}},
+        {{"source_start": 20.0, "source_end": 28.0, "reason": "MEDIUM: [BOLD] escalating take — builds tension", "is_hook_clip": false}},
+        {{"source_start": 35.0, "source_end": 45.0, "reason": "LONG: [DRAMA]+[BOLD] anchor clip — biggest moment", "is_hook_clip": false}},
+        {{"source_start": 50.0, "source_end": 57.0, "reason": "MEDIUM: [REACT] aftermath reaction — satisfying land", "is_hook_clip": false}}
       ]
     }}
   ]
@@ -849,67 +1303,237 @@ Video title: {video_title}
 GROUPS (clips already locked):
 {groups_json}
 
-RULES
-- Max 3 events per group: 1 hook + up to 2 commentaries.
-- Hook: reel_start=0.0, reel_end=2.0-3.0, 4-7 words, specific curiosity.
-  BANNED: "Watch what happens", "You won't believe", "This is insane", "Wait for it",
-  "No way this is real", "I can't believe it", "This is crazy", "Look at this",
-  "Oh my god", "Bro what"
-- Commentary 1 (middle): 4-6 words, place at ~35-45% of estimated_duration. Must have persona.
-- Commentary 2 (end): 4-6 words, place at ~70-80% of estimated_duration. Must have persona.
-  Personas: roast | brutally_honest | friendly | sarcastic | hype | deadpan
-  BANNED filler phrases for both commentaries.
+═══════════════════════════════════════════════════════
+EVENT STRUCTURE — max 3 events per group
+═══════════════════════════════════════════════════════
+
+1. HOOK (required): reel_start=0.0, reel_end=4.0-6.0
+   - 5-8 words, specific curiosity gap
+   - Must match the hook clip's first 4-6 seconds
+   - Should make viewer think "wait, what?"
+
+   GOOD HOOKS (specific, curiosity-driven):
+   - "First kiss panic over sweat patches?"
+   - "Guy pops because name isn't moanable?"
+   - "Birthday girl gets to pop 5 guys?"
+   - "Final girl rejected for shallow reasons?"
+   - "Guy vows to pop any woman under 10?"
+
+   BANNED HOOKS (generic, clickbait):
+   - "Watch what happens", "You won't believe", "This is insane"
+   - "Wait for it", "No way this is real", "I can't believe it"
+   - "This is crazy", "Look at this", "Oh my god", "Bro what"
+
+2. COMMENTARY 1 (middle): 4-6 words, place at the ESCALATION moment
+   - Don't use a fixed percentage — read the clips and place it where tension rises
+   - Typically during the 2nd or 3rd clip (the build-up)
+   - Must REACT to what's on screen, not describe it
+
+3. COMMENTARY 2 (end): 4-6 words, place at the PEAK or PAYOFF moment
+   - Don't use a fixed percentage — read the clips and place it where the biggest moment is
+   - Typically during the anchor clip or just before the final clip
+   - Must REACT to the biggest moment in the reel
+
+═══════════════════════════════════════════════════════
+PERSONAS — match to content type
+═══════════════════════════════════════════════════════
+
+Detect the content type from the group's clips and title, then use matching personas.
+USE EDGY, VULGAR LANGUAGE — this is Gen-Z content, not a family show.
+Bad words are ENCOURAGED when they land the joke harder.
+
+DATING/REALITY:
+- roast: "Guys are dumbass for popping themselves, lol."
+- brutally_honest: "She's outta his league and he knows it, bullshit excuse."
+- sarcastic: "Oh yeah, great personality bro, that'll get you far."
+- deadpan: "Dude really said that with a straight face. Embarrassing."
+
+CHALLENGE/STUNT:
+- narrator: "Last to leave wins $500K, this is gonna get ugly."
+- hype_man: "This shit is INSANE, nobody's done this before!"
+- underdog: "Everyone counted him out, now watch this bastard win."
+- dramatic: "One wrong move and it's game over, no pressure."
+
+COMEDY/SKIT:
+- deadpan: "This is painfully relatable and I hate it."
+- absurdist: "Why is this actually my life? Fuck."
+- self_deprecating: "I feel personally attacked and I don't like it."
+- hype_man: "The plot twist nobody asked for but everybody needed."
+
+PODCAST/COMMENTARY:
+- investigator: "Let's talk about the bullshit nobody's mentioning."
+- gossiper: "So apparently the tea is spilling and it's messy."
+- analyst: "Here's why this actually matters, no bullshit."
+- roast: "The audacity is actually impressive, what a dumbass."
+
+REACTION/REVIEW:
+- roasted: "This is trash and I'm obsessed with it."
+- hype_man: "This is actually fire, fight me if you disagree."
+- deadpan: "10/10, no notes, fuck the haters."
+- brutally_honest: "Let's be real, this is mid as hell."
+
+═══════════════════════════════════════════════════════
+WRITING RULES
+═══════════════════════════════════════════════════════
+
 - Punchy style: short, sharp, impactful. Think one-liner, not sentence.
 - Commentary must REACT to what is on screen, not DESCRIBE it.
-- Use power words: destroyed, insane, genius, why, actually, never
-- No filler: like, basically, honestly, so, well, you know
-- ≥0.8s gap between events. Never cover key_moment. Last 3-5s free of narration.
-- Allowed chars: letters numbers . , ! ? ' - — " : ;
-- BANNED chars: / \ | @ # $ % ^ & * ( ) [ ] {{ }} < > ~ `
+- USE SWEAR WORDS WHEN THEY FIT: fuck, shit, ass, dumbass, bullshit, sucks, hell, damn
+- Make it sound like your funniest friend roasting the video alongside you
+- Match the energy: roast for rejection, hype for wins, deadpan for cringe
+- The more savage and unexpected the commentary, the better
+- Comments should make people screenshot and share "look what the AI said"
 
+═══════════════════════════════════════════════════════
+TIMING RULES
+═══════════════════════════════════════════════════════
+
+- ≥0.8s gap between events
+- Never cover key_moment (the anchor clip's peak moment)
+- Last 3-5s free of narration (let the payoff breathe)
+- Hook narration must fit within the hook clip's duration (4-6s)
+- Commentary must land during a clip that has the matching engagement signal
+
+═══════════════════════════════════════════════════════
+CHARACTER RULES
+═══════════════════════════════════════════════════════
+
+- Allowed: letters numbers . , ! ? ' - — " : ;
+- BANNED: / \ | @ # $ % ^ & * ( ) [ ] {{ }} < > ~ `
+
+═══════════════════════════════════════════════════════
 OUTPUT — STRICT JSON ONLY
+═══════════════════════════════════════════════════════
+
 {{
   "reel_groups": [
     {{
       "group_index": 0,
       "narration_events": [
-        {{"event_type": "hook", "reel_start": 0.0, "reel_end": 2.5, "text": "...", "persona": null, "voice_id": null}},
-        {{"event_type": "commentary", "reel_start": 35.0, "reel_end": 36.5, "text": "...", "persona": "roast", "voice_id": null}},
-        {{"event_type": "commentary", "reel_start": 70.0, "reel_end": 71.5, "text": "...", "persona": "hype", "voice_id": null}}
+        {{"event_type": "hook", "reel_start": 0.0, "reel_end": 5.0, "text": "First kiss panic over sweat patches?", "persona": null, "voice_id": null}},
+        {{"event_type": "commentary", "reel_start": 22.0, "reel_end": 23.5, "text": "Dude's sweating more than the kiss.", "persona": "deadpan", "voice_id": null}},
+        {{"event_type": "commentary", "reel_start": 55.0, "reel_end": 56.5, "text": "No wonder he's still a virgin, dumbass.", "persona": "roast", "voice_id": null}}
       ]
     }}
   ]
 }}"""
 
 
-def _prompt_critic(plan: dict, dur_min: int, dur_max: int) -> str:
+def _detect_content_type(title: str, blocks: list[SemanticBlock]) -> str:
+    """Detect content type from video title and semantic blocks."""
+    text = (title or "").lower()
+    block_text = " ".join(
+        b.text.lower() for b in blocks if b.text
+    )
+    combined = text + " " + block_text
+
+    # Dating / reality
+    dating_kw = ["dating", "kiss", "love", "rejected", "proposal", "married", "boyfriend", "girlfriend",
+                  "first date", "blind date", "couple", "single", "crush", "flirting", "pickup"]
+    if any(k in combined for k in dating_kw):
+        return "dating"
+
+    # Challenge / stunt
+    challenge_kw = ["challenge", "last to", "stunt", "dare", "competition", "winner", "prize",
+                    "eliminated", "round", "fastest", "strongest", "endurance"]
+    if any(k in combined for k in challenge_kw):
+        return "challenge"
+
+    # Comedy / skit
+    comedy_kw = ["comedy", "funny", "skit", "prank", "joke", "hilarious", "laugh", "meme"]
+    if any(k in combined for k in comedy_kw):
+        return "comedy"
+
+    # Podcast / commentary
+    podcast_kw = ["podcast", "interview", "talk show", "discussion", "debate", "opinion", "explained"]
+    if any(k in combined for k in podcast_kw):
+        return "podcast"
+
+    # Reaction / review
+    reaction_kw = ["reaction", "react", "review", "rating", "responding"]
+    if any(k in combined for k in reaction_kw):
+        return "reaction"
+
+    # Default: detect from block characteristics
+    has_dialogue = any(b.get("dialogue", "").strip() for b in blocks)
+    has_narration = any(b.get("narration_text", "").strip() for b in blocks)
+    if has_dialogue and not has_narration:
+        return "podcast"
+    return "dating"  # safe default for most YouTube Shorts
+
+
+def _prompt_critic(plan: dict, dur_min: int, dur_max: int, content_type: str) -> str:
     plan_json = json.dumps(plan, ensure_ascii=False, indent=2)[:60000]
-    return f"""You are a senior YouTube Shorts editor.
+    return f"""You are a senior YouTube Shorts editor with 10M+ subscriber experience.
 Do NOT invent new groups. Do NOT rewrite everything.
 Critique the draft reel plan and apply concrete fixes.
 
 Draft:
 {plan_json}
 
-Check for:
-- boring openings (weak hook clips that don't create curiosity)
-- weak pacing (too many similar lengths, no rhythm)
-- redundant clips across groups (EVERY source timestamp may belong to ONE reel only — zero overlap)
-- confusing story / missing payoff in any group
-- dead air / low-value clips (repeated explanations, waiting, filler)
-- missed emotional peaks (strongest moment buried in middle instead of final 30%)
-- duration outside {dur_min}-{dur_max}s
-- groups that don't stand alone (require context from another reel)
-- hook clips that are introductions instead of curiosity triggers
-- clips showing then explaining instead of explaining then showing (prefer show-first)
-- commentary text longer than 6 words (trim to 4-6 words, punchy)
-- commentary that DESCRIBES instead of REACTS (should feel like a one-liner)
-- banned characters in narration: / \ | @ # $ % ^ & * ( ) [ ] {{ }} < > ~ `
-- filler words in narration: like, basically, honestly, so, well, you know
+Content type: {content_type}
 
-Return the FULL revised plan as STRICT JSON with the same schema:
-structure_analysis (if present), ranked_segments (optional), reel_groups (with source_clips + narration_events), explanations.
-Only change what needs fixing. Keep strong parts intact."""
+═══════════════════════════════════════════════════════
+PRIORITY ORDER — fix most impactful issues first
+═══════════════════════════════════════════════════════
+
+1. HOOK CLIPS (highest impact)
+   - Must create curiosity, not introduce
+   - Hook clips must be 4-6 seconds
+   - Show moment FIRST, then explain (show-first rule)
+   - If hook clip is just talking head → swap for visual-first clip
+
+2. EMOTIONAL ARC (retention)
+   - Strongest moment must be in FINAL 30% (peak)
+   - Don't front-load the best content
+   - Build tension: hook → rise → peak → land
+   - If peak is in first half → swap clips to move peak later
+
+3. ENGAGEMENT SIGNALS (virality)
+   - Each group should have 2-3 engagement signals (drama, vulgarity, flirting, bold statements, etc.)
+   - Commentary should amplify these moments, not ignore them
+   - If a group has 0-1 engagement signals → it's boring, swap clips or add commentary that creates engagement
+
+4. PACING (retention)
+   - Vary clip lengths: mix short (1-3s) + medium (4-6s) + long (7-10s)
+   - No back-to-back same-length clips
+   - Dead air / filler clips → remove or speed up
+   - Groups that don't standalone without another reel → merge or add context
+
+5. COMMENTARY QUALITY (shareability)
+   - Commentary must be 4-6 words max (punchy)
+   - Must REACT to what's on screen, not DESCRIBE it
+   - Use edgy/savage language when appropriate: dumbass, bullshit, sucks, fuck, etc.
+   - Commentary must land at actual engagement moments (not fixed percentages)
+   - No banned words: like, basically, honestly, so, well, you know
+   - No banned characters: / \ | @ # $ % ^ & * ( ) [ ] {{ }} < > ~ `
+
+6. DURATION
+   - Every group must be {dur_min}-{dur_max}s
+   - If too short → expand clips, don't pad with filler
+   - If too long → remove weakest clip, not the peak
+
+7. REDUNDANCY
+   - Zero timestamp overlap across reels (every source timestamp in ONE reel only)
+   - If two reels cover similar content → merge or remove the weaker one
+
+═══════════════════════════════════════════════════════
+OUTPUT FORMAT
+═══════════════════════════════════════════════════════
+
+Return the FULL revised plan as STRICT JSON with the same schema.
+For each group, include ALL required fields:
+- source_clips (with source_start, source_end, clip_index)
+- hook_block_id, hook_description
+- peak_block_id, peak_description
+- engagement_signals (updated if commentary changed)
+- anchor_clip_index
+- emotional_journey
+- narration_events (hook + commentary, with reel_start, reel_end, text, persona)
+- explanations
+
+Only change what needs fixing. Keep strong parts intact.
+Explain EACH fix in the explanations array — what was wrong and what you changed."""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -925,6 +1549,8 @@ def select_reel_plan(
     interactions: list[LLMInteraction] | None = None,
     rich_timeline: RichTimeline | None = None,
     model: str | None = None,
+    checkpoint: Any = None,
+    resume_from: str | None = None,
 ) -> ReelPlan:
     if progress_cb:
         progress_cb("Building semantic blocks...", 5)
@@ -975,75 +1601,100 @@ def select_reel_plan(
     )
 
     # ── LLM #1 Structure Planner ──
-    if progress_cb:
-        progress_cb("Structure planning...", 20)
-    raw1 = _call_llm(
-        [
-            {"role": "system", "content": "Respond with ONLY valid JSON."},
-            {"role": "user", "content": _prompt_structure_planner(
-                video_title, description, blocks_text, source_duration, min_groups, max_groups, usable_hints
-            )},
-        ],
-        progress_cb, reporter, interactions, stage_name="structure_planner",
-        max_tokens=32768, model=model,
-    )
-    structure = _parse_json_response(raw1)
-    sa = structure.get("structure_analysis", structure)
-    logger.info(
-        f"STRUCTURE: type={sa.get('video_type')} groups={sa.get('final_group_count')} "
-        f"reason={sa.get('reasoning')}"
-    )
+    sa = None
+    if checkpoint and resume_from and resume_from != "structure_planner":
+        # Loading from checkpoint - skip structure planner
+        ckpt_data = checkpoint.load_stage("analyze_structure")
+        if ckpt_data and "structure_analysis" in ckpt_data:
+            sa = ckpt_data["structure_analysis"]
+            logger.info("Resuming from checkpoint: structure planner already complete")
+
+    if sa is None:
+        if progress_cb:
+            progress_cb("Structure planning...", 20)
+        raw1 = _call_llm(
+            [
+                {"role": "system", "content": "Respond with ONLY valid JSON."},
+                {"role": "user", "content": _prompt_structure_planner(
+                    video_title, description, blocks_text, source_duration, min_groups, max_groups, usable_hints
+                )},
+            ],
+            progress_cb, reporter, interactions, stage_name="structure_planner",
+            max_tokens=65536, model=model,
+        )
+        structure = _parse_json_response(raw1)
+        sa = structure.get("structure_analysis", structure)
+        logger.info(
+            f"STRUCTURE: type={sa.get('video_type')} groups={sa.get('final_group_count')} "
+            f"reason={sa.get('reasoning')}"
+        )
+        # Save intermediate checkpoint
+        if checkpoint:
+            checkpoint.save_stage("analyze_structure", {"structure_analysis": sa})
 
     # ── LLM #2 Clip Planner ──
-    if progress_cb:
-        progress_cb("Selecting clips...", 45)
+    groups = None
+    if checkpoint and resume_from and resume_from not in ("structure_planner", "clip_planner"):
+        # Loading from checkpoint - skip clip planner
+        ckpt_data = checkpoint.load_stage("analyze_clips")
+        if ckpt_data and "groups" in ckpt_data:
+            groups = ckpt_data["groups"]
+            logger.info("Resuming from checkpoint: clip planner already complete")
 
-    # Build top-blocks hint per kept unit for the clip planner
-    top_blocks_lines: list[str] = []
-    kept_units = [u for u in sa.get("identified_units", []) if u.get("kept", True)]
-    for unit in kept_units:
-        u_start = unit.get("approx_start", 0.0)
-        u_end = unit.get("approx_end", source_duration)
-        unit_blocks = [
-            b for b in blocks
-            if b.end > u_start and b.start < u_end and not b.black_frame and not b.freeze
-        ]
-        unit_blocks.sort(key=lambda b: b.importance, reverse=True)
-        top5 = unit_blocks[:5]
-        if top5:
-            block_strs = ", ".join(
-                f"Block {b.block_id} (imp={b.importance:.0f}, peak=+{b.peak_offset:.1f}s)"
-                for b in top5
-            )
-            top_blocks_lines.append(
-                f"  {unit.get('name', 'unit')} [{u_start:.0f}-{u_end:.0f}s]: {block_strs}"
-            )
-    top_blocks_hint = "\n".join(top_blocks_lines)
+    if groups is None:
+        if progress_cb:
+            progress_cb("Selecting clips...", 45)
 
-    raw2 = _call_llm(
-        [
-            {"role": "system", "content": "Respond with ONLY valid JSON."},
-            {"role": "user", "content": _prompt_clip_planner(
-                video_title, structure, blocks_text, source_duration, reel_dur_min, reel_dur_max,
-                top_blocks_hint=top_blocks_hint,
-            )},
-        ],
-        progress_cb, reporter, interactions, stage_name="clip_planner",
-        max_tokens=65536, model=model,
-    )
-    clips_plan = _parse_json_response(raw2)
-    groups = clips_plan.get("reel_groups", [])
-    if not groups:
-        raise RuntimeError("Clip planner returned no reel_groups")
+        # Build top-blocks hint per kept unit for the clip planner
+        top_blocks_lines: list[str] = []
+        kept_units = [u for u in sa.get("identified_units", []) if u.get("kept", True)]
+        for unit in kept_units:
+            u_start = unit.get("approx_start", 0.0)
+            u_end = unit.get("approx_end", source_duration)
+            unit_blocks = [
+                b for b in blocks
+                if b.end > u_start and b.start < u_end and not b.black_frame and not b.freeze
+            ]
+            unit_blocks.sort(key=lambda b: b.importance, reverse=True)
+            top5 = unit_blocks[:5]
+            if top5:
+                block_strs = ", ".join(
+                    f"Block {b.block_id} (imp={b.importance:.0f}, peak=+{b.peak_offset:.1f}s)"
+                    for b in top5
+                )
+                top_blocks_lines.append(
+                    f"  {unit.get('name', 'unit')} [{u_start:.0f}-{u_end:.0f}s]: {block_strs}"
+                )
+        top_blocks_hint = "\n".join(top_blocks_lines)
 
-    # Strip any narration the clip planner may have hallucinated
-    for g in groups:
-        g.pop("narration_events", None)
+        raw2 = _call_llm(
+            [
+                {"role": "system", "content": "Respond with ONLY valid JSON."},
+                {"role": "user", "content": _prompt_clip_planner(
+                    video_title, structure, blocks_text, source_duration, reel_dur_min, reel_dur_max,
+                    top_blocks_hint=top_blocks_hint,
+                )},
+            ],
+            progress_cb, reporter, interactions, stage_name="clip_planner",
+            max_tokens=65536, model=model,
+        )
+        clips_plan = _parse_json_response(raw2)
+        groups = clips_plan.get("reel_groups", [])
+        if not groups:
+            raise RuntimeError("Clip planner returned no reel_groups")
 
-    # ── Python: rank hook candidates ──
-    hook_swaps = _rank_hook_candidates(groups, blocks)
-    if hook_swaps > 0:
-        logger.info(f"Hook ranking: swapped {hook_swaps} hook clip(s)")
+        # Strip any narration the clip planner may have hallucinated
+        for g in groups:
+            g.pop("narration_events", None)
+
+        # ── Python: rank hook candidates ──
+        hook_swaps = _rank_hook_candidates(groups, blocks)
+        if hook_swaps > 0:
+            logger.info(f"Hook ranking: swapped {hook_swaps} hook clip(s)")
+
+        # Save intermediate checkpoint
+        if checkpoint:
+            checkpoint.save_stage("analyze_clips", {"groups": groups})
 
     # ── LLM #3 Narration Writer ──
     if progress_cb:
@@ -1075,6 +1726,7 @@ def select_reel_plan(
 
     # ── LLM #4 Critic (one revision) ──
     from backend.config import FAST_MODE
+    content_type = _detect_content_type(video_title, blocks)
     if not FAST_MODE:
         if progress_cb:
             progress_cb("Critic pass...", 80)
@@ -1082,10 +1734,10 @@ def select_reel_plan(
             raw4 = _call_llm(
                 [
                     {"role": "system", "content": "Respond with ONLY valid JSON."},
-                    {"role": "user", "content": _prompt_critic(draft, reel_dur_min, reel_dur_max)},
+                    {"role": "user", "content": _prompt_critic(draft, reel_dur_min, reel_dur_max, content_type)},
                 ],
                 progress_cb, reporter, interactions, stage_name="critic",
-                max_tokens=32768, model=model,
+                max_tokens=65536, model=model,
             )
             revised = _parse_json_response(raw4)
             revised_groups = revised.get("reel_groups", [])

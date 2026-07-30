@@ -147,7 +147,7 @@ FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend" / "renderer"
 class CreateJobRequest(BaseModel):
     url: str
     generate_captions: bool = True
-    model: str = "stepfun-ai/step-3.7-flash"
+    model: str = "mimo-v2.5-free"
 
 
 def _check_rate_limit() -> bool:
@@ -198,6 +198,16 @@ async def delete_job(job_id: str):
     return JSONResponse(status_code=404, content={"error": "job not found"})
 
 
+@app.post("/jobs/{job_id}/retry")
+async def retry_job(job_id: str):
+    """Retry a failed or completed job from its last checkpoint."""
+    if queue_manager is None:
+        return JSONResponse(status_code=503, content={"error": "Server starting up, try again shortly."})
+    if queue_manager.retry_job(job_id):
+        return {"ok": True, "message": "Job re-enqueued for retry"}
+    return JSONResponse(status_code=404, content={"error": "job not found or not retryable"})
+
+
 @app.get("/health")
 async def health_check():
     """Health check endpoint showing queue status and system info."""
@@ -216,11 +226,11 @@ async def health_check():
     except RuntimeError:
         pass
 
-    # Check NVIDIA API key
-    nvidia_key_ok = False
+    # Check OpenCode API key
+    opencode_key_ok = False
     try:
-        from backend.config import NVIDIA_API_KEY
-        nvidia_key_ok = bool(NVIDIA_API_KEY)
+        from backend.config import OPENCODE_API_KEY
+        opencode_key_ok = bool(OPENCODE_API_KEY)
     except Exception:
         pass
 
@@ -235,7 +245,7 @@ async def health_check():
         },
         "system": {
             "ffmpeg_available": ffmpeg_ok,
-            "nvidia_api_key_configured": nvidia_key_ok,
+            "opencode_api_key_configured": opencode_key_ok,
             "active_websocket_connections": len(connection_manager.active_connections),
         },
     }
@@ -268,7 +278,7 @@ async def set_mode(body: ModeRequest):
 # --- Model config endpoints ---
 
 class ModelRequest(BaseModel):
-    model: str  # "default" or "stepfun-ai/step-3.7-flash"
+    model: str  # "default" or "mimo-v2.5-free"
 
 
 @app.get("/config/model")
@@ -276,7 +286,7 @@ async def get_model():
     """Return current model configuration."""
     import backend.config as cfg
     return {
-        "model": cfg.NVIDIA_MODEL,
+        "model": cfg.OPENCODE_MODEL,
         "available_models": AVAILABLE_MODELS,
     }
 
@@ -291,7 +301,7 @@ async def set_model(body: ModelRequest):
             content={"error": f"model must be one of: {', '.join(AVAILABLE_MODELS.keys())}"},
         )
     resolved_model = AVAILABLE_MODELS[body.model]
-    cfg.NVIDIA_MODEL = resolved_model
+    cfg.OPENCODE_MODEL = resolved_model
     logger.info("LLM model set to: %s (resolved: %s)", body.model, resolved_model)
     return {"model": body.model, "resolved_model": resolved_model}
 

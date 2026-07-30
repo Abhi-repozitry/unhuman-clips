@@ -16,9 +16,9 @@ __all__ = [
     "BASE_DIR", "DOWNLOADS_DIR", "WORKING_DIR", "OUTPUTS_DIR", "CLIPS_DIR",
     "get_job_working_dir", "validate_config", "cleanup_stale_files",
     "FFMPEG_PATH", "FFPROBE_PATH",
-    "NVIDIA_API_KEY", "NVIDIA_BASE_URL", "NVIDIA_MODEL", "NVIDIA_MODEL_FALLBACK",
+    "OPENCODE_API_KEY", "OPENCODE_BASE_URL", "OPENCODE_MODEL", "OPENCODE_MODEL_FALLBACK",
     "AVAILABLE_MODELS",
-    "MAX_INPUT_TOKENS", "MAX_OUTPUT_TOKENS",
+    "MAX_OUTPUT_TOKENS",
     "MIN_CONTENT_DURATION",
     "WHISPER_MODEL_SIZE", "WHISPER_COMPUTE_TYPE_CUDA", "WHISPER_COMPUTE_TYPE_CPU",
     "TTS_VOICE",
@@ -51,26 +51,22 @@ WHISPER_MODEL_SIZE = os.environ.get("WHISPER_MODEL_SIZE", "large-v3-turbo")
 WHISPER_COMPUTE_TYPE_CUDA = os.environ.get("WHISPER_COMPUTE_TYPE_CUDA", "float16")
 WHISPER_COMPUTE_TYPE_CPU = os.environ.get("WHISPER_COMPUTE_TYPE_CPU", "int8")
 
-NVIDIA_API_KEY = os.environ.get("NVIDIA_API_KEY")
-NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
-NVIDIA_MODEL = os.environ.get("NVIDIA_MODEL", "openai/gpt-oss-120b")
-NVIDIA_MODEL_FALLBACK = os.environ.get("NVIDIA_MODEL_FALLBACK", "openai/gpt-oss-120b")
+OPENCODE_API_KEY = os.environ.get("OPENCODE_API_KEY")
+OPENCODE_BASE_URL = os.environ.get("OPENCODE_BASE_URL", "https://opencode.ai/zen/v1")
+OPENCODE_MODEL = os.environ.get("OPENCODE_MODEL", "mimo-v2.5-free")
+OPENCODE_MODEL_FALLBACK = os.environ.get("OPENCODE_MODEL_FALLBACK", "mimo-v2.5-free")
 
 # Available models for UI selection — maps display key to actual model ID
 AVAILABLE_MODELS = {
-    "stepfun-ai/step-3.7-flash": "stepfun-ai/step-3.7-flash",
-    "gpt-oss-120b": NVIDIA_MODEL,
+    "mimo-v2.5-free": "mimo-v2.5-free",
 }
 
 # Cross-fallback map: when primary model fails, fall back to the other model
 MODEL_FALLBACK_MAP = {
-    "stepfun-ai/step-3.7-flash": NVIDIA_MODEL,
-    "gpt-oss-120b": "stepfun-ai/step-3.7-flash",
+    "mimo-v2.5-free": "mimo-v2.5-free",
 }
 
-MAX_INPUT_TOKENS = int(os.environ.get("MAX_INPUT_TOKENS", "80000"))
-MAX_OUTPUT_TOKENS = int(os.environ.get("MAX_OUTPUT_TOKENS", "16384"))
-REASONING_EFFORT = os.environ.get("REASONING_EFFORT", "high")
+MAX_OUTPUT_TOKENS = int(os.environ.get("MAX_OUTPUT_TOKENS", "65536"))
 
 CLIP_COUNT_MIN = int(os.environ.get("CLIP_COUNT_MIN", "6"))
 CLIP_COUNT_MAX = int(os.environ.get("CLIP_COUNT_MAX", "12"))
@@ -149,13 +145,13 @@ def validate_config() -> list[str]:
     else:
         logger.info("Config: ffmpeg found at %s", FFMPEG_PATH)
 
-    # --- Check NVIDIA API key ---
-    if not NVIDIA_API_KEY:
+    # --- Check OpenCode API key ---
+    if not OPENCODE_API_KEY:
         warnings.append(
-            "NVIDIA_API_KEY not set. LLM analysis will use fallback heuristic plan."
+            "OPENCODE_API_KEY not set. LLM analysis will use fallback heuristic plan."
         )
     else:
-        logger.info("Config: NVIDIA API key is set")
+        logger.info("Config: OpenCode API key is set")
 
     # --- Check Whisper model ---
     logger.info("Config: Whisper model=%s, compute_type_cuda=%s",

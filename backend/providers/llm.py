@@ -62,31 +62,29 @@ def call_llm_sync(
     messages: list[dict[str, Any]],
     model: str,
     api_key: str,
-    base_url: str = "https://integrate.api.nvidia.com/v1",
+    base_url: str = "https://opencode.ai/zen/v1",
     temperature: float = 0.0,
-    max_tokens: int = 16384,
+    max_tokens: int = 65536,
     timeout: float = 480.0,
     reporter: Any = None,
     interactions: list[LLMInteraction] | None = None,
     stage_name: str = "reel_plan",
-    reasoning_effort: str = "high",
 ) -> str:
     """Synchronous LLM call with enhanced retry logic and exponential backoff.
 
     Features:
     - 4-5 total attempts per model with exponential backoff [1, 3, 6, 10]s
-    - Falls back to NVIDIA_MODEL_FALLBACK if primary model exhausts retries
+    - Falls back to OPENCODE_MODEL_FALLBACK if primary model exhausts retries
     - Classifies errors into categories (timeout, rate_limit, connection, etc.)
     - Collects structured LLMInteraction records for UI display
     - Detailed logging via reporter.log_info/log_warn
     - temperature=0.0 for determinism where possible
-    - reasoning_effort controls model thinking depth ('low'/'medium'/'high')
     """
-    from backend.config import MODEL_FALLBACK_MAP, NVIDIA_MODEL_FALLBACK
+    from backend.config import MODEL_FALLBACK_MAP, OPENCODE_MODEL_FALLBACK
 
     models_to_try = [model]
     # Use cross-fallback map: each model falls back to the other
-    fallback = MODEL_FALLBACK_MAP.get(model, NVIDIA_MODEL_FALLBACK)
+    fallback = MODEL_FALLBACK_MAP.get(model, OPENCODE_MODEL_FALLBACK)
     if fallback and fallback != model:
         models_to_try.append(fallback)
 
@@ -161,7 +159,6 @@ def call_llm_sync(
                     "max_tokens": max_tokens,
                     "timeout": timeout,
                     "seed": 42,
-                    "reasoning_effort": reasoning_effort,
                 }
                 kwargs["response_format"] = {"type": "json_object"}
                 kwargs["stream_options"] = {"include_usage": True}
@@ -191,7 +188,11 @@ def call_llm_sync(
                         raw = reasoning_content.strip()
                         logger.warning(f"LLM returned only reasoning_content ({len(reasoning_content)} chars), using as response")
                     else:
-                        raw = ""
+                        # Empty response - raise to trigger retry
+                        raise RuntimeError(
+                            f"OpenCode API returned empty content from {current_model}. "
+                            f"Full content: {len(full_content)} chars, reasoning: {len(reasoning_content)} chars."
+                        )
                     usage = getattr(chunk, 'usage', None) if chunk else None
                     if usage:
                         token_count = f" ({usage.completion_tokens} out / {usage.prompt_tokens} in tokens)"
@@ -201,13 +202,13 @@ def call_llm_sync(
                     kwargs.pop("stream", None)
                     response = client.chat.completions.create(**kwargs)
                     if not response.choices:
-                        raise RuntimeError("NVIDIA API returned no choices in response.")
+                        raise RuntimeError("OpenCode API returned no choices in response.")
                     raw = response.choices[0].message.content
                     if raw is None:
                         finish_reason = response.choices[0].finish_reason
                         refusal = getattr(response.choices[0].message, 'refusal', None)
                         raise RuntimeError(
-                            f"NVIDIA API returned empty content. "
+                            f"OpenCode API returned empty content. "
                             f"Finish reason: {finish_reason}. Refusal: {refusal}."
                         )
                     raw = raw.strip()
@@ -265,7 +266,7 @@ def call_llm_sync(
                     break
 
     raise RuntimeError(
-        f"All NVIDIA models failed after {max_attempts_per_model} retries each. "
+        f"All OpenCode models failed after {max_attempts_per_model} retries each. "
         f"Last error: {last_error}"
     )
 
@@ -277,9 +278,9 @@ _LLM_CACHE_TTL = 300  # 5 minutes
 _llm_cache: dict[str, tuple[float, str]] = {}
 
 
-def _cache_key(messages: list, model: str, reasoning_effort: str = "high") -> str:
-    """Deterministic cache key from messages + model + reasoning_effort."""
-    blob = json.dumps({"m": messages, "model": model, "re": reasoning_effort}, sort_keys=True, default=str)
+def _cache_key(messages: list, model: str) -> str:
+    """Deterministic cache key from messages + model."""
+    blob = json.dumps({"m": messages, "model": model}, sort_keys=True, default=str)
     return hashlib.sha256(blob.encode()).hexdigest()[:16]
 
 
@@ -287,23 +288,22 @@ def cached_call_llm_sync(
     messages: list[dict[str, Any]],
     model: str,
     api_key: str,
-    base_url: str = "https://integrate.api.nvidia.com/v1",
+    base_url: str = "https://opencode.ai/zen/v1",
     temperature: float = 0.0,
-    max_tokens: int = 16384,
+    max_tokens: int = 65536,
     timeout: float = 480.0,
     reporter: Any = None,
     interactions: list[LLMInteraction] | None = None,
     stage_name: str = "reel_plan",
     use_cache: bool = True,
-    reasoning_effort: str = "high",
 ) -> str:
     """LLM call with TTL cache. Cached responses skip the API entirely."""
     if not use_cache or temperature != 0.0:
         return call_llm_sync(messages, model, api_key, base_url, temperature,
                              max_tokens, timeout, reporter, interactions,
-                             stage_name, reasoning_effort)
+                             stage_name)
 
-    key = _cache_key(messages, model, reasoning_effort)
+    key = _cache_key(messages, model)
     now = time.monotonic()
 
     # Periodically clean up expired cache entries
@@ -333,7 +333,7 @@ def cached_call_llm_sync(
 
     result = call_llm_sync(messages, model, api_key, base_url, temperature,
                            max_tokens, timeout, reporter, interactions,
-                           stage_name, reasoning_effort)
+                           stage_name)
     _llm_cache[key] = (now, result)
     return result
 

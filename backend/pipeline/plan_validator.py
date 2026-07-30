@@ -203,7 +203,7 @@ def remove_overlaps(groups: list[dict]) -> int:
 # ---------------------------------------------------------------------------
 
 def validate_narration(groups: list[dict]) -> None:
-    """Validate narration events: types, hook placement, distribution, text sanitization."""
+    """Validate narration events: types, hook placement, duration, distribution, text sanitization."""
     for i, group in enumerate(groups):
         # Sanitize narration text
         for event in group.get("narration_events", []):
@@ -237,6 +237,24 @@ def validate_narration(groups: list[dict]) -> None:
                 logger.warning(f"Group {i}: Hook must start at 0.0, correcting")
                 event["reel_start"] = 0.0
 
+            # Hook duration: 4-6 seconds
+            if ev_type == "hook":
+                hook_dur = event.get("reel_end", 0) - event.get("reel_start", 0)
+                if hook_dur < 4.0:
+                    logger.info(f"Group {i}: Hook too short ({hook_dur:.1f}s < 4s), extending to 5s")
+                    event["reel_end"] = event.get("reel_start", 0) + 5.0
+                elif hook_dur > 6.0:
+                    logger.info(f"Group {i}: Hook too long ({hook_dur:.1f}s > 6s), trimming to 5s")
+                    event["reel_end"] = event.get("reel_start", 0) + 5.0
+
+            # Commentary: max 6 words (trim if longer)
+            if ev_type == "commentary":
+                text = event.get("text", "")
+                words = text.split()
+                if len(words) > 6:
+                    event["text"] = " ".join(words[:6])
+                    logger.info(f"Group {i} commentary {j}: Trimmed from {len(words)} to 6 words")
+
         if usable_count == 0:
             logger.warning(f"Group {i}: ZERO usable narration events — reel will have NO narration")
 
@@ -267,13 +285,15 @@ def validate_narration(groups: list[dict]) -> None:
             and (e.get("reel_end", 0) - e.get("reel_start", 0)) >= 0.3
         ]
         if len(commentary_events) >= 2:
-            last_40_start = est_dur * 0.6
-            all_in_tail = all(e.get("reel_start", 0) >= last_40_start for e in commentary_events)
+            # Check if all commentary is in the last 50% (clustered)
+            last_50_start = est_dur * 0.5
+            all_in_tail = all(e.get("reel_start", 0) >= last_50_start for e in commentary_events)
             if all_in_tail:
                 logger.warning(
                     f"Group {i}: ALL {len(commentary_events)} commentary events clustered in "
-                    f"last 40%. Redistributing..."
+                    f"last 50%. Redistributing..."
                 )
+                # Spread across 40% and 75% of reel
                 targets = [0.40, 0.75]
                 for idx, event in enumerate(commentary_events):
                     fraction = targets[idx % len(targets)]
@@ -281,6 +301,11 @@ def validate_narration(groups: list[dict]) -> None:
                     dur = event.get("reel_end", 0) - event.get("reel_start", 0)
                     event["reel_start"] = new_start
                     event["reel_end"] = round(new_start + dur, 2)
+
+        # Validate engagement signals exist
+        signals = group.get("engagement_signals", [])
+        if len(signals) < 1:
+            logger.info(f"Group {i}: No engagement signals detected — commentary may lack punch")
 
 
 # ---------------------------------------------------------------------------
