@@ -18,8 +18,8 @@ All settings are configured via environment variables in `backend/.env`. The ser
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `NVIDIA_BASE_URL` | `https://integrate.api.nvidia.com/v1` | NVIDIA API endpoint |
-| `NVIDIA_MODEL` | `openai/gpt-oss-120b` | Primary LLM model |
-| `NVIDIA_MODEL_FALLBACK` | `nvidia/llama-3.3-nemotron-super-49b-v1.5` | Fallback model on primary failure |
+| `NVIDIA_MODEL` | `stepfun-ai/step-3.7-flash` | Primary LLM model |
+| `NVIDIA_MODEL_FALLBACK` | `stepfun-ai/step-3.7-flash` | Fallback model on primary failure |
 | `NVIDIA_MAX_TOKENS` | `8192` | Max tokens for LLM response |
 | `NVIDIA_TEMPERATURE` | `0.7` | LLM temperature (0.0–1.0) |
 
@@ -129,8 +129,8 @@ NVIDIA_API_KEY=nvapi-xxxxxxxxxxxxxxxxxxxxx
 FFMPEG_PATH=C:\ffmpeg\bin\ffmpeg.exe
 
 # LLM
-NVIDIA_MODEL=openai/gpt-oss-120b
-NVIDIA_MODEL_FALLBACK=openai/gpt-oss-120b
+NVIDIA_MODEL=stepfun-ai/step-3.7-flash
+NVIDIA_MODEL_FALLBACK=stepfun-ai/step-3.7-flash
 
 # Video
 DOWNLOAD_MAX_HEIGHT=1080

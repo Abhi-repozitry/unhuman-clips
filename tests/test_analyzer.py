@@ -52,30 +52,25 @@ class TestComputeImportance:
     """Test deterministic importance scoring."""
 
     def test_high_energy_high_score(self):
-        score = _compute_importance(0.9, -10.0, False, False, False, False)
+        score = _compute_importance(0.9, -10.0, False, False, False)
         assert score > 50.0
 
     def test_low_energy_low_score(self):
-        score = _compute_importance(0.1, -40.0, False, False, False, False)
+        score = _compute_importance(0.1, -40.0, False, False, False)
         assert score < 20.0
 
-    def test_ocr_boosts_score(self):
-        base = _compute_importance(0.5, -20.0, False, False, False, False)
-        with_ocr = _compute_importance(0.5, -20.0, True, False, False, False)
-        assert with_ocr > base
-
     def test_black_frame_penalizes(self):
-        base = _compute_importance(0.5, -20.0, False, False, False, False)
-        with_black = _compute_importance(0.5, -20.0, False, False, True, False)
+        base = _compute_importance(0.5, -20.0, False, False, False)
+        with_black = _compute_importance(0.5, -20.0, False, True, False)
         assert with_black < base
 
     def test_score_clamped_0_100(self):
-        score = _compute_importance(1.0, 0.0, True, True, False, False)
+        score = _compute_importance(1.0, 0.0, True, False, False)
         assert 0.0 <= score <= 100.0
 
     def test_silence_before_boosts(self):
-        base = _compute_importance(0.5, None, False, False, False, False)
-        with_silence = _compute_importance(0.5, None, False, True, False, False)
+        base = _compute_importance(0.5, None, False, False, False)
+        with_silence = _compute_importance(0.5, None, True, False, False)
         assert with_silence > base
 
 
@@ -160,7 +155,7 @@ class TestFormatBlocksForLlm:
         from backend.pipeline.analyzer import SemanticBlock
         blocks = [SemanticBlock(
             block_id=0, start=0.0, end=5.0, text="hello world",
-            speech_energy=0.8, volume_db=-10.0, ocr=[], silence_before=False,
+            speech_energy=0.8, volume_db=-10.0, silence_before=False,
             black_frame=False, freeze=False, importance=75.0, peak_offset=2.5,
         )]
         result = _format_blocks_for_llm(blocks)
@@ -172,7 +167,7 @@ class TestFormatBlocksForLlm:
         blocks = [
             SemanticBlock(block_id=i, start=float(i*10), end=float(i*10+5),
                           text=f"block {i}", speech_energy=0.5, volume_db=None,
-                          ocr=[], silence_before=False, black_frame=False,
+                          silence_before=False, black_frame=False,
                           freeze=False, importance=float(i*10), peak_offset=0.0)
             for i in range(5)
         ]
@@ -315,7 +310,7 @@ class TestSemanticBlockFields:
         from backend.pipeline.analyzer import SemanticBlock
         block = SemanticBlock(
             block_id=0, start=0.0, end=5.0, text="What happens next?",
-            speech_energy=0.8, volume_db=-10.0, ocr=[], silence_before=False,
+            speech_energy=0.8, volume_db=-10.0, silence_before=False,
             black_frame=False, freeze=False, importance=75.0, peak_offset=2.5,
             has_question=True,
         )
@@ -326,7 +321,7 @@ class TestSemanticBlockFields:
         from backend.pipeline.analyzer import SemanticBlock
         block = SemanticBlock(
             block_id=0, start=0.0, end=5.0, text="Unbelievable!",
-            speech_energy=0.8, volume_db=-10.0, ocr=[], silence_before=False,
+            speech_energy=0.8, volume_db=-10.0, silence_before=False,
             black_frame=False, freeze=False, importance=75.0, peak_offset=2.5,
             has_exclamation=True,
         )
@@ -337,7 +332,7 @@ class TestSemanticBlockFields:
         from backend.pipeline.analyzer import SemanticBlock
         block = SemanticBlock(
             block_id=0, start=0.0, end=5.0, text="This is INCREDIBLE",
-            speech_energy=0.8, volume_db=-10.0, ocr=[], silence_before=False,
+            speech_energy=0.8, volume_db=-10.0, silence_before=False,
             black_frame=False, freeze=False, importance=75.0, peak_offset=2.5,
             has_emphasis=True,
         )
@@ -348,7 +343,7 @@ class TestSemanticBlockFields:
         from backend.pipeline.analyzer import SemanticBlock
         block = SemanticBlock(
             block_id=0, start=0.0, end=5.0, text="fast talking here",
-            speech_energy=0.8, volume_db=-10.0, ocr=[], silence_before=False,
+            speech_energy=0.8, volume_db=-10.0, silence_before=False,
             black_frame=False, freeze=False, importance=75.0, peak_offset=2.5,
             word_density=3.2,
         )
@@ -359,7 +354,7 @@ class TestSemanticBlockFields:
         from backend.pipeline.analyzer import SemanticBlock
         block = SemanticBlock(
             block_id=0, start=0.0, end=5.0, text="WHAT?!",
-            speech_energy=0.8, volume_db=-10.0, ocr=[], silence_before=True,
+            speech_energy=0.8, volume_db=-10.0, silence_before=True,
             black_frame=False, freeze=False, importance=75.0, peak_offset=2.5,
             has_question=True, has_exclamation=True, has_emphasis=True, word_density=2.0,
         )
@@ -378,7 +373,7 @@ class TestScoreClipAsHook:
         from backend.pipeline.analyzer import SemanticBlock
         defaults = dict(
             block_id=0, start=0.0, end=5.0, text="test",
-            speech_energy=0.5, volume_db=None, ocr=[], silence_before=False,
+            speech_energy=0.5, volume_db=None, silence_before=False,
             black_frame=False, freeze=False, importance=50.0, peak_offset=0.0,
         )
         defaults.update(kwargs)
@@ -407,7 +402,7 @@ class TestScoreClipAsHook:
         # Block spans 5-15s so it overlaps both clips
         block = SemanticBlock(
             block_id=0, start=5.0, end=15.0, text="test",
-            speech_energy=0.5, volume_db=None, ocr=[], silence_before=False,
+            speech_energy=0.5, volume_db=None, silence_before=False,
             black_frame=False, freeze=False, importance=50.0, peak_offset=0.0,
         )
         # Clip at start (0-5s) doesn't overlap the block
@@ -431,12 +426,12 @@ class TestRankHookCandidates:
         blocks = [
             SemanticBlock(
                 block_id=0, start=0.0, end=5.0, text="boring intro",
-                speech_energy=0.3, volume_db=None, ocr=[], silence_before=False,
+                speech_energy=0.3, volume_db=None, silence_before=False,
                 black_frame=False, freeze=False, importance=30.0, peak_offset=0.0,
             ),
             SemanticBlock(
                 block_id=1, start=10.0, end=15.0, text="What happens next?!",
-                speech_energy=0.9, volume_db=-10.0, ocr=[], silence_before=True,
+                speech_energy=0.9, volume_db=-10.0, silence_before=True,
                 black_frame=False, freeze=False, importance=85.0, peak_offset=2.0,
                 has_question=True, has_exclamation=True,
             ),
@@ -458,13 +453,13 @@ class TestRankHookCandidates:
         blocks = [
             SemanticBlock(
                 block_id=0, start=0.0, end=5.0, text="Amazing hook?!",
-                speech_energy=0.9, volume_db=-10.0, ocr=[], silence_before=True,
+                speech_energy=0.9, volume_db=-10.0, silence_before=True,
                 black_frame=False, freeze=False, importance=90.0, peak_offset=1.0,
                 has_question=True, has_exclamation=True,
             ),
             SemanticBlock(
                 block_id=1, start=10.0, end=15.0, text="boring middle",
-                speech_energy=0.3, volume_db=None, ocr=[], silence_before=False,
+                speech_energy=0.3, volume_db=None, silence_before=False,
                 black_frame=False, freeze=False, importance=30.0, peak_offset=0.0,
             ),
         ]

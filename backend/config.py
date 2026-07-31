@@ -17,6 +17,7 @@ __all__ = [
     "get_job_working_dir", "validate_config", "cleanup_stale_files",
     "FFMPEG_PATH", "FFPROBE_PATH",
     "NVIDIA_API_KEY", "NVIDIA_BASE_URL", "NVIDIA_MODEL", "NVIDIA_MODEL_FALLBACK",
+    "OPENCODE_API_KEY", "OPENCODE_BASE_URL", "OPENCODE_MODEL",
     "MAX_INPUT_TOKENS", "MAX_OUTPUT_TOKENS",
     "MIN_CONTENT_DURATION",
     "WHISPER_MODEL_SIZE", "WHISPER_COMPUTE_TYPE_CUDA", "WHISPER_COMPUTE_TYPE_CPU",
@@ -52,8 +53,12 @@ WHISPER_COMPUTE_TYPE_CPU = os.environ.get("WHISPER_COMPUTE_TYPE_CPU", "int8")
 
 NVIDIA_API_KEY = os.environ.get("NVIDIA_API_KEY")
 NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
-NVIDIA_MODEL = os.environ.get("NVIDIA_MODEL", "openai/gpt-oss-120b")
-NVIDIA_MODEL_FALLBACK = os.environ.get("NVIDIA_MODEL_FALLBACK", "openai/gpt-oss-120b")
+NVIDIA_MODEL = os.environ.get("NVIDIA_MODEL", "stepfun-ai/step-3.7-flash")
+NVIDIA_MODEL_FALLBACK = os.environ.get("NVIDIA_MODEL_FALLBACK", "stepfun-ai/step-3.7-flash")
+
+OPENCODE_API_KEY = os.environ.get("OPENCODE_API_KEY")
+OPENCODE_BASE_URL = os.environ.get("OPENCODE_BASE_URL", "https://opencode.ai/zen/v1")
+OPENCODE_MODEL = os.environ.get("OPENCODE_MODEL", "mimo-v2.5-free")
 
 MAX_INPUT_TOKENS = int(os.environ.get("MAX_INPUT_TOKENS", "80000"))
 MAX_OUTPUT_TOKENS = int(os.environ.get("MAX_OUTPUT_TOKENS", "16384"))

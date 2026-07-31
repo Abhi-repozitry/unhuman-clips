@@ -94,6 +94,18 @@ class QueueManager:
             return True
         return False
 
+    def cleanup_old_jobs(self, max_age_hours: float = 24.0) -> int:
+        """Remove completed/error jobs older than max_age_hours. Returns count removed."""
+        from datetime import datetime, timedelta, timezone
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
+        to_remove = []
+        for job_id, job in self.jobs.items():
+            if job.status in ("DONE", "ERROR") and job.created_at.replace(tzinfo=timezone.utc) < cutoff:
+                to_remove.append(job_id)
+        for job_id in to_remove:
+            del self.jobs[job_id]
+        return len(to_remove)
+
     async def broadcast_drain_loop(self, broadcast_fn: Callable[[VideoJob], Any]) -> None:
         """Event-loop coroutine: poll the thread-safe queue and send to WebSocket clients.
 
@@ -258,7 +270,7 @@ class QueueManager:
         # Stage 3: BUILDING RICH TIMELINE
         job.stage_index = 3
         job.total_stages = 9
-        job.stage_data = {"status": "building_timeline", "message": "Building Rich Timeline (VAD + OCR + FFmpeg metrics)..."}
+        job.stage_data = {"status": "building_timeline", "message": "Building Rich Timeline (VAD + FFmpeg metrics)..."}
         reporter.update_stage(JobStatus.BUILDING_TIMELINE, "Building Rich Timeline...", 0, 3)
 
         # Check for timeline checkpoint
@@ -282,8 +294,7 @@ class QueueManager:
         reporter.log_info(
             f"Rich Timeline: {len(job.rich_timeline.segments)} segments, "
             f"speech={job.rich_timeline.total_speech_duration:.1f}s, "
-            f"VAD_regions={job.rich_timeline.speech_region_count}, "
-            f"OCR_texts={job.rich_timeline.ocr_region_count}"
+            f"VAD_regions={job.rich_timeline.speech_region_count}"
         )
 
         # Stage 4: ANALYZING

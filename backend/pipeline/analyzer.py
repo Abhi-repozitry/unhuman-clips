@@ -43,6 +43,9 @@ from backend.config import (
     NVIDIA_BASE_URL,
     NVIDIA_MODEL,
     NVIDIA_MODEL_FALLBACK,
+    OPENCODE_API_KEY,
+    OPENCODE_BASE_URL,
+    OPENCODE_MODEL,
     REASONING_EFFORT,
 )
 from backend.models import LLMInteraction, ReelPlan, RichTimeline
@@ -67,7 +70,6 @@ class SemanticBlock:
     text: str
     speech_energy: float
     volume_db: float | None
-    ocr: list[str]
     silence_before: bool
     black_frame: bool
     freeze: bool
@@ -85,7 +87,6 @@ class SemanticBlock:
 
     def summary_line(self) -> str:
         energy_bar = "█" * int(self.speech_energy * 10) + "░" * (10 - int(self.speech_energy * 10))
-        ocr_str = f" | OCR: {'; '.join(self.ocr[:3])}" if self.ocr else ""
         flags = []
         if self.silence_before:
             flags.append("SILENCE_BEFORE")
@@ -106,21 +107,19 @@ class SemanticBlock:
             f"Block {self.block_id} [{self.start:.1f}-{self.end:.1f}s] "
             f"imp={self.importance:.0f} energy={energy_bar}({self.speech_energy:.2f})"
             f"{vol} peak=+{self.peak_offset:.1f}s{wps}{flag_str}: "
-            f"{self.text[:220]}{ocr_str}"
+            f"{self.text[:220]}"
         )
 
 
 def _compute_importance(
     energy: float,
     volume_db: float | None,
-    has_ocr: bool,
     silence_before: bool,
     black: bool,
     freeze: bool,
     has_question: bool = False,
     has_exclamation: bool = False,
     has_emphasis: bool = False,
-    ocr_confidence: float = 0.0,
 ) -> float:
     """Deterministic importance 0–100. Python calculates; LLM only ranks editorially."""
     score = 0.0
@@ -131,9 +130,6 @@ def _compute_importance(
         # typical speech ~-20 to -10; map roughly
         vol_norm = max(0.0, min(1.0, (volume_db + 40) / 30.0))
         score += vol_norm * 15.0
-    # OCR = strong key-moment signal (0–15, weighted by confidence)
-    if has_ocr:
-        score += max(5.0, ocr_confidence * 15.0)
     # Natural cut point (0–10)
     if silence_before:
         score += 10.0
@@ -169,8 +165,6 @@ def _build_semantic_blocks(
                 "text": (seg.speech or "").strip(),
                 "energy": float(getattr(seg, "speech_energy", 0.0) or 0.0),
                 "volume_db": getattr(seg.metrics, "volume_db", None) if hasattr(seg, "metrics") else None,
-                "ocr": list(seg.ocr) if getattr(seg, "ocr", None) else [],
-                "ocr_confidence": float(getattr(seg, "ocr_confidence", 0.0) or 0.0),
                 "silence_before": bool(getattr(seg, "silence_before", False)),
                 "black": bool(getattr(seg.metrics, "black_frame", False)) if hasattr(seg, "metrics") else False,
                 "freeze": bool(getattr(seg.metrics, "freeze_detected", False)) if hasattr(seg, "metrics") else False,
@@ -189,7 +183,6 @@ def _build_semantic_blocks(
                 "text": (entry.get("text") or "").strip(),
                 "energy": 0.5,
                 "volume_db": None,
-                "ocr": [],
                 "silence_before": False,
                 "black": False,
                 "freeze": False,
@@ -218,11 +211,6 @@ def _build_semantic_blocks(
         peak_offset = max(0.0, (peak_seg["start"] + peak_seg["end"]) / 2.0 - start)
         vols = [g["volume_db"] for g in group if g["volume_db"] is not None]
         volume_db = sum(vols) / len(vols) if vols else None
-        ocr: list[str] = []
-        for g in group:
-            for t in g["ocr"]:
-                if t and t not in ocr:
-                    ocr.append(t)
         silence_before = group[0]["silence_before"]
         black = any(g["black"] for g in group)
         freeze = any(g["freeze"] for g in group)
@@ -231,12 +219,9 @@ def _build_semantic_blocks(
         has_emphasis = any(g["has_emphasis"] for g in group)
         word_densities = [g["word_density"] for g in group if g["word_density"] > 0]
         avg_word_density = sum(word_densities) / len(word_densities) if word_densities else 0.0
-        # OCR confidence: use max confidence from segments with OCR
-        ocr_confs = [g.get("ocr_confidence", 0.0) for g in group if g.get("ocr")]
-        max_ocr_confidence = max(ocr_confs) if ocr_confs else 0.0
         importance = _compute_importance(
-            avg_energy, volume_db, bool(ocr), silence_before, black, freeze,
-            has_question, has_exclamation, has_emphasis, max_ocr_confidence
+            avg_energy, volume_db, silence_before, black, freeze,
+            has_question, has_exclamation, has_emphasis
         )
         blocks.append(SemanticBlock(
             block_id=len(blocks),
@@ -245,7 +230,6 @@ def _build_semantic_blocks(
             text=text,
             speech_energy=avg_energy,
             volume_db=volume_db,
-            ocr=ocr[:5],
             silence_before=silence_before,
             black_frame=black,
             freeze=freeze,
@@ -424,24 +408,32 @@ def _call_llm(
     max_tokens: int = MAX_OUTPUT_TOKENS,
     reasoning_effort: str = REASONING_EFFORT,
 ) -> str:
-    if not NVIDIA_API_KEY:
+    from backend.main import SELECTED_MODEL_PROVIDER
+
+    providers = []
+    if SELECTED_MODEL_PROVIDER == "opencode" and OPENCODE_API_KEY:
+        providers.append((OPENCODE_MODEL, OPENCODE_API_KEY, OPENCODE_BASE_URL))
+    if NVIDIA_API_KEY:
+        providers.append((NVIDIA_MODEL, NVIDIA_API_KEY, NVIDIA_BASE_URL))
+        if NVIDIA_MODEL_FALLBACK and NVIDIA_MODEL_FALLBACK != NVIDIA_MODEL:
+            providers.append((NVIDIA_MODEL_FALLBACK, NVIDIA_API_KEY, NVIDIA_BASE_URL))
+    if SELECTED_MODEL_PROVIDER != "opencode" and OPENCODE_API_KEY:
+        providers.append((OPENCODE_MODEL, OPENCODE_API_KEY, OPENCODE_BASE_URL))
+
+    if not providers:
         raise RuntimeError(
-            "NVIDIA_API_KEY is not set. Skipping LLM analysis and using local fallback."
+            "No API keys set (NVIDIA_API_KEY, OPENCODE_API_KEY). Cannot run LLM analysis."
         )
 
-    models_to_try = [NVIDIA_MODEL]
-    if NVIDIA_MODEL_FALLBACK and NVIDIA_MODEL_FALLBACK != NVIDIA_MODEL:
-        models_to_try.append(NVIDIA_MODEL_FALLBACK)
-
     last_error = None
-    for model in models_to_try:
+    for model, api_key, base_url in providers:
         try:
-            logger.info(f"Calling LLM ({stage_name}) model={model}")
+            logger.info(f"Calling LLM ({stage_name}) model={model} base_url={base_url}")
             raw_content = call_llm_sync(
                 messages=messages,
                 model=model,
-                api_key=NVIDIA_API_KEY,
-                base_url=NVIDIA_BASE_URL,
+                api_key=api_key,
+                base_url=base_url,
                 temperature=0.0,
                 max_tokens=max_tokens,
                 timeout=480.0,
@@ -467,7 +459,7 @@ def _call_llm(
             logger.warning(f"LLM call failed ({stage_name}) model={model}: {e}")
             last_error = e
 
-    raise RuntimeError(f"All NVIDIA models failed ({stage_name}). Last error: {last_error}") from last_error
+    raise RuntimeError(f"All LLM models failed ({stage_name}). Last error: {last_error}") from last_error
 
 
 def _try_repair_truncated_json(text: str) -> str:

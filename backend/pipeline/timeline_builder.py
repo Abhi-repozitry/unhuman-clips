@@ -1,4 +1,4 @@
-"""Rich Timeline builder — merges Whisper, Silero VAD, OCR, and FFmpeg metrics.
+"""Rich Timeline builder — merges Whisper, Silero VAD, and FFmpeg metrics.
 
 Constructs a RichTimeline from multiple analysis sources, producing the single
 source of truth consumed by the LLM and all downstream pipeline stages.
@@ -213,94 +213,6 @@ def _compute_ffmpeg_metrics(
 
 
 # ---------------------------------------------------------------------------
-# OCR — text detection on sampled frames
-# ---------------------------------------------------------------------------
-
-def _run_ocr_on_source(
-    video_path: str,
-    segments: list[dict],
-    sample_interval: float = 5.0,
-    max_frames: int = 60,
-) -> dict[int, dict]:
-    """Sample frames from the source video and run OCR.
-
-    Returns dict mapping segment_id -> {"texts": [...], "confidence": float}.
-    """
-    try:
-        from backend.pipeline.ocr import _try_ocr_engine, _extract_frame
-    except ImportError as e:
-        logger.error(f"OCR module not importable: {e} — skipping OCR analysis")
-        return {}
-
-    # Sample timestamps across the video
-    if not segments:
-        logger.info("OCR: no segments to sample from")
-        return {}
-
-    total_duration = segments[-1]["end"] if segments else 0.0
-    sample_times = []
-    t = 0.0
-    while t < total_duration and len(sample_times) < max_frames:
-        sample_times.append(t)
-        t += sample_interval
-
-    logger.info(f"OCR: will analyze {len(sample_times)} sampled frames from {total_duration:.1f}s video")
-
-    ocr_results: dict[int, dict] = {}
-    frames_extracted = 0
-    frames_with_text = 0
-    extraction_failures = 0
-
-    for sample_t in sample_times:
-        # Find which segment this timestamp belongs to
-        seg_id = -1
-        for seg in segments:
-            if seg["start"] <= sample_t < seg["end"]:
-                seg_id = seg.get("segment_id", segments.index(seg))
-                break
-
-        if seg_id < 0:
-            continue
-
-        # Extract frame and run OCR
-        tmp_fd, tmp_path = tempfile.mkstemp(suffix=".jpg", prefix="ocr_frame_")
-        os.close(tmp_fd)
-
-        try:
-            if _extract_frame(video_path, sample_t, tmp_path):
-                frames_extracted += 1
-                results = _try_ocr_engine(tmp_path)
-                if results:
-                    texts = [r["text"] for r in results if r.get("text")]
-                    conf = max((r["confidence"] for r in results), default=0.0)
-                    if texts:
-                        frames_with_text += 1
-                    if seg_id not in ocr_results:
-                        ocr_results[seg_id] = {"texts": [], "confidence": 0.0}
-                    ocr_results[seg_id]["texts"].extend(texts)
-                    ocr_results[seg_id]["confidence"] = max(
-                        ocr_results[seg_id]["confidence"], conf
-                    )
-            else:
-                extraction_failures += 1
-        except Exception as e:
-            logger.warning(f"OCR failed at {sample_t:.1f}s: {type(e).__name__}: {e}")
-        finally:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-
-    logger.info(
-        f"OCR complete: {frames_extracted} frames extracted, "
-        f"{frames_with_text} contained text, "
-        f"{len(ocr_results)} segments with OCR data, "
-        f"{extraction_failures} frame extraction failures"
-    )
-    return ocr_results
-
-
-# ---------------------------------------------------------------------------
 # Speech energy — proportion of VAD speech within each segment
 # ---------------------------------------------------------------------------
 
@@ -356,10 +268,10 @@ def build_rich_timeline(
     progress_cb: Callable[[str, float], None] | None = None,
     reporter: Any = None,
 ) -> RichTimeline:
-    """Construct a RichTimeline by merging Whisper, VAD, OCR, and FFmpeg metrics.
+    """Construct a RichTimeline by merging Whisper, VAD, and FFmpeg metrics.
 
     This is the SINGLE source of truth for every downstream stage.
-    No downstream component should directly consume raw Whisper, OCR, VAD, or FFmpeg output.
+    No downstream component should directly consume raw Whisper, VAD, or FFmpeg output.
 
     Args:
         transcript: Whisper transcript segments with start/end/text/words keys.
@@ -407,22 +319,12 @@ def build_rich_timeline(
     logger.info(f"Rich Timeline source: FFmpeg -> {metrics_with_data}/{len(segment_metrics)} segments with volume data")
 
     if progress_cb:
-        progress_cb("Building Rich Timeline: running OCR on sampled frames...", 65)
-
-    # 3. Run OCR on sampled frames
-    ocr_data = _run_ocr_on_source(video_path, transcript)
-    logger.info(f"Rich Timeline source: OCR -> {len(ocr_data)} segments with text")
-    if reporter:
-        reporter.log_info(f"Rich Timeline: OCR found text in {len(ocr_data)} segments")
-
-    if progress_cb:
         progress_cb("Building Rich Timeline: merging all sources...", 85)
 
-    # 4. Merge into RichTimelineSegment list
+    # 3. Merge into RichTimelineSegment list
     segments = []
     total_speech = 0.0
     total_silence = 0.0
-    ocr_count = 0
     segments_with_energy = 0
 
     for i, seg in enumerate(transcript):
@@ -442,14 +344,6 @@ def build_rich_timeline(
 
         # Speech confidence (use VAD presence as proxy)
         speech_confidence = min(1.0, energy * 1.2) if energy > 0 else 0.0
-
-        # OCR data
-        ocr_texts = []
-        ocr_confidence = 0.0
-        if i in ocr_data:
-            ocr_texts = ocr_data[i]["texts"]
-            ocr_confidence = ocr_data[i]["confidence"]
-            ocr_count += len(ocr_texts)
 
         # Speech regions overlapping this segment
         overlapping_regions = [
@@ -484,8 +378,6 @@ def build_rich_timeline(
             speech_energy=round(energy, 3),
             speech_regions=overlapping_regions,
             silence_before=silence_before,
-            ocr=ocr_texts,
-            ocr_confidence=round(ocr_confidence, 3),
             metrics=metrics,
             word_density=round(word_density, 3),
             has_question=has_question,
@@ -502,14 +394,12 @@ def build_rich_timeline(
         total_speech_duration=round(total_speech, 3),
         total_silence_duration=round(total_silence, 3),
         speech_region_count=len(speech_regions),
-        ocr_region_count=ocr_count,
     )
 
     logger.info(
         f"Rich Timeline MERGED: "
         f"Whisper={len(segments)} segments | "
         f"Silero={len(speech_regions)} regions ({total_speech_vad:.1f}s) | "
-        f"OCR={ocr_count} texts | "
         f"FFmpeg={metrics_with_data} metrics | "
         f"Segments with energy={segments_with_energy} | "
         f"Speech={total_speech:.1f}s, Silence={total_silence:.1f}s"
@@ -517,8 +407,7 @@ def build_rich_timeline(
     if reporter:
         reporter.log_info(
             f"Rich Timeline built: {len(segments)} segments, "
-            f"VAD={len(speech_regions)} regions ({total_speech_vad:.1f}s speech), "
-            f"OCR={ocr_count} texts"
+            f"VAD={len(speech_regions)} regions ({total_speech_vad:.1f}s speech)"
         )
 
     if progress_cb:

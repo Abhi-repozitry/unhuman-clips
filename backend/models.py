@@ -70,7 +70,7 @@ class FFmpegMetrics(BaseModel):
 class RichTimelineSegment(BaseModel):
     """A single segment in the Rich Timeline — the single source of truth.
 
-    Merges Whisper transcription, Silero VAD, OCR, and FFmpeg metrics
+    Merges Whisper transcription, Silero VAD, and FFmpeg metrics
     into one unified structure consumed by the LLM and downstream stages.
     """
     segment_id: int
@@ -83,8 +83,6 @@ class RichTimelineSegment(BaseModel):
     speech_energy: float = 0.0
     speech_regions: list[dict] = Field(default_factory=list)
     silence_before: bool = False
-    ocr: list[str] = Field(default_factory=list)
-    ocr_confidence: float = 0.0
     metrics: FFmpegMetrics = Field(default_factory=FFmpegMetrics)
     word_density: float = 0.0
     has_question: bool = False
@@ -96,14 +94,13 @@ class RichTimeline(BaseModel):
     """Complete Rich Timeline — merged output of all analysis sources.
 
     This is the single source of truth consumed by the LLM.
-    No downstream component should directly consume raw Whisper, OCR, VAD, or FFmpeg output.
+    No downstream component should directly consume raw Whisper, VAD, or FFmpeg output.
     """
     segments: list[RichTimelineSegment] = Field(default_factory=list)
     source_duration: float = 0.0
     total_speech_duration: float = 0.0
     total_silence_duration: float = 0.0
     speech_region_count: int = 0
-    ocr_region_count: int = 0
 
 
 class StructureAnalysis(BaseModel):

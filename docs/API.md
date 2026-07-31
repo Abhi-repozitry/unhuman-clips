@@ -225,7 +225,7 @@ Real-time progress updates for all jobs. Connect with a WebSocket client.
     "role": "assistant",
     "content": "Preview of LLM response...",
     "full_content": "Full response text...",
-    "model": "openai/gpt-oss-120b",
+    "model": "stepfun-ai/step-3.7-flash",
     "token_count": "1500 out / 45000 in",
     "stage_name": "reel_plan"
   }

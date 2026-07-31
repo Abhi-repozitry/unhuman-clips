@@ -24,8 +24,8 @@ Use NVIDIA's API (integrate.api.nvidia.com) as the primary LLM provider, with a 
 |-----------|---------|---------|
 | `NVIDIA_API_KEY` | *(required)* | API authentication |
 | `NVIDIA_BASE_URL` | `https://integrate.api.nvidia.com/v1` | API endpoint |
-| `NVIDIA_MODEL` | `openai/gpt-oss-120b` | Primary model |
-| `NVIDIA_MODEL_FALLBACK` | `openai/gpt-oss-120b` | Fallback on primary failure |
+| `NVIDIA_MODEL` | `stepfun-ai/step-3.7-flash` | Primary model |
+| `NVIDIA_MODEL_FALLBACK` | `stepfun-ai/step-3.7-flash` | Fallback on primary failure |
 
 **Retry strategy:**
 1. Try primary model first
@@ -42,7 +42,7 @@ LLMInteraction(
     role="assistant",
     content="preview...",     # truncated for UI
     full_content="...",       # full text for debug
-    model="openai/gpt-oss-120b",
+    model="stepfun-ai/step-3.7-flash",
     token_count="1500 out / 45000 in",
     stage_name="reel_plan",
 )

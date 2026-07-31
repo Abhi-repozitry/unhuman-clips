@@ -79,7 +79,6 @@ class TestRichTimelineModels:
         )
         assert seg.segment_id == 0
         assert seg.speech_energy == 0.0
-        assert seg.ocr == []
 
     def test_timeline_construction(self):
         tl = RichTimeline(source_duration=60.0)

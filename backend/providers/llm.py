@@ -304,6 +304,10 @@ def cached_call_llm_sync(
     key = _cache_key(messages, model, reasoning_effort)
     now = time.monotonic()
 
+    # Periodically clean up expired cache entries
+    if len(_llm_cache) > 100:
+        _cleanup_expired_cache()
+
     if key in _llm_cache:
         cached_time, cached_val = _llm_cache[key]
         if now - cached_time < _LLM_CACHE_TTL:
@@ -335,3 +339,11 @@ def cached_call_llm_sync(
 def clear_llm_cache():
     """Clear the LLM response cache."""
     _llm_cache.clear()
+
+
+def _cleanup_expired_cache():
+    """Remove expired entries from the LLM cache."""
+    now = time.monotonic()
+    expired = [k for k, (t, _) in _llm_cache.items() if now - t >= _LLM_CACHE_TTL]
+    for k in expired:
+        del _llm_cache[k]

@@ -97,9 +97,10 @@ class GroupOrchestrator:
         if actual_clip_dur < MIN_CONTENT_DURATION:
             from backend.pipeline.plan_validator import _expand_clips_to_fill_gap
             clips_dicts = [c.model_dump() for c in group.source_clips]
+            source_dur = float(self.job.transcript[-1]["end"]) if self.job.transcript and len(self.job.transcript) > 0 else 0.0
             expanded = _expand_clips_to_fill_gap(
                 clips_dicts,
-                float(self.job.transcript[-1]["end"]) if self.job.transcript else 0.0,
+                source_dur,
                 MIN_CONTENT_DURATION,
             )
             if expanded > 0:
@@ -439,7 +440,7 @@ class GroupOrchestrator:
             source_path,
             working_dir,
             group.estimated_duration_seconds,
-            float(self.job.transcript[-1]["end"]) if self.job.transcript else 0.0,
+            float(self.job.transcript[-1]["end"]) if self.job.transcript and len(self.job.transcript) > 0 else 0.0,
             compositor_progress,
         )
 
@@ -594,15 +595,30 @@ class GroupOrchestrator:
                     reporter.log_info(f"Group {group_idx+1}: Skipping clip captions (generate_captions=False)")
                     group_clip_captions = []
                     group_narration_captions = []
+                    # Update stage to show we're working on commentary captions
+                    self.job.stage_index = 7
+                    self.job.stage_data = {
+                        "status": "captioning",
+                        "group_index": group_idx,
+                        "total_groups": self.job.num_output_groups,
+                        "current": 0,
+                        "total": len(group_narration_audio),
+                        "skipped_clip_captions": True,
+                    }
+                    reporter.update_stage(JobStatus.CAPTIONING, f"Group {group_idx+1}/{self.job.num_output_groups}: Generating commentary captions (clip captions skipped)...", 0, 7)
                     # Still generate commentary captions (top) even when clip captions are skipped
                     for i, nar in enumerate(group_narration_audio):
                         narr_caption_path = working_dir / f"group_{group_idx}_narr_caption_{i}.ass"
+
+                        def narr_skip_progress(msg: str, prog: float, idx=i):
+                            reporter.progress_callback(f"Commentary caption {idx+1}: {msg}", prog)
+
                         await asyncio.to_thread(
                             generate_commentary_ass,
                             nar["text"],
                             nar["duration"],
                             str(narr_caption_path),
-                            lambda msg, prog: None,
+                            narr_skip_progress,
                             nar["reel_start"],
                         )
                         group_narration_captions.append({
@@ -611,6 +627,15 @@ class GroupOrchestrator:
                             "reel_end": nar["reel_end"],
                             "path": str(narr_caption_path),
                         })
+                    self.job.caption_paths = []
+                    self.job.stage_data = {
+                        "status": "done",
+                        "group_index": group_idx,
+                        "clip_captions": 0,
+                        "narration_captions": len(group_narration_captions),
+                        "skipped_clip_captions": True,
+                    }
+                    reporter.log_info(f"Group {group_idx+1}: Generated {len(group_narration_captions)} commentary captions (clip captions skipped)")
                 group_output_path = await self.run_compositing(
                     group_idx, group, reporter, working_dir,
                     group_clip_paths, group_narration_audio,

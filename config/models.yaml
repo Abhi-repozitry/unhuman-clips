@@ -1,9 +1,14 @@
 providers:
   nvidia_nim:
-    primary: openai/gpt-oss-120b
-    fallback: openai/gpt-oss-120b
+    primary: stepfun-ai/step-3.7-flash
+    fallback: stepfun-ai/step-3.7-flash
     base_url: https://integrate.api.nvidia.com/v1
     api_key_env: NVIDIA_API_KEY
+
+  opencode:
+    primary: mimo-v2.5-free
+    base_url: https://opencode.ai/zen/v1
+    api_key_env: OPENCODE_API_KEY
 
 rate_limits:
   global:

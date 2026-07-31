@@ -138,7 +138,8 @@ def _run_ffmpeg(
 
 def _ass_filter(path: str) -> str:
     filename = Path(path).name
-    return f"ass=filename={filename}"
+    escaped = filename.replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
+    return f"ass='{escaped}'"
 
 
 def _concat_demuxer(

@@ -27,6 +27,9 @@ __all__ = ["app"]
 
 logger = logging.getLogger(__name__)
 
+# Model provider selection: "nvidia" or "opencode"
+SELECTED_MODEL_PROVIDER = "nvidia"
+
 # Rate limiter state: timestamps of recent /jobs POST requests (global, in-memory)
 _job_request_times: deque[float] = deque()
 _RATE_LIMIT_WINDOW = 60  # seconds
@@ -215,11 +218,13 @@ async def health_check():
     except RuntimeError:
         pass
 
-    # Check NVIDIA API key
+    # Check API keys
     nvidia_key_ok = False
+    opencode_key_ok = False
     try:
-        from backend.config import NVIDIA_API_KEY
+        from backend.config import NVIDIA_API_KEY, OPENCODE_API_KEY
         nvidia_key_ok = bool(NVIDIA_API_KEY)
+        opencode_key_ok = bool(OPENCODE_API_KEY)
     except Exception:
         pass
 
@@ -235,6 +240,7 @@ async def health_check():
         "system": {
             "ffmpeg_available": ffmpeg_ok,
             "nvidia_api_key_configured": nvidia_key_ok,
+            "opencode_api_key_configured": opencode_key_ok,
             "active_websocket_connections": len(connection_manager.active_connections),
         },
     }
@@ -264,6 +270,27 @@ async def set_mode(body: ModeRequest):
     return {"mode": body.mode, "fast_mode": cfg.FAST_MODE}
 
 
+class ModelRequest(BaseModel):
+    provider: str  # "nvidia" or "opencode"
+
+
+@app.get("/config/model")
+async def get_model():
+    """Return current model provider selection."""
+    return {"provider": SELECTED_MODEL_PROVIDER}
+
+
+@app.put("/config/model")
+async def set_model(body: ModelRequest):
+    """Switch between nvidia and opencode model providers."""
+    global SELECTED_MODEL_PROVIDER
+    if body.provider not in ("nvidia", "opencode"):
+        return JSONResponse(status_code=400, content={"error": "provider must be 'nvidia' or 'opencode'"})
+    SELECTED_MODEL_PROVIDER = body.provider
+    logger.info("Model provider set to: %s", body.provider)
+    return {"provider": body.provider}
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await connection_manager.connect(websocket)
@@ -283,7 +310,9 @@ async def websocket_endpoint(websocket: WebSocket):
 
 @app.get("/{full_path:path}")
 async def serve_frontend(full_path: str):
-    file_path = FRONTEND_DIR / full_path
+    file_path = (FRONTEND_DIR / full_path).resolve()
+    if not str(file_path).startswith(str(FRONTEND_DIR.resolve())):
+        return JSONResponse(status_code=403, content={"error": "forbidden"})
     if file_path.exists() and file_path.is_file():
         return FileResponse(str(file_path))
     return FileResponse(str(FRONTEND_DIR / "index.html"))
