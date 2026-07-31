@@ -80,6 +80,10 @@ class SemanticBlock:
     has_exclamation: bool = False
     has_emphasis: bool = False
     word_density: float = 0.0
+    has_vulgarity: bool = False
+    has_dating: bool = False
+    has_roast: bool = False
+    has_stakes: bool = False
 
     @property
     def duration(self) -> float:
@@ -100,6 +104,14 @@ class SemanticBlock:
             flags.append("!")
         if self.has_emphasis:
             flags.append("CAPS")
+        if self.has_vulgarity:
+            flags.append("VULGAR")
+        if self.has_dating:
+            flags.append("DATING")
+        if self.has_roast:
+            flags.append("ROAST")
+        if self.has_stakes:
+            flags.append("STAKES")
         flag_str = f" [{', '.join(flags)}]" if flags else ""
         vol = f" vol={self.volume_db:.1f}dB" if self.volume_db is not None else ""
         wps = f" wps={self.word_density:.1f}" if self.word_density > 0 else ""
@@ -144,6 +156,37 @@ def _compute_importance(
     return max(0.0, min(100.0, score))
 
 
+# Small keyword sets for 4 engagement signals — kept short on purpose.
+# A 10-category, 150-keyword version of this made prompts worse, not better.
+_VULGARITY_KEYWORDS = {"sexy", "hot", "fine", "thick", "ass", "body count", "ugly", "mid", "onlyfans", "savage"}
+_DATING_KEYWORDS = {"date", "dating", "crush", "flirt", "flirting", "kiss", "couple", "boyfriend", "girlfriend", "chemistry", "single", "match"}
+_ROAST_KEYWORDS = {"rejected", "no way", "shut up", "roast", "roasted", "exposed", "called out", "ridiculous", "unbelievable", "dumb"}
+_STAKES_KEYWORDS = {"money", "prize", "win", "winner", "eliminated", "last one", "challenge", "record", "insane", "never before"}
+
+
+def _detect_engagement_signals(text: str) -> dict[str, bool]:
+    """Detect vulgarity / dating / roast / stakes signals from block text.
+
+    Used for two things only: (1) hook scoring favors clips carrying one of
+    these flags, (2) the clip planner sees the flags on each block and gets a
+    one-line nudge on which to prioritize based on the video's content type.
+    """
+    if not text:
+        return {"has_vulgarity": False, "has_dating": False, "has_roast": False, "has_stakes": False}
+    text_lower = text.lower()
+    words = set(text_lower.split())
+
+    def _hit(keywords: set[str]) -> bool:
+        return any((kw in text_lower) if " " in kw else (kw in words) for kw in keywords)
+
+    return {
+        "has_vulgarity": _hit(_VULGARITY_KEYWORDS),
+        "has_dating": _hit(_DATING_KEYWORDS),
+        "has_roast": _hit(_ROAST_KEYWORDS),
+        "has_stakes": _hit(_STAKES_KEYWORDS),
+    }
+
+
 def _build_semantic_blocks(
     rich_timeline: RichTimeline | None,
     transcript: list[dict],
@@ -173,6 +216,8 @@ def _build_semantic_blocks(
                 "has_emphasis": bool(getattr(seg, "has_emphasis", False)),
                 "word_density": float(getattr(seg, "word_density", 0.0) or 0.0),
             })
+        for item in items:
+            item.update(_detect_engagement_signals(item["text"]))
     else:
         items = []
         for i, entry in enumerate(transcript):
@@ -191,6 +236,8 @@ def _build_semantic_blocks(
                 "has_emphasis": False,
                 "word_density": 0.0,
             })
+        for item in items:
+            item.update(_detect_engagement_signals(item["text"]))
 
     if not items:
         return []
@@ -217,6 +264,10 @@ def _build_semantic_blocks(
         has_question = any(g["has_question"] for g in group)
         has_exclamation = any(g["has_exclamation"] for g in group)
         has_emphasis = any(g["has_emphasis"] for g in group)
+        has_vulgarity = any(g.get("has_vulgarity", False) for g in group)
+        has_dating = any(g.get("has_dating", False) for g in group)
+        has_roast = any(g.get("has_roast", False) for g in group)
+        has_stakes = any(g.get("has_stakes", False) for g in group)
         word_densities = [g["word_density"] for g in group if g["word_density"] > 0]
         avg_word_density = sum(word_densities) / len(word_densities) if word_densities else 0.0
         importance = _compute_importance(
@@ -240,6 +291,10 @@ def _build_semantic_blocks(
             has_exclamation=has_exclamation,
             has_emphasis=has_emphasis,
             word_density=avg_word_density,
+            has_vulgarity=has_vulgarity,
+            has_dating=has_dating,
+            has_roast=has_roast,
+            has_stakes=has_stakes,
         ))
 
     for item in items[1:]:
@@ -342,6 +397,10 @@ def _score_clip_as_hook(
     # Not at the very start (curiosity gap)
     if clip_start > 3.0:
         score += 10.0
+
+    # Engagement signal bonus — vulgar/dating/roast/stakes moments hook hardest
+    if any(b.has_vulgarity or b.has_dating or b.has_roast or b.has_stakes for b in blocks_in_clip):
+        score += 15.0
 
     return min(100.0, score)
 
@@ -712,6 +771,23 @@ OUTPUT — STRICT JSON ONLY
 }}"""
 
 
+def _content_type_hint(video_title: str, blocks_text: str) -> str:
+    """One-line nudge for the clip planner based on a loose content-type guess.
+
+    Kept intentionally short — a full content-type rule system (5 categories,
+    ranked priority lists, scoring anchors) is what made output worse before.
+    This just points the model at which of the block flags to weight.
+    """
+    combined = (video_title or "").lower() + " " + (blocks_text or "").lower()
+    if any(k in combined for k in ("dating", "date night", "crush", "boyfriend", "girlfriend", "single", "flirt")):
+        return "CONTENT NUDGE: looks like dating/reality content — prioritize ROAST (rejections, callouts) and DATING (chemistry) moments over neutral small talk."
+    if any(k in combined for k in ("challenge", "last to leave", "eliminated", "prize", "winner takes", "$")):
+        return "CONTENT NUDGE: looks like a challenge/stunt (MrBeast-style) video — prioritize STAKES moments (money, prizes, elimination, records) and always end on the winner/result."
+    if any(k in combined for k in ("roast", "react", "reaction", "review", "rating")):
+        return "CONTENT NUDGE: looks like roast/reaction content — prioritize ROAST moments (comebacks, strong reactions, callouts) over flat commentary."
+    return ""
+
+
 def _prompt_clip_planner(
     video_title: str,
     structure: dict,
@@ -721,7 +797,8 @@ def _prompt_clip_planner(
     dur_max: int,
     top_blocks_hint: str = "",
 ) -> str:
-    units = structure.get("identified_units", [])
+    sa = structure.get("structure_analysis", structure)
+    units = sa.get("identified_units", structure.get("identified_units", []))
     kept = [u for u in units if u.get("kept", True)]
     units_json = json.dumps(kept, ensure_ascii=False, indent=2)
 
@@ -729,12 +806,15 @@ def _prompt_clip_planner(
     if top_blocks_hint:
         top_section = f"\nTOP BLOCKS BY IMPORTANCE (use these to anchor your strongest clips):\n{top_blocks_hint}\n"
 
+    content_hint = _content_type_hint(video_title, blocks_text)
+
     return f"""You are a senior YouTube Shorts clip editor.
 Your ONLY job: select the strongest source clips for each group defined by the structure plan.
 Do NOT write narration text. Do NOT change the number of groups.
 
 You choose clips for maximum impact, not transcript continuity.
 Every second must earn its place. If nothing meaningful happens, cut it.
+{content_hint}
 
 STRUCTURE PLAN (already decided):
 {json.dumps(structure.get("structure_analysis", structure), ensure_ascii=False, indent=2)}
@@ -745,6 +825,8 @@ KEPT UNITS:
 SEMANTIC BLOCKS (imp = importance 0-100, peak = best moment offset):
 {blocks_text}
 {top_section}
+Block flags VULGAR / DATING / ROAST / STAKES mark high-engagement moments — weight them heavily when picking clips.
+
 CRITICAL RULE — NO SOURCE OVERLAP
 Every source timestamp may belong to ONE reel only.
 If reel A uses 20.0-35.0s, NO other reel may touch 20.0-35.0s.
@@ -770,6 +852,7 @@ The Resolution clip is NOT optional. Every reel MUST end by showing what happene
 Find the exact moment where the winner is declared, the record is broken, the prize is awarded, or the challenge concludes. This is the payoff the viewer stays for.
 
 HOOK CLIPS — chosen by curiosity, NOT earliest timestamp.
+Blocks flagged VULGAR/DATING/ROAST/STAKES are usually the strongest hook candidates — check those first.
 Search the entire unit for:
 - "What happens if..." moments
 - Unexpected visuals or instant action
@@ -1027,11 +1110,17 @@ def select_reel_plan(
             )
     top_blocks_hint = "\n".join(top_blocks_lines)
 
+    sa = structure.get("structure_analysis", structure)
+    structure_for_prompt = {
+        "structure_analysis": sa,
+        "identified_units": sa.get("identified_units", structure.get("identified_units", [])),
+    }
+
     raw2 = _call_llm(
         [
             {"role": "system", "content": "Respond with ONLY valid JSON."},
             {"role": "user", "content": _prompt_clip_planner(
-                video_title, structure, blocks_text, source_duration, reel_dur_min, reel_dur_max,
+                video_title, structure_for_prompt, blocks_text, source_duration, reel_dur_min, reel_dur_max,
                 top_blocks_hint=top_blocks_hint,
             )},
         ],

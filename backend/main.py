@@ -30,6 +30,9 @@ logger = logging.getLogger(__name__)
 # Model provider selection: "nvidia" or "opencode"
 SELECTED_MODEL_PROVIDER = "nvidia"
 
+# Caption generation: True = generate, False = skip
+SELECTED_CAPTIONS = True
+
 # Rate limiter state: timestamps of recent /jobs POST requests (global, in-memory)
 _job_request_times: deque[float] = deque()
 _RATE_LIMIT_WINDOW = 60  # seconds
@@ -289,6 +292,25 @@ async def set_model(body: ModelRequest):
     SELECTED_MODEL_PROVIDER = body.provider
     logger.info("Model provider set to: %s", body.provider)
     return {"provider": body.provider}
+
+
+class CaptionRequest(BaseModel):
+    generate: bool
+
+
+@app.get("/config/caption")
+async def get_caption():
+    """Return current caption setting."""
+    return {"generate": SELECTED_CAPTIONS}
+
+
+@app.put("/config/caption")
+async def set_caption(body: CaptionRequest):
+    """Switch between generate and skip captions."""
+    global SELECTED_CAPTIONS
+    SELECTED_CAPTIONS = body.generate
+    logger.info("Caption generation set to: %s", body.generate)
+    return {"generate": body.generate}
 
 
 @app.websocket("/ws")
