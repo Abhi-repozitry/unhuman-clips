@@ -12,7 +12,7 @@ from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -20,15 +20,16 @@ from pydantic import BaseModel
 
 from backend.config import OUTPUTS_DIR
 from backend.logging_config import setup_logging
-from backend.models import VideoJob
+from backend.models import HookMode, SourceMetadata, VideoJob
+from backend.pipeline.downloader import fetch_video_metadata
 from backend.queue_manager import QueueManager
 
 __all__ = ["app"]
 
 logger = logging.getLogger(__name__)
 
-# Model provider selection: "nvidia" or "opencode"
-SELECTED_MODEL_PROVIDER = "nvidia"
+# Model provider: opencode only
+SELECTED_MODEL_PROVIDER = "opencode"
 
 # Caption generation: True = generate, False = skip
 SELECTED_CAPTIONS = True
@@ -129,7 +130,7 @@ async def lifespan(app: FastAPI):
             await asyncio.wait_for(_worker_task, timeout=30.0)
         except asyncio.CancelledError:
             logger.info("Worker task cancelled successfully.")
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.warning("Worker task did not finish within 30s timeout.")
 
     logger.info("Shutdown complete.")
@@ -153,6 +154,16 @@ FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend" / "renderer"
 class CreateJobRequest(BaseModel):
     url: str
     generate_captions: bool = True
+    hook_mode: HookMode = "auto"
+
+
+class PreflightJobRequest(BaseModel):
+    url: str
+
+
+class PreflightJobResponse(BaseModel):
+    source_metadata: SourceMetadata
+    suggested_hook_mode: HookMode = "required"
 
 
 def _check_rate_limit() -> bool:
@@ -183,8 +194,24 @@ async def create_job(body: CreateJobRequest):
             status_code=429,
             content={"error": "Rate limit exceeded. Try again later."},
         )
-    job = queue_manager.add_job(body.url, generate_captions=body.generate_captions)
+    job = queue_manager.add_job(
+        body.url,
+        generate_captions=body.generate_captions,
+        hook_mode=body.hook_mode,
+    )
     return job
+
+
+@app.post("/jobs/preflight")
+async def preflight_job(body: PreflightJobRequest) -> PreflightJobResponse:
+    """Fetch source metadata before a user commits a job to the queue."""
+    if not _check_rate_limit():
+        raise HTTPException(status_code=429, detail="Rate limit exceeded. Try again later.")
+    try:
+        metadata = await asyncio.to_thread(fetch_video_metadata, body.url)
+    except RuntimeError as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
+    return PreflightJobResponse(source_metadata=SourceMetadata.model_validate(metadata))
 
 
 @app.get("/jobs")
@@ -201,6 +228,77 @@ async def delete_job(job_id: str):
     if queue_manager.delete_job(job_id):
         return {"ok": True}
     return JSONResponse(status_code=404, content={"error": "job not found"})
+
+
+@app.get("/jobs/{job_id}/checkpoints")
+async def list_checkpoints(job_id: str):
+    """List completed checkpoint stages for a job."""
+    if queue_manager is None:
+        return JSONResponse(status_code=503, content={"error": "Server starting up, try again shortly."})
+    job = queue_manager.jobs.get(job_id)
+    if not job:
+        return JSONResponse(status_code=404, content={"error": "job not found"})
+    from backend.config import get_job_working_dir
+    from backend.pipeline.checkpoint import PipelineCheckpoint
+    ckpt = PipelineCheckpoint(get_job_working_dir(job_id))
+    stages = ckpt.list_stages()
+    return {"job_id": job_id, "checkpoints": stages}
+
+
+class RetryRequest(BaseModel):
+    from_stage: str | None = None  # None = full retry, str = retry from this stage
+
+
+STAGE_ORDER = ["download", "transcribe", "rich_timeline", "multimodal", "analyze"]
+
+
+@app.post("/jobs/{job_id}/retry")
+async def retry_job(job_id: str, body: RetryRequest = None):
+    """Retry a failed job. Optionally delete checkpoints after a given stage to force re-processing."""
+    if queue_manager is None:
+        return JSONResponse(status_code=503, content={"error": "Server starting up, try again shortly."})
+    job = queue_manager.jobs.get(job_id)
+    if not job:
+        return JSONResponse(status_code=404, content={"error": "job not found"})
+    if job.status not in ("ERROR", "DONE"):
+        return JSONResponse(status_code=400, content={"error": "can only retry ERROR or DONE jobs"})
+
+    from backend.config import get_job_working_dir
+    from backend.pipeline.checkpoint import PipelineCheckpoint
+    ckpt = PipelineCheckpoint(get_job_working_dir(job_id))
+
+    from_stage = body.from_stage if body else None
+    if from_stage:
+        # Delete this stage and all later stages to force re-processing
+        stages_to_delete = []
+        found = False
+        for s in STAGE_ORDER:
+            if s == from_stage:
+                found = True
+            if found:
+                stages_to_delete.append(s)
+        # Also delete per-group checkpoints if retrying from a group stage
+        if from_stage.startswith("group_"):
+            for s in ckpt.list_stages():
+                if s.startswith(from_stage.split("_clips")[0]):
+                    stages_to_delete.append(s)
+        for s in stages_to_delete:
+            ckpt.clear_stage(s)
+        logger.info("Retry %s from stage '%s': deleted checkpoints %s", job_id, from_stage, stages_to_delete)
+    else:
+        # Full retry: clear all checkpoints
+        count = ckpt.cleanup()
+        logger.info("Full retry %s: cleared %d checkpoints", job_id, count)
+
+    # Reset job status and re-enqueue
+    job.status = "QUEUED"
+    job.error = None
+    job.progress = 0.0
+    job.stage_index = 0
+    job.stage_data = {}
+    queue_manager.queue.put_nowait(job_id)
+    queue_manager.enqueue_broadcast(job)
+    return {"ok": True, "from_stage": from_stage}
 
 
 @app.get("/health")
@@ -222,11 +320,9 @@ async def health_check():
         pass
 
     # Check API keys
-    nvidia_key_ok = False
     opencode_key_ok = False
     try:
-        from backend.config import NVIDIA_API_KEY, OPENCODE_API_KEY
-        nvidia_key_ok = bool(NVIDIA_API_KEY)
+        from backend.config import OPENCODE_API_KEY
         opencode_key_ok = bool(OPENCODE_API_KEY)
     except Exception:
         pass
@@ -242,7 +338,6 @@ async def health_check():
         },
         "system": {
             "ffmpeg_available": ffmpeg_ok,
-            "nvidia_api_key_configured": nvidia_key_ok,
             "opencode_api_key_configured": opencode_key_ok,
             "active_websocket_connections": len(connection_manager.active_connections),
         },
@@ -273,27 +368,6 @@ async def set_mode(body: ModeRequest):
     return {"mode": body.mode, "fast_mode": cfg.FAST_MODE}
 
 
-class ModelRequest(BaseModel):
-    provider: str  # "nvidia" or "opencode"
-
-
-@app.get("/config/model")
-async def get_model():
-    """Return current model provider selection."""
-    return {"provider": SELECTED_MODEL_PROVIDER}
-
-
-@app.put("/config/model")
-async def set_model(body: ModelRequest):
-    """Switch between nvidia and opencode model providers."""
-    global SELECTED_MODEL_PROVIDER
-    if body.provider not in ("nvidia", "opencode"):
-        return JSONResponse(status_code=400, content={"error": "provider must be 'nvidia' or 'opencode'"})
-    SELECTED_MODEL_PROVIDER = body.provider
-    logger.info("Model provider set to: %s", body.provider)
-    return {"provider": body.provider}
-
-
 class CaptionRequest(BaseModel):
     generate: bool
 
@@ -311,6 +385,50 @@ async def set_caption(body: CaptionRequest):
     SELECTED_CAPTIONS = body.generate
     logger.info("Caption generation set to: %s", body.generate)
     return {"generate": body.generate}
+
+
+class ProviderRequest(BaseModel):
+    provider: str  # "mimo"
+
+
+@app.get("/config/provider")
+async def get_provider():
+    """Return current AI provider setting."""
+    import backend.config as cfg
+    return {"provider": cfg.AI_PROVIDER, "model": cfg.OPENCODE_MODEL}
+
+
+@app.put("/config/provider")
+async def set_provider(body: ProviderRequest):
+    """Set AI provider."""
+    import backend.config as cfg
+    if body.provider != "mimo":
+        return JSONResponse(status_code=400, content={"error": "provider must be 'mimo'"})
+    cfg.AI_PROVIDER = body.provider
+    logger.info("AI provider set to: %s (model: %s)", body.provider, cfg.OPENCODE_MODEL)
+    return {"provider": body.provider, "model": cfg.OPENCODE_MODEL}
+
+
+class OcrRequest(BaseModel):
+    mode: str  # "keep" or "skip"
+
+
+@app.get("/config/ocr")
+async def get_ocr():
+    """Return current OCR mode setting."""
+    import backend.config as cfg
+    return {"mode": cfg.OCR_MODE}
+
+
+@app.put("/config/ocr")
+async def set_ocr(body: OcrRequest):
+    """Switch between keep and skip OCR modes."""
+    import backend.config as cfg
+    if body.mode not in ("keep", "skip"):
+        return JSONResponse(status_code=400, content={"error": "mode must be 'keep' or 'skip'"})
+    cfg.OCR_MODE = body.mode
+    logger.info("OCR mode set to: %s", body.mode)
+    return {"mode": body.mode}
 
 
 @app.websocket("/ws")

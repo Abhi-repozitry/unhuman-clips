@@ -5,12 +5,14 @@ source of truth consumed by the LLM and all downstream pipeline stages.
 """
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import re
 import subprocess
 import tempfile
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 from backend.config import VAD_THRESHOLD
 from backend.ffmpeg_utils import get_ffmpeg
@@ -73,8 +75,8 @@ def _run_vad_on_source(
     Returns list of {"start": float, "end": float} for each detected speech segment.
     """
     try:
-        import torch
         import soundfile as sf
+        import torch
         from silero_vad import get_speech_timestamps, load_silero_vad
     except ImportError as e:
         logger.error(
@@ -138,10 +140,8 @@ def _run_vad_on_source(
         return []
     finally:
         if tmp_wav and os.path.exists(tmp_wav):
-            try:
+            with contextlib.suppress(OSError):
                 os.unlink(tmp_wav)
-            except OSError:
-                pass
 
 
 # ---------------------------------------------------------------------------
@@ -242,7 +242,7 @@ def _check_silence_before(
     min_silence: float = 0.3,
 ) -> bool:
     """Check if there is a silence gap of at least min_silence before this segment.
-    
+
     Only checks the immediately preceding VAD region, not arbitrary ones.
     """
     if not speech_regions:
@@ -383,6 +383,7 @@ def build_rich_timeline(
             has_question=has_question,
             has_exclamation=has_exclamation,
             has_emphasis=has_emphasis,
+            speaker_id=str(seg.get("speaker_id") or seg.get("speaker") or "").strip() or None,
         )
         segments.append(segment)
 

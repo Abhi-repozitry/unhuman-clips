@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import re
@@ -52,8 +53,8 @@ def detect_silence_with_vad(
     More aggressive: catches shorter silences (0.3s+) for tighter pacing.
     """
     try:
-        import torch
         import soundfile as sf
+        import torch
         from silero_vad import get_speech_timestamps, load_silero_vad
     except ImportError:
         print("[WARN] Silero VAD not available, falling back to ffmpeg silencedetect")
@@ -130,10 +131,8 @@ def detect_silence_with_vad(
         return detect_silence_ffmpeg(video_path, -35.0, min_silence_duration)
     finally:
         if tmp_wav and os.path.exists(tmp_wav):
-            try:
+            with contextlib.suppress(OSError):
                 os.unlink(tmp_wav)
-            except OSError:
-                pass
 
 
 def detect_silence_ffmpeg(
@@ -355,13 +354,3 @@ def apply_edits(
         "original_duration": round(original_duration, 2),
         "final_duration": round(final_duration, 2)
     }
-
-
-def edit_final_video(video_path: str, job_id: str) -> dict[str, Any]:
-    """Edit the final composed video: trim silence, subtle speed up, finalize.
-
-    This is the entry point called by queue_manager.py.
-    Delegates to apply_edits with enhanced default config.
-    """
-    working_dir = Path(video_path).parent
-    return apply_edits(video_path, str(working_dir))

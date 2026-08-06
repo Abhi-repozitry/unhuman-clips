@@ -35,7 +35,7 @@ class OutputManager:
         Returns:
             Final output file path in OUTPUTS_DIR.
         """
-        from backend.config import OUTPUTS_DIR, MAX_OUTPUT_DURATION
+        from backend.config import MAX_OUTPUT_DURATION, OUTPUTS_DIR
 
         ffmpeg = get_ffmpeg()
         ffprobe = get_ffprobe()

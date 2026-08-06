@@ -1,7 +1,6 @@
 """Tests for backend.pipeline.orchestrator — group orchestration flow with mocks."""
 from __future__ import annotations
 
-import asyncio
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -114,7 +113,7 @@ class TestGroupOrchestrator:
         with patch.object(orch.ckpt, "load_stage", return_value={"narration_audio": saved_narrations}):
             result = await orch.run_tts(0, sample_group, mock_reporter, Path("/fake/working"))
             # run_tts returns (narration_audio, narration_events)
-            narration_audio, narration_events = result
+            narration_audio, _ = result
             assert len(narration_audio) == 1
             assert narration_audio[0]["path"] == "/n.wav"
 
@@ -123,19 +122,10 @@ class TestGroupOrchestrator:
         """Without checkpoint, TTS should call synthesize_commentary."""
         orch = GroupOrchestrator(sample_job, mock_broadcast)
 
-        mock_nar_result = {
-            "event_type": "hook",
-            "reel_start": 0.0,
-            "reel_end": 3.0,
-            "text": "Hook text",
-            "path": "/fake/hook.wav",
-            "duration": 3.0,
-        }
-
         with patch.object(orch.ckpt, "load_stage", return_value=None), \
              patch("backend.pipeline.orchestrator.synthesize_commentary", return_value=3.0) as mock_tts:
             result = await orch.run_tts(0, sample_group, mock_reporter, Path("/fake/working"))
-            narration_audio, narration_events = result
+            narration_audio, _ = result
             assert len(narration_audio) >= 1
             mock_tts.assert_called()
 
@@ -153,8 +143,8 @@ class TestGroupOrchestrator:
         ]
 
         with patch.object(orch.ckpt, "load_stage", return_value=None), \
-             patch("backend.pipeline.orchestrator.generate_clip_ass", return_value="/fake/clip.ass") as mock_clip_ass, \
-             patch("backend.pipeline.orchestrator.generate_commentary_ass", return_value="/fake/com.ass") as mock_com_ass:
+             patch("backend.pipeline.orchestrator.generate_clip_ass", return_value="/fake/clip.ass"), \
+             patch("backend.pipeline.orchestrator.generate_commentary_ass", return_value="/fake/com.ass"):
             result = await orch.run_captioning(
                 0, sample_group, mock_reporter, Path("/fake/working"), narration_audio
             )
@@ -170,7 +160,7 @@ class TestGroupOrchestrator:
         with patch.object(orch.ckpt, "load_stage", return_value=None), \
              patch("backend.pipeline.orchestrator.synthesize_commentary", return_value=3.0):
             result = await orch.run_tts(0, sample_group, mock_reporter, Path("/fake/working"))
-            narration_audio, narration_events = result
+            narration_audio, _ = result
             # Orchestrator injects fallback hook from reel_summary.short_description
             assert len(narration_audio) == 1
             assert narration_audio[0]["event_type"] == "hook"

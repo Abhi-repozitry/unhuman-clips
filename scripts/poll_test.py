@@ -1,11 +1,12 @@
-import requests
-import time
 import json
+import time
+
+import requests
 
 job_id = 'e089b759-1130-4c2a-91b2-63c29c6d1feb'
 last_log = None
 
-for i in range(200):
+for _i in range(200):
     r = requests.get('http://127.0.0.1:9000/jobs', timeout=30)
     jobs = r.json()
     match = [j for j in jobs if j.get('id') == job_id]
@@ -33,14 +34,13 @@ for i in range(200):
         for o in outputs:
             print(f'  Group {o["output_index"]}: {o.get("output_path", "")} ({o.get("duration_seconds", 0):.1f}s)')
         # Count generated files
-        import os
         from pathlib import Path
         working = Path('backend/storage/working') / job_id
         if working.exists():
             audio_files = list(working.glob('*.wav'))
             caption_files = list(working.glob('*.ass'))
             clip_files = list((working / 'clips').glob('*.mp4')) if (working / 'clips').exists() else []
-            print(f'\n=== GENERATED FILE COUNTS ===')
+            print('\n=== GENERATED FILE COUNTS ===')
             print(f'  Audio files (narration): {len(audio_files)}')
             print(f'  Caption files: {len(caption_files)}')
             print(f'  Cut clips: {len(clip_files)}')

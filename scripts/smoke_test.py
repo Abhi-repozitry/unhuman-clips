@@ -77,7 +77,7 @@ def main() -> int:
     check("extract_json", lambda: _assert('"key": "value"' in _extract_json_object('{"key": "value"}')))
 
     print("\n[5/5] Models validation...")
-    from backend.models import VideoJob, JobStatus
+    from backend.models import JobStatus, VideoJob
     job = VideoJob(url="https://test.com")
     check("VideoJob creation", lambda: _assert(job.status == JobStatus.QUEUED))
     check("JobStatus enum", lambda: _assert(len(list(JobStatus)) == 12))

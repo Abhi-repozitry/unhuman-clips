@@ -164,7 +164,7 @@ class TestGenerateClipAss:
 
     def test_empty_transcript(self, tmp_path):
         out = str(tmp_path / "empty.ass")
-        result = generate_clip_ass([], 0.0, 10.0, out)
+        generate_clip_ass([], 0.0, 10.0, out)
         content = Path(out).read_text(encoding="utf-8")
         assert "[Script Info]" in content
         assert "Dialogue:" not in content

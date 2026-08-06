@@ -2,13 +2,17 @@
 from __future__ import annotations
 
 import json
-import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from backend.pipeline.downloader import download_video, validate_downloaded_video
+from backend.pipeline.downloader import (
+    download_video,
+    fetch_video_metadata,
+    normalize_source_metadata,
+    validate_downloaded_video,
+)
 
 
 class TestValidateDownloadedVideo:
@@ -136,7 +140,7 @@ class TestDownloadVideo:
 
     def test_download_empty_url_raises(self, tmp_path):
         hook = MagicMock()
-        with pytest.raises(Exception):
+        with pytest.raises(RuntimeError):
             download_video("", str(tmp_path), hook)
 
     def test_progress_hook_called(self, tmp_path, monkeypatch):
@@ -168,3 +172,61 @@ class TestDownloadVideo:
         # Should complete without error (hook may not be called in this mock setup)
         result = download_video("https://youtube.com/watch?v=vid2", out_dir, hook)
         assert result["id"] == "vid2"
+
+
+class TestSourceMetadata:
+    def test_normalizes_channel_and_video_fields(self):
+        metadata = normalize_source_metadata({
+            "id": "abc123",
+            "title": "  Contestants reveal their secrets  ",
+            "description": "Video description",
+            "channel": "Creator Channel",
+            "channel_description": "Creator description",
+            "channel_id": "channel-id",
+            "channel_url": "https://youtube.com/@creator",
+            "uploader": "Creator Uploads",
+            "uploader_id": "creator",
+            "uploader_url": "https://youtube.com/@creator",
+            "channel_follower_count": "1200000",
+        })
+
+        assert metadata == {
+            "video_id": "abc123",
+            "title": "Contestants reveal their secrets",
+            "description": "Video description",
+            "channel_name": "Creator Channel",
+            "channel_description": "Creator description",
+            "channel_id": "channel-id",
+            "channel_url": "https://youtube.com/@creator",
+            "uploader": "Creator Uploads",
+            "uploader_id": "creator",
+            "uploader_url": "https://youtube.com/@creator",
+            "channel_follower_count": 1200000,
+        }
+
+    def test_falls_back_to_uploader_when_channel_is_missing(self):
+        metadata = normalize_source_metadata({"uploader": "Creator", "description": None})
+
+        assert metadata["channel_name"] == "Creator"
+        assert metadata["description"] == ""
+        assert metadata["channel_follower_count"] is None
+
+    def test_fetches_metadata_without_downloading(self, monkeypatch):
+        mock_ydl = MagicMock()
+        mock_ydl_instance = MagicMock()
+        mock_ydl_instance.__enter__ = MagicMock(return_value=mock_ydl_instance)
+        mock_ydl_instance.__exit__ = MagicMock(return_value=False)
+        mock_ydl.return_value = mock_ydl_instance
+        mock_ydl_instance.extract_info.return_value = {
+            "id": "abc123",
+            "title": "Metadata only",
+            "channel": "Creator",
+        }
+        monkeypatch.setattr("backend.pipeline.downloader.yt_dlp.YoutubeDL", mock_ydl)
+
+        metadata = fetch_video_metadata("https://youtube.com/watch?v=abc123")
+
+        assert metadata["title"] == "Metadata only"
+        mock_ydl_instance.extract_info.assert_called_once_with(
+            "https://youtube.com/watch?v=abc123", download=False
+        )

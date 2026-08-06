@@ -11,10 +11,11 @@ wait_then_run.py
 
 Run: python wait_then_run.py
 """
-import os
+import contextlib
 import json
-import time
+import os
 import sys
+import time
 import traceback
 from pathlib import Path
 
@@ -98,10 +99,8 @@ def collect_evidence(job_id: str) -> dict:
     out["ass_files"] = [str(p) for p in ass_files]
     ass_contents = {}
     for p in ass_files:
-        try:
+        with contextlib.suppress(Exception):
             ass_contents[str(p)] = p.read_text(encoding="utf-8")
-        except Exception:
-            pass
     out["ass_contents"] = ass_contents
 
     # Job JSON from queue_manager if present
@@ -189,7 +188,7 @@ def main():
         print(f"\n[REPORT] {REPORT_FILE}")
         print(f"[DURATION] {report.get('edited_duration_seconds')}")
         print(f"[STATUS] {report['final_state']}")
-    except Exception as e:
+    except Exception:
         traceback.print_exc()
         sys.exit(1)
 

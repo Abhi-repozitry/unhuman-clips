@@ -41,26 +41,24 @@ Create a new video processing job.
 ```json
 {
   "url": "https://www.youtube.com/watch?v=...",
-  "options": {
-    "voice": "en-US-ChristopherNeural",
-    "target_groups": 3
-  }
+  "generate_captions": true,
+  "hook_mode": "required"
 }
 ```
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `url` | `string` | Yes | — | YouTube video URL |
-| `options.voice` | `string` | No | `en-US-ChristopherNeural` | Edge-TTS voice for narration |
-| `options.target_groups` | `int` | No | auto | Number of reels to generate (auto-scaled by duration) |
+| `generate_captions` | `boolean` | No | `true` | Generate clip and narration captions. |
+| `hook_mode` | `required` \| `skip` \| `auto` | No | `auto` | `required` forces a curiosity hook; `skip` opens directly with context; `auto` is resolved by the Identifier stage in a later pipeline phase. |
 
-**Response** `202 Accepted`
+**Response** `200 OK`
 
 ```json
 {
-  "job_id": "a1b2c3d4",
-  "status": "queued",
-  "message": "Job queued for processing"
+  "id": "a1b2c3d4",
+  "status": "QUEUED",
+  "hook_mode": "required"
 }
 ```
 
@@ -71,6 +69,50 @@ Create a new video processing job.
 | `400` | Invalid URL or missing required fields |
 | `429` | Queue is full |
 | `500` | Internal server error |
+
+---
+
+### `POST /jobs/preflight`
+
+Fetch YouTube metadata without downloading video or queueing a job. The frontend uses
+this before submission to show the real channel and video information. The default hook
+recommendation is `required` until the Identifier stage is available.
+
+**Request Body**
+
+```json
+{
+  "url": "https://www.youtube.com/watch?v=..."
+}
+```
+
+**Response** `200 OK`
+
+```json
+{
+  "source_metadata": {
+    "video_id": "...",
+    "title": "...",
+    "description": "...",
+    "channel_name": "...",
+    "channel_description": null,
+    "channel_id": "...",
+    "channel_url": "...",
+    "uploader": "...",
+    "uploader_id": "...",
+    "uploader_url": "...",
+    "channel_follower_count": 1200000
+  },
+  "suggested_hook_mode": "required"
+}
+```
+
+**Errors**
+
+| Status | Condition |
+|--------|-----------|
+| `422` | yt-dlp could not fetch metadata for the URL. |
+| `429` | Rate limit exceeded. |
 
 ---
 

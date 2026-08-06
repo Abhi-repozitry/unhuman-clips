@@ -1,17 +1,14 @@
 """Shared test fixtures for the unhuman-clips test suite.
 
-Provides mock ffmpeg, mock LLM responses, sample transcripts, and
+Provides mock ffmpeg, a sample reel plan, a mock reporter, and
 temporary file system fixtures used across all test modules.
 """
 from __future__ import annotations
 
-import json
-import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
-
 
 # ---------------------------------------------------------------------------
 # Temp directory fixture (autouse for every test)
@@ -24,34 +21,16 @@ def _isolated_tmp(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# Sample transcript fixtures
+# Sample transcript and reel plan fixtures
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
 def sample_transcript() -> list[dict]:
-    """10-segment transcript simulating a ~60s video."""
+    """A small ordered transcript for analyzer formatting tests."""
     return [
-        {"start": 0.0, "end": 5.0, "text": "Welcome to the show everyone."},
-        {"start": 5.5, "end": 12.0, "text": "Today we are going to look at something amazing."},
-        {"start": 12.5, "end": 18.0, "text": "This invention changed the world forever."},
-        {"start": 18.5, "end": 24.0, "text": "Nobody expected what happened next."},
-        {"start": 24.5, "end": 30.0, "text": "The results were absolutely shocking."},
-        {"start": 30.5, "end": 36.0, "text": "Scientists could not believe their eyes."},
-        {"start": 36.5, "end": 42.0, "text": "It was a breakthrough discovery."},
-        {"start": 42.5, "end": 48.0, "text": "They published the findings immediately."},
-        {"start": 48.5, "end": 54.0, "text": "The world would never be the same."},
-        {"start": 54.5, "end": 60.0, "text": "And that is the story of how it all began."},
-    ]
-
-
-@pytest.fixture
-def short_transcript() -> list[dict]:
-    """4-segment transcript for edge-case testing."""
-    return [
-        {"start": 0.0, "end": 3.0, "text": "Hello world."},
-        {"start": 3.5, "end": 7.0, "text": "This is a test."},
-        {"start": 7.5, "end": 11.0, "text": "Nothing more to say."},
-        {"start": 11.5, "end": 15.0, "text": "Goodbye."},
+        {"start": 0.0, "end": 5.0, "text": "Welcome to the show"},
+        {"start": 5.0, "end": 10.0, "text": "Here is the challenge"},
+        {"start": 10.0, "end": 15.0, "text": "The result surprises everyone"},
     ]
 
 
@@ -97,28 +76,6 @@ def sample_reel_plan_dict() -> dict:
 
 
 # ---------------------------------------------------------------------------
-# LLM mock response fixtures
-# ---------------------------------------------------------------------------
-
-@pytest.fixture
-def mock_llm_response(sample_reel_plan_dict: dict) -> str:
-    """Return a valid JSON string the analyzer would parse."""
-    return json.dumps(sample_reel_plan_dict)
-
-
-@pytest.fixture
-def mock_llm_response_with_fences(sample_reel_plan_dict: dict) -> str:
-    """Return a fenced JSON string (common LLM output format)."""
-    return f"```json\n{json.dumps(sample_reel_plan_dict, indent=2)}\n```"
-
-
-@pytest.fixture
-def mock_llm_truncated_response() -> str:
-    """Return a truncated JSON to test repair logic."""
-    return '{"reel_groups": [{"group_index": 0, "source_clips": [{"source_start": 0.0, "source_end": 5.0}], '
-
-
-# ---------------------------------------------------------------------------
 # Mock ffmpeg / ffprobe fixtures
 # ---------------------------------------------------------------------------
 
@@ -135,14 +92,6 @@ def mock_ffmpeg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr("backend.ffmpeg_utils.get_ffmpeg", lambda: fake_ffmpeg)
     monkeypatch.setattr("backend.ffmpeg_utils.get_ffprobe", lambda: fake_ffprobe)
     return fake_ffmpeg, fake_ffprobe
-
-
-@pytest.fixture
-def mock_subprocess_run(monkeypatch: pytest.MonkeyPatch):
-    """Patch subprocess.run globally — returns a configurable MagicMock."""
-    mock = MagicMock(return_value=MagicMock(returncode=0, stdout="", stderr="", text=True))
-    monkeypatch.setattr(subprocess, "run", mock)
-    return mock
 
 
 # ---------------------------------------------------------------------------
@@ -164,42 +113,3 @@ def mock_reporter():
     reporter.set_clip_details = MagicMock()
     reporter.update_clip_progress = MagicMock()
     return reporter
-
-
-# ---------------------------------------------------------------------------
-# Model fixtures
-# ---------------------------------------------------------------------------
-
-@pytest.fixture
-def sample_source_clips():
-    """Sample SourceClip objects matching sample_transcript."""
-    from backend.models import SourceClip
-    return [
-        SourceClip(source_start=0.0, source_end=5.0, reason="Opening hook"),
-        SourceClip(source_start=12.0, source_end=24.0, reason="Key reveal"),
-        SourceClip(source_start=36.0, source_end=42.0, reason="Discovery moment"),
-    ]
-
-
-@pytest.fixture
-def sample_narration_events():
-    """Sample NarrationEvent objects for composition testing."""
-    from backend.models import NarrationEvent
-    return [
-        NarrationEvent(event_type="hook", reel_start=0.0, reel_end=3.0, text="One discovery changed everything."),
-        NarrationEvent(event_type="commentary", reel_start=30.0, reel_end=33.0, text="The results shocked researchers."),
-    ]
-
-
-@pytest.fixture
-def sample_reel_group(sample_reel_plan_dict):
-    """A ReelGroup model from the sample plan dict."""
-    from backend.models import ReelGroup
-    return ReelGroup(**sample_reel_plan_dict["reel_groups"][0])
-
-
-@pytest.fixture
-def sample_video_job():
-    """A fresh VideoJob in QUEUED state."""
-    from backend.models import VideoJob
-    return VideoJob(url="https://www.youtube.com/watch?v=test123")

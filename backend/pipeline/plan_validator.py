@@ -14,25 +14,23 @@ The LLM must NEVER become responsible for these operations.
 """
 from __future__ import annotations
 
-import json
 import logging
-import re
 
 from backend.config import MAX_OUTPUT_DURATION, MIN_CONTENT_DURATION, MIN_OUTPUT_DURATION
 from backend.models import ReelPlan
 from backend.pipeline.sanitize import sanitize_text
 
 __all__ = [
-    "validate_clip_bounds",
-    "validate_timing",
-    "remove_overlaps",
-    "validate_narration",
-    "verify_duration",
-    "verify_captions",
-    "validate_clip_diversity",
     "enforce_clip_pacing",
-    "repair_clip_diversity",
     "finalize_edit",
+    "remove_overlaps",
+    "repair_clip_diversity",
+    "validate_clip_bounds",
+    "validate_clip_diversity",
+    "validate_narration",
+    "validate_timing",
+    "verify_captions",
+    "verify_duration",
 ]
 
 logger = logging.getLogger(__name__)
@@ -52,7 +50,7 @@ def validate_clip_bounds(
     Returns the number of clips that were adjusted.
     """
     adjusted = 0
-    for i, group in enumerate(groups):
+    for group in groups:
         for clip in group.get("source_clips", []):
             s = clip.get("source_start", 0.0)
             e = clip.get("source_end", 0.0)
@@ -224,7 +222,7 @@ def validate_narration(groups: list[dict]) -> None:
                 else:
                     hook_seen = True
 
-            if ev_type not in ("hook", "commentary"):
+            if ev_type not in ("hook", "start", "commentary"):
                 logger.warning(
                     f"Group {i} narration event {j} has unrecognized type '{ev_type}' — "
                     f"will be SILENTLY DROPPED before TTS"
@@ -232,31 +230,31 @@ def validate_narration(groups: list[dict]) -> None:
             else:
                 usable_count += 1
 
-            # Hook must start at 0.0
-            if ev_type == "hook" and event.get("reel_start", 0) != 0.0:
-                logger.warning(f"Group {i}: Hook must start at 0.0, correcting")
+            # Opening events (hook or start) must start at 0.0
+            if ev_type in ("hook", "start") and event.get("reel_start", 0) != 0.0:
+                logger.warning(f"Group {i}: {ev_type.capitalize()} must start at 0.0, correcting")
                 event["reel_start"] = 0.0
 
         if usable_count == 0:
             logger.warning(f"Group {i}: ZERO usable narration events — reel will have NO narration")
 
-        # Cap at 3 narration events (1 hook + 2 commentaries)
+        # Cap at 6 narration events (1 opening + up to 5 commentaries)
         usable_events = [
             e for e in group.get("narration_events", [])
-            if str(e.get("event_type", "")).strip().lower() in ("hook", "commentary")
+            if str(e.get("event_type", "")).strip().lower() in ("hook", "start", "commentary")
         ]
-        if len(usable_events) > 3:
-            # Keep hook + first 2 commentaries, drop the rest
-            hook = next((e for e in usable_events if e.get("event_type") == "hook"), None)
+        if len(usable_events) > 6:
+            # Keep opening (hook or start) + first 5 commentaries, drop the rest
+            opening = next((e for e in usable_events if e.get("event_type") in ("hook", "start")), None)
             commentary = [e for e in usable_events if e.get("event_type") == "commentary"]
-            keep_events = ([hook] if hook else []) + commentary[:2]
+            keep_events = ([opening] if opening else []) + commentary[:5]
             drop_events = [e for e in usable_events if e not in keep_events]
             for e in drop_events:
                 group.get("narration_events", []).remove(e)
             if drop_events:
                 logger.info(
                     f"Group {i}: Capped narration from {len(usable_events)} to "
-                    f"{len(keep_events)} events (max 3 allowed)"
+                    f"{len(keep_events)} events (max 6 allowed)"
                 )
 
         # Distribution check: ensure commentary is spread across the reel
@@ -333,22 +331,29 @@ def _expand_clips_to_fill_gap(
 
             extra_each_side = max_extra / 2.0
 
-            # Find bounds: previous clip end and next clip start
-            prev_end = 0.0
-            next_start = source_duration
-            for other in clips:
-                if other is clip:
-                    continue
-                o_start = other.get("source_start", 0.0)
-                o_end = other.get("source_end", 0.0)
-                if o_end <= cur_start and o_end > prev_end:
-                    prev_end = o_end
-                if o_start >= cur_end and o_start < next_start:
-                    next_start = o_start
+            # Extension must never cross another clip's interval. A clip that
+            # straddles the current range's left/right edge blocks that side
+            # entirely; clips fully before/after bound the usable space.
+            overlap_back = any(
+                o is not clip and o["source_start"] < cur_start < o["source_end"]
+                for o in clips
+            )
+            overlap_fwd = any(
+                o is not clip and o["source_start"] < cur_end < o["source_end"]
+                for o in clips
+            )
+            prev_end = max(
+                (o["source_end"] for o in clips if o is not clip and o["source_end"] <= cur_start),
+                default=0.0,
+            )
+            next_start = min(
+                (o["source_start"] for o in clips if o is not clip and o["source_start"] >= cur_end),
+                default=source_duration,
+            )
+            avail_back = 0.0 if overlap_back else max(0.0, cur_start - prev_end)
+            avail_fwd = 0.0 if overlap_fwd else max(0.0, next_start - cur_end)
 
             # Extend backward and forward, allocating unused budget to the other side
-            avail_back = cur_start - prev_end
-            avail_fwd = next_start - cur_end
             extend_back = min(extra_each_side, avail_back, deficit)
             remaining_after_back = deficit - extend_back
             extend_fwd = min(extra_each_side + (extra_each_side - extend_back), avail_fwd, remaining_after_back)
@@ -390,15 +395,22 @@ def _expand_clips_to_fill_gap(
 
 
 def verify_duration(groups: list[dict], source_duration: float) -> None:
-    """Verify and enforce duration constraints on each group."""
+    """Verify and enforce duration constraints on each group.
+
+    For executor-mode groups with unit_dur_min/max, uses those as bounds
+    instead of the global MIN_CONTENT_DURATION/MIN_OUTPUT_DURATION.
+    """
     for i, group in enumerate(groups):
         clips = group.get("source_clips", [])
         clips_total = sum(c.get("source_end", 0) - c.get("source_start", 0) for c in clips)
-        nar_events = group.get("narration_events", [])
-        nar_total = sum(e.get("reel_end", 0) - e.get("reel_start", 0) for e in nar_events)
+
+        # Use per-unit targets when available (executor mode), fall back to globals
+        unit_min = group.get("unit_dur_min", 0) or 0
+        unit_max = group.get("unit_dur_max", 0) or 0
+        has_unit_targets = unit_min > 0 and unit_max > 0
 
         # If clip content is too short, expand clips as much as source allows
-        target_content = MIN_CONTENT_DURATION
+        target_content = unit_min if has_unit_targets else MIN_CONTENT_DURATION
         if clips_total < target_content and source_duration > clips_total:
             logger.warning(
                 f"Group {i}: clip content {clips_total:.1f}s below minimum "
@@ -416,9 +428,10 @@ def verify_duration(groups: list[dict], source_duration: float) -> None:
         actual_estimated = clips_total + 2.0
 
         llm_estimate = group.get("estimated_duration_seconds", 0)
-        if llm_estimate < MIN_OUTPUT_DURATION and source_duration >= MIN_OUTPUT_DURATION:
+        dur_floor = unit_min if has_unit_targets else MIN_OUTPUT_DURATION
+        if llm_estimate < dur_floor and source_duration >= dur_floor:
             logger.warning(
-                f"Group {i}: estimated {llm_estimate:.1f}s below target {MIN_OUTPUT_DURATION}s. "
+                f"Group {i}: estimated {llm_estimate:.1f}s below target {dur_floor}s. "
                 f"Computed: {actual_estimated:.1f}s"
             )
 
@@ -426,13 +439,14 @@ def verify_duration(groups: list[dict], source_duration: float) -> None:
         if actual_estimated > llm_estimate:
             group["estimated_duration_seconds"] = round(actual_estimated, 1)
 
-        # Cap at MAX_OUTPUT_DURATION
-        if group["estimated_duration_seconds"] > MAX_OUTPUT_DURATION:
+        # Cap at MAX_OUTPUT_DURATION (or per-unit max if available)
+        dur_cap = unit_max if has_unit_targets else MAX_OUTPUT_DURATION
+        if group["estimated_duration_seconds"] > dur_cap:
             logger.warning(
                 f"Group {i}: capping estimated {group['estimated_duration_seconds']:.1f}s "
-                f"to {MAX_OUTPUT_DURATION}s"
+                f"to {dur_cap}s"
             )
-            group["estimated_duration_seconds"] = float(MAX_OUTPUT_DURATION)
+            group["estimated_duration_seconds"] = float(dur_cap)
 
 
 # ---------------------------------------------------------------------------
@@ -517,20 +531,23 @@ def validate_clip_diversity(groups: list[dict], source_duration: float) -> None:
 
 def _classify_clip_duration(duration: float) -> str:
     """Classify a clip as SHORT, MEDIUM, or LONG based on duration."""
-    if duration <= 6.0:
-        return "SHORT"
-    if duration <= 15.0:
-        return "MEDIUM"
-    return "LONG"
+    from backend.pipeline.analyzer import classify_clip_duration
+
+    return classify_clip_duration(duration)
 
 
-def enforce_clip_pacing(groups: list[dict]) -> int:
+FAST_PACED_GENRES = {"comedy_sketch", "roast_reaction", "sports_fitness", "game_challenge"}
+
+
+def enforce_clip_pacing(groups: list[dict], content_type: str = "", source_duration: float = 0.0) -> int:
     """Enforce deterministic pacing rules on clip selections.
 
     Rules:
     - No back-to-back LONG clips (merge or trim the weaker one)
     - No 3+ SHORT clips in a row (merge the two weakest adjacent)
     - Final clip must be MEDIUM (payoff moments need enough time for the reveal)
+      — skipped for fast-paced genres (comedy, roast, sports, game) where SHORT
+      payoffs are natural.
 
     Returns the number of clips modified or removed.
     """
@@ -544,7 +561,8 @@ def enforce_clip_pacing(groups: list[dict]) -> int:
         clips.sort(key=lambda c: c.get("source_start", 0))
 
         # 1. Final clip must be MEDIUM (payoff needs time for the reveal)
-        if clips:
+        #    Skip for fast-paced genres where SHORT payoffs are natural.
+        if clips and content_type not in FAST_PACED_GENRES:
             last = clips[-1]
             last_dur = last.get("source_end", 0) - last.get("source_start", 0)
             if _classify_clip_duration(last_dur) != "MEDIUM" and len(clips) >= 2:
@@ -576,10 +594,12 @@ def enforce_clip_pacing(groups: list[dict]) -> int:
                 trim_idx = classified[k][0] if imp_a <= imp_b else classified[k + 1][0]
                 clip = clips[trim_idx]
                 clip_dur = clip.get("source_end", 0) - clip.get("source_start", 0)
-                # Trim to 15s but respect 3s minimum
+                # Trim to 15s but respect 3s minimum, clamp to source duration
                 target_dur = max(3.0, min(15.0, clip_dur))
                 if clip_dur > target_dur:
                     new_end = clip["source_start"] + target_dur
+                    if source_duration > 0:
+                        new_end = min(new_end, source_duration)
                     clip["source_end"] = round(new_end, 3)
                     adjustments += 1
                     logger.info(
@@ -592,51 +612,53 @@ def enforce_clip_pacing(groups: list[dict]) -> int:
             k += 1
 
         # 3. No 3+ SHORT in a row — merge the two weakest adjacent SHORTs
-        classified = [
-            (k, _classify_clip_duration(c.get("source_end", 0) - c.get("source_start", 0)))
-            for k, c in enumerate(clips)
-        ]
-        run_start = 0
-        while run_start < len(classified):
-            # Find run of SHORT
-            run_end = run_start
-            while run_end < len(classified) and classified[run_end][1] == "SHORT":
-                run_end += 1
-            run_len = run_end - run_start
-            if run_len >= 3:
-                # Find the two weakest adjacent SHORTs in this run
-                best_merge_pair = None
-                best_combined_imp = float("inf")
-                for m in range(run_start, run_end - 1):
-                    imp_a = _estimate_clip_importance(clips[classified[m][0]])
-                    imp_b = _estimate_clip_importance(clips[classified[m + 1][0]])
-                    combined = imp_a + imp_b
-                    if combined < best_combined_imp:
-                        best_combined_imp = combined
-                        best_merge_pair = (m, m + 1)
-                if best_merge_pair:
-                    idx_a = classified[best_merge_pair[0]][0]
-                    idx_b = classified[best_merge_pair[1]][0]
-                    clip_a = clips[idx_a]
-                    clip_b = clips[idx_b]
-                    # Merge by extending clip_a to cover clip_b
-                    clip_a["source_end"] = clip_b.get("source_end", clip_a["source_end"])
-                    # Remove clip_b
-                    clips.pop(idx_b)
-                    adjustments += 1
-                    logger.info(
-                        f"Group {i}: Merged 3+ SHORT run by combining clips at "
-                        f"{clip_a['source_start']:.1f}s and {clip_b['source_start']:.1f}s"
-                    )
-                    # Rebuild classified after removal
-                    classified = [
-                        (k, _classify_clip_duration(c.get("source_end", 0) - c.get("source_start", 0)))
-                        for k, c in enumerate(clips)
-                    ]
-                    # Don't advance run_start — re-check from same position
-                    continue
-            # Advance past the current run (at least 1 position)
-            run_start = max(run_end, run_start + 1)
+        #    Skip for fast-paced genres where rapid cuts are natural.
+        if content_type not in FAST_PACED_GENRES:
+            classified = [
+                (k, _classify_clip_duration(c.get("source_end", 0) - c.get("source_start", 0)))
+                for k, c in enumerate(clips)
+            ]
+            run_start = 0
+            while run_start < len(classified):
+                # Find run of SHORT
+                run_end = run_start
+                while run_end < len(classified) and classified[run_end][1] == "SHORT":
+                    run_end += 1
+                run_len = run_end - run_start
+                if run_len >= 3:
+                    # Find the two weakest adjacent SHORTs in this run
+                    best_merge_pair = None
+                    best_combined_imp = float("inf")
+                    for m in range(run_start, run_end - 1):
+                        imp_a = _estimate_clip_importance(clips[classified[m][0]])
+                        imp_b = _estimate_clip_importance(clips[classified[m + 1][0]])
+                        combined = imp_a + imp_b
+                        if combined < best_combined_imp:
+                            best_combined_imp = combined
+                            best_merge_pair = (m, m + 1)
+                    if best_merge_pair:
+                        idx_a = classified[best_merge_pair[0]][0]
+                        idx_b = classified[best_merge_pair[1]][0]
+                        clip_a = clips[idx_a]
+                        clip_b = clips[idx_b]
+                        # Merge by extending clip_a to cover clip_b
+                        clip_a["source_end"] = clip_b.get("source_end", clip_a["source_end"])
+                        # Remove clip_b
+                        clips.pop(idx_b)
+                        adjustments += 1
+                        logger.info(
+                            f"Group {i}: Merged 3+ SHORT run by combining clips at "
+                            f"{clip_a['source_start']:.1f}s and {clip_b['source_start']:.1f}s"
+                        )
+                        # Rebuild classified after removal
+                        classified = [
+                            (k, _classify_clip_duration(c.get("source_end", 0) - c.get("source_start", 0)))
+                            for k, c in enumerate(clips)
+                        ]
+                        # Don't advance run_start — re-check from same position
+                        continue
+                # Advance past the current run (at least 1 position)
+                run_start = max(run_end, run_start + 1)
 
         # 4. Re-check: final clip must be MEDIUM (merge may have changed classification)
         if clips:
@@ -693,6 +715,8 @@ def repair_clip_diversity(groups: list[dict], source_duration: float) -> int:
                 if expandable > 0:
                     old_end = clips[j - 1]["source_end"]
                     new_end = old_end + expandable
+                    if source_duration > 0:
+                        new_end = min(new_end, source_duration)
                     clips[j - 1]["source_end"] = round(new_end, 3)
                     repairs += 1
                     logger.info(
@@ -759,19 +783,33 @@ def _compute_clip_overlap_ratio(group_a: dict, group_b: dict) -> float:
 
     Uses total overlapping seconds / total unique seconds to measure similarity.
     A ratio of 0.0 means no overlap; 1.0 means identical clip coverage.
+
+    Intervals within each group are merged first to avoid double-counting
+    overlapping clips (e.g., group B has [5-15, 10-25] against group A's [0-20]).
     """
     clips_a = group_a.get("source_clips", [])
     clips_b = group_b.get("source_clips", [])
     if not clips_a or not clips_b:
         return 0.0
 
-    # Collect all clip intervals
-    intervals_a = sorted(
+    def _merge_intervals(intervals: list[tuple[float, float]]) -> list[tuple[float, float]]:
+        if not intervals:
+            return []
+        merged = [intervals[0]]
+        for s, e in intervals[1:]:
+            if s <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+            else:
+                merged.append((s, e))
+        return merged
+
+    # Collect and merge clip intervals within each group
+    intervals_a = _merge_intervals(sorted(
         [(c.get("source_start", 0), c.get("source_end", 0)) for c in clips_a]
-    )
-    intervals_b = sorted(
+    ))
+    intervals_b = _merge_intervals(sorted(
         [(c.get("source_start", 0), c.get("source_end", 0)) for c in clips_b]
-    )
+    ))
 
     total_overlap = 0.0
     for sa, ea in intervals_a:
@@ -868,14 +906,42 @@ def deduplicate_groups(groups: list[dict]) -> list[dict]:
 # Final Integrity Validation
 # ---------------------------------------------------------------------------
 
-def finalize_edit(plan_dict: dict, source_duration: float, min_groups: int = 1) -> ReelPlan:
+def _transfer_per_unit_targets(groups: list[dict]) -> None:
+    """Transfer stashed per-unit duration targets from dict keys to ReelGroup fields.
+
+    execute_plan stashes _unit_reel_dur_min/_unit_reel_dur_max on each group
+    dict. These must be moved to unit_dur_min/unit_dur_max before Pydantic
+    converts the dicts to ReelGroup models (unknown keys cause validation errors).
+    """
+    for g in groups:
+        if isinstance(g, dict):
+            g["unit_dur_min"] = g.pop("_unit_reel_dur_min", 0.0)
+            g["unit_dur_max"] = g.pop("_unit_reel_dur_max", 0.0)
+
+
+def finalize_edit(
+    plan_dict: dict,
+    source_duration: float,
+    min_groups: int = 1,
+    preserve_layout: bool = False,
+    content_type: str = "",
+) -> ReelPlan:
     """Run all validation steps and return a validated ReelPlan.
 
     This is the single entry point for post-LLM validation.
+
+    ``preserve_layout`` skips every destructive repair (overlap removal,
+    clip expansion, pacing swaps/merges, diversity relocation, group
+    deduplication). The executor mode passes it because its clip ranges,
+    reel order and overlap-freedom are already guaranteed deterministically
+    — the legacy repairs fight those guarantees (they re-sort clips, stretch
+    them toward CLIP_DURATION_SOFT_MAX and relocate them into "gaps").
     """
     groups = plan_dict.get("reel_groups", [])
     if not groups:
         raise RuntimeError("No reel_groups in plan")
+
+    entity_grouped = plan_dict.get("entity_grouped", False)
 
     # 1. Clip bounds
     adjusted = validate_clip_bounds(groups, source_duration)
@@ -884,6 +950,39 @@ def finalize_edit(plan_dict: dict, source_duration: float, min_groups: int = 1) 
 
     # 2. Timing validation
     validate_timing(groups, source_duration)
+
+    if preserve_layout:
+        # 3. Narration validation
+        validate_narration(groups)
+
+        # 4. Caption verification
+        verify_captions(groups)
+
+        # Floor enforcement — the executor already guarantees >= min_groups
+        # Entity content: skip floor check (low-quality entities intentionally dropped)
+        if not entity_grouped and len(groups) < min_groups:
+            raise RuntimeError(
+                f"Group count ({len(groups)}) fell below minimum ({min_groups})"
+            )
+
+        total_clips = sum(len(g.get("source_clips", [])) for g in groups)
+        total_narrations = sum(len(g.get("narration_events", [])) for g in groups)
+        logger.info(
+            f"Plan validated (layout preserved): {len(groups)} groups, "
+            f"{total_clips} clips, {total_narrations} narrations"
+        )
+
+        # Last-resort repair: fill in missing reel_start/reel_end on any
+        # narration events that slipped through without timestamps
+        for g in groups:
+            for ev in g.get("narration_events", []):
+                if isinstance(ev, dict) and "reel_start" not in ev:
+                    ev["reel_start"] = 0.0
+                if isinstance(ev, dict) and "reel_end" not in ev:
+                    ev["reel_end"] = 0.0
+
+        _transfer_per_unit_targets(groups)
+        return ReelPlan(**plan_dict)
 
     # 3. Overlap removal
     removed = remove_overlaps(groups)
@@ -908,7 +1007,7 @@ def finalize_edit(plan_dict: dict, source_duration: float, min_groups: int = 1) 
         logger.info(f"Repaired {diversity_repairs} diversity issues")
 
     # 9. Enforce pacing rules
-    pacing_adjustments = enforce_clip_pacing(groups)
+    pacing_adjustments = enforce_clip_pacing(groups, content_type=content_type, source_duration=source_duration)
     if pacing_adjustments > 0:
         logger.info(f"Made {pacing_adjustments} pacing adjustments")
 
@@ -917,7 +1016,8 @@ def finalize_edit(plan_dict: dict, source_duration: float, min_groups: int = 1) 
     plan_dict["reel_groups"] = deduplicated
 
     # 11. Floor enforcement — fail if dedup dropped below minimum
-    if len(deduplicated) < min_groups:
+    # Entity content: skip floor check (low-quality entities intentionally dropped)
+    if not entity_grouped and len(deduplicated) < min_groups:
         raise RuntimeError(
             f"Group count ({len(deduplicated)}) fell below minimum ({min_groups}) "
             f"after deduplication. Need at least {min_groups} standalone groups."
@@ -932,4 +1032,14 @@ def finalize_edit(plan_dict: dict, source_duration: float, min_groups: int = 1) 
         f"{total_narrations} narrations, avg {avg_duration:.1f}s"
     )
 
+    # Last-resort repair: fill in missing reel_start/reel_end on any
+    # narration events that slipped through without timestamps
+    for g in deduplicated:
+        for ev in g.get("narration_events", []):
+            if isinstance(ev, dict) and "reel_start" not in ev:
+                ev["reel_start"] = 0.0
+            if isinstance(ev, dict) and "reel_end" not in ev:
+                    ev["reel_end"] = 0.0
+
+    _transfer_per_unit_targets(deduplicated)
     return ReelPlan(**plan_dict)

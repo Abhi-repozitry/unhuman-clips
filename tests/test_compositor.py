@@ -1,8 +1,6 @@
 """Tests for backend.pipeline.compositor — ducking filter chain, VAD integration, duration math."""
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
-
 import pytest
 
 from backend.pipeline.compositor import (
@@ -65,7 +63,7 @@ class TestGetSpeechTimestampsFromNarration:
 
     def test_returns_list_type(self, tmp_path):
         """Function should return a list when given a valid audio file.
-        
+
         Note: This test may fail in CI without torch/torchaudio installed.
         The test is designed to pass silently if torch is unavailable.
         """

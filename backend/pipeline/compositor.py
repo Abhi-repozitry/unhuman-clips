@@ -5,11 +5,14 @@ VAD-driven audio ducking, caption overlays, and freeze-frame padding.
 """
 from __future__ import annotations
 
+import contextlib
+import copy
 import logging
 import os
 import subprocess
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from backend.config import (
     ALIMITER_ATTACK_MS,
@@ -102,7 +105,7 @@ def _run_ffmpeg(
         )
         return result
     except subprocess.TimeoutExpired:
-        raise RuntimeError(f"{description} timed out after 600 seconds. FFmpeg may be deadlocked or the input is too large.")
+        raise RuntimeError(f"{description} timed out after 600 seconds. FFmpeg may be deadlocked or the input is too large.") from None
     except subprocess.CalledProcessError as e:
         stderr_text = e.stderr.decode(errors="replace") if e.stderr else "(no stderr)"
         if attempt < max_attempts and "h264_nvenc" in " ".join(cmd) and os.environ.get("ALLOW_CPU_FFMPEG_FALLBACK") == "1":
@@ -115,16 +118,15 @@ def _run_ffmpeg(
             output_path = cmd[-1] if cmd else None
             while i < len(cmd) - 1:  # stop before last arg (output path)
                 arg = cmd[i]
-                if arg in ("-ss", "-i", "-t") and i + 1 < len(cmd) - 1:
-                    new_cmd.extend([arg, cmd[i + 1]]); i += 2
-                elif arg == "-filter_complex" and i + 1 < len(cmd) - 1:
-                    new_cmd.extend([arg, cmd[i + 1]]); i += 2
-                elif arg == "-map" and i + 1 < len(cmd) - 1:
-                    new_cmd.extend([arg, cmd[i + 1]]); i += 2
+                if (arg in ("-ss", "-i", "-t") and i + 1 < len(cmd) - 1) or (arg == "-filter_complex" and i + 1 < len(cmd) - 1) or (arg == "-map" and i + 1 < len(cmd) - 1):
+                    new_cmd.extend([arg, cmd[i + 1]])
+                    i += 2
                 elif arg in ("-y",):
-                    new_cmd.append(arg); i += 1
+                    new_cmd.append(arg)
+                    i += 1
                 elif arg.startswith("[") and (i + 1 < len(cmd) - 1 and cmd[i + 1] == "-map"):
-                    new_cmd.extend([arg, cmd[i + 1]]); i += 2
+                    new_cmd.extend([arg, cmd[i + 1]])
+                    i += 2
                 else:
                     i += 1  # skip encoder-specific args
             # Append CPU encoder opts, audio, movflags, and output
@@ -164,7 +166,6 @@ def _concat_demuxer(
         video_codec: Video codec when not copying.
         extra_args: Optional extra ffmpeg arguments.
     """
-    import tempfile
     working_dir = Path(output_path).parent
     filelist_path = working_dir / f"_concat_{Path(output_path).stem}.txt"
 
@@ -189,10 +190,8 @@ def _concat_demuxer(
     try:
         _run_ffmpeg(cmd, f"concat {Path(output_path).name}")
     finally:
-        try:
+        with contextlib.suppress(OSError):
             filelist_path.unlink(missing_ok=True)
-        except OSError:
-            pass
 
 
 def get_speech_timestamps_from_narration(
@@ -214,8 +213,8 @@ def get_speech_timestamps_from_narration(
     fallback = [{"start": 0.0, "end": _get_audio_duration(narration_path)}]
 
     try:
-        import torch
         import soundfile as sf
+        import torch
         from silero_vad import get_speech_timestamps, load_silero_vad
     except ImportError as e:
         logger.warning(f"silero-vad/soundfile import failed: {type(e).__name__}: {e}, using full-window fallback for {Path(narration_path).name}")
@@ -224,8 +223,7 @@ def get_speech_timestamps_from_narration(
     try:
         # Load WAV directly with soundfile — silero_vad.read_audio() wraps
         # torchaudio.load() which fails on torchaudio >=2.9 without torchcodec.
-        sampling_rate = 16000
-        wav_np, file_sr = sf.read(narration_path, dtype='float32')
+        wav_np, _file_sr = sf.read(narration_path, dtype='float32')
         wav = torch.from_numpy(wav_np)
 
         if len(wav) == 0:
@@ -321,7 +319,7 @@ def _build_ducking_filter_chain(
 
     duck_terms = []
 
-    for ev_idx, (ev, vad_segments) in enumerate(zip(valid_events, valid_vad)):
+    for ev_idx, (ev, vad_segments) in enumerate(zip(valid_events, valid_vad, strict=False)):
         # Process each VAD-detected speech segment within this narration event
         for seg_idx, seg in enumerate(vad_segments):
             seg_start = seg.get("start", 0.0)
@@ -435,8 +433,13 @@ def compose_group(
     estimated_duration_seconds: float = 0.0,
     source_duration: float = 0.0,
     progress_cb: Callable[[str, float], None] | None = None,
+    min_duration: float | None = None,
 ) -> dict[str, Any]:
     """Build a single group's output reel.
+
+    ``min_duration`` overrides the legacy MIN_OUTPUT_DURATION floor. Executor
+    mode passes 0.0: the plan's deterministic content length IS the reel
+    length — the legacy 90s floor produced inflated, misaligned reels.
 
     Renders continuous video from clips with VAD-driven audio ducking during
     narration, caption overlays, and final mux.  If clip content is shorter
@@ -531,21 +534,27 @@ def compose_group(
         progress_cb(f"Group {group_idx+1}: Building continuous video from {n_clips} clips...", 5)
 
     total_clip_duration = sum(clip["source_end"] - clip["source_start"] for clip in source_clips)
-    
+
     max_narration_end = 0.0
     if narration_audio:
         max_narration_end = max(nar.get("reel_end", 0) for nar in narration_audio)
-    
+
+    min_duration_floor = min_duration if min_duration is not None else float(MIN_OUTPUT_DURATION)
     target_duration = max(
         estimated_duration_seconds,    # Analyzer's intended duration (primary signal)
         max_narration_end,             # Don't cut off narration
         total_clip_duration,           # Don't cut off clip content
-        float(MIN_OUTPUT_DURATION)     # Never go below minimum
+        min_duration_floor             # Legacy minimum floor (0 in executor mode)
     )
     target_duration = min(target_duration, float(MAX_OUTPUT_DURATION))
     pad_duration = target_duration - total_clip_duration
 
     # Fill gap by extending the last clip into the source video (no freeze-frame).
+    # DeepCopy to avoid mutating the caller's source_clips list (which was already
+    # used for TTS timing validation by the orchestrator).
+    if source_clips:
+        source_clips = copy.deepcopy(source_clips)
+    extended_last = False
     if pad_duration > 0 and source_duration > 0 and source_clips:
         last_clip = source_clips[-1]
         last_end = last_clip.get("source_end", 0.0)
@@ -555,6 +564,7 @@ def compose_group(
             last_clip["source_end"] = round(last_end + extend_by, 3)
             total_clip_duration += extend_by
             pad_duration = target_duration - total_clip_duration
+            extended_last = True
             logger.info(
                 f"Group {group_idx}: Extended last clip [{last_end:.1f} -> "
                 f"{last_clip['source_end']:.1f}] by {extend_by:.1f}s to fill gap"
@@ -564,12 +574,33 @@ def compose_group(
                 f"max_narration_end={max_narration_end:.1f}s, est={estimated_duration_seconds:.1f}s, target={target_duration:.1f}s")
 
     # 1. Build video filter complex
-    if use_precut:
+    if use_precut and not extended_last:
         ffmpeg_video_inputs = []
         video_filter_parts = []
         for i, p in enumerate(group_clip_paths):
             ffmpeg_video_inputs.extend(["-i", str(p)])
             video_filter_parts.append(f"[{i}:v]scale={OUTPUT_WIDTH}:{OUTPUT_HEIGHT}:force_original_aspect_ratio=increase,crop={OUTPUT_WIDTH}:{OUTPUT_HEIGHT},setsar=1[v{i}]")
+        concat_inputs = "".join(f"[v{i}]" for i in range(n_clips))
+        video_filter_parts.append(f"{concat_inputs}concat=n={n_clips}:v=1:a=0[base_v]")
+    elif use_precut:
+        # Mixed: pre-cut clips except the last — the extended last clip is
+        # trimmed LIVE from the source at its final range. The pre-cut file
+        # only holds the original range; using it here would leave a huge
+        # pad_duration and freeze the last frame (tpad clone) to fill it.
+        ffmpeg_video_inputs = []
+        for p in group_clip_paths[:-1]:
+            ffmpeg_video_inputs.extend(["-i", str(p)])
+        src_input_idx = n_clips - 1
+        ffmpeg_video_inputs.extend(["-i", source_path])
+        video_filter_parts = []
+        for i in range(n_clips - 1):
+            video_filter_parts.append(f"[{i}:v]scale={OUTPUT_WIDTH}:{OUTPUT_HEIGHT}:force_original_aspect_ratio=increase,crop={OUTPUT_WIDTH}:{OUTPUT_HEIGHT},setsar=1[v{i}]")
+        last_clip = source_clips[-1]
+        video_filter_parts.append(
+            f"[{src_input_idx}:v]trim=start={last_clip['source_start']}:end={last_clip['source_end']},"
+            f"setpts=PTS-STARTPTS,scale={OUTPUT_WIDTH}:{OUTPUT_HEIGHT}:force_original_aspect_ratio=increase,"
+            f"crop={OUTPUT_WIDTH}:{OUTPUT_HEIGHT},setsar=1[v{n_clips - 1}]"
+        )
         concat_inputs = "".join(f"[v{i}]" for i in range(n_clips))
         video_filter_parts.append(f"{concat_inputs}concat=n={n_clips}:v=1:a=0[base_v]")
     else:
@@ -599,14 +630,14 @@ def compose_group(
     all_caption_filters = []
     last_v = last_video_label
     caption_label_idx = 1
-    for i, cap_path in enumerate(clip_caption_paths):
+    for cap_path in clip_caption_paths:
         next_label = f"vc{caption_label_idx}"
         all_caption_filters.append(f"[{last_v}]{_ass_filter(cap_path)}[{next_label}]")
         last_v = next_label
         caption_label_idx += 1
 
     # Add narration captions (top)
-    for i, cap_path in enumerate(narration_caption_paths):
+    for cap_path in narration_caption_paths:
         next_label = f"vc{caption_label_idx}"
         all_caption_filters.append(f"[{last_v}]{_ass_filter(cap_path)}[{next_label}]")
         last_v = next_label
@@ -616,14 +647,7 @@ def compose_group(
         video_filter += ";" + ";".join(all_caption_filters)
 
     video_output = working_dir / f"group_{group_idx}_video.mp4"
-    ffmpeg_video = [
-        get_ffmpeg(), "-loglevel", "error"
-    ] + ffmpeg_video_inputs + [
-        "-filter_complex", video_filter,
-        "-map", f"[{last_v}]",
-    ] + encoder_opts + [
-        "-r", str(OUTPUT_FPS), "-y", str(video_output)
-    ]
+    ffmpeg_video = [get_ffmpeg(), "-loglevel", "error", *ffmpeg_video_inputs, "-filter_complex", video_filter, "-map", f"[{last_v}]", *encoder_opts, "-r", str(OUTPUT_FPS), "-y", str(video_output)]
     if progress_cb:
         progress_cb(f"Group {group_idx+1}: Rendering video ({total_clip_duration:.0f}s+{pad_duration:.0f}s pad)...", 25)
     _run_ffmpeg(ffmpeg_video, f"Group {group_idx} video", cwd=str(working_dir))
@@ -638,7 +662,7 @@ def compose_group(
 
     clip_audio_output = working_dir / f"group_{group_idx}_clip_audio.wav"
 
-    if use_precut:
+    if use_precut and not extended_last:
         # Concat demuxer: stream-copy audio from pre-cut clips (no re-encode)
         raw_audio_tmp = working_dir / f"group_{group_idx}_raw_concat.wav"
         _concat_demuxer(
@@ -656,10 +680,8 @@ def compose_group(
             "-y", str(clip_audio_output)
         ]
         _run_ffmpeg(ffmpeg_pad, f"Group {group_idx} clip audio pad")
-        try:
+        with contextlib.suppress(OSError):
             raw_audio_tmp.unlink(missing_ok=True)
-        except OSError:
-            pass
     else:
         ffmpeg_audio_inputs = ["-i", source_path]
         audio_filter_parts = []
@@ -672,18 +694,11 @@ def compose_group(
         concat_audio_inputs = "".join(f"[a{i}]" for i in range(n_clips))
         audio_filter_parts.append(
             f"{concat_audio_inputs}concat=n={n_clips}:v=0:a=1[raw_audio];"
-            f"[raw_audio]volume=0.02,apad=whole_dur={target_duration:.2f},atrim=end={target_duration:.2f}[clip_audio]"
+            f"[raw_audio]apad=whole_dur={target_duration:.2f},atrim=end={target_duration:.2f}[clip_audio]"
         )
         audio_filter = ";".join(audio_filter_parts)
 
-        ffmpeg_clip_audio = [
-            get_ffmpeg(), "-loglevel", "error"
-        ] + ffmpeg_audio_inputs + [
-            "-filter_complex", audio_filter,
-            "-map", "[clip_audio]",
-            "-c:a", "pcm_s16le", "-ar", "44100", "-ac", "2",
-            "-y", str(clip_audio_output)
-        ]
+        ffmpeg_clip_audio = [get_ffmpeg(), "-loglevel", "error", *ffmpeg_audio_inputs, "-filter_complex", audio_filter, "-map", "[clip_audio]", "-c:a", "pcm_s16le", "-ar", "44100", "-ac", "2", "-y", str(clip_audio_output)]
         _run_ffmpeg(ffmpeg_clip_audio, f"Group {group_idx} clip audio")
 
     clip_audio_dur = _get_video_duration_seconds(str(clip_audio_output))

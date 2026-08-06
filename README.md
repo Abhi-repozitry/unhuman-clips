@@ -20,7 +20,7 @@ Paste a YouTube URL. Get multiple 75–95 second vertical reels with AI-selected
         │                  │                  │
   ┌─────▼─────┐    ┌───────▼───────┐    ┌─────▼─────┐
   │ Download   │    │  Transcribe   │    │  Analyze   │
-  │ (yt-dlp)   │    │ (Whisper GPU) │    │ (NVIDIA    │
+  │ (yt-dlp)   │    │ (Whisper GPU) │    │ (OpenCode │
   │            │    │               │    │  LLM)      │
   └─────┬─────┘    └───────┬───────┘    └─────┬─────┘
         │                  │                  │
@@ -77,7 +77,7 @@ pip install -r backend/requirements.txt
 # 4. Configure environment
 cp backend/.env.example backend/.env   # or create manually
 # Edit backend/.env — set at minimum:
-#   NVIDIA_API_KEY=nvapi-...
+#   OPENCODE_API_KEY=oc-...
 #   FFMPEG_PATH=/path/to/ffmpeg
 
 # 5. Start the server
@@ -100,7 +100,7 @@ All settings are configured via environment variables in `backend/.env`. See [do
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `NVIDIA_API_KEY` | *(required)* | NVIDIA API key for LLM analysis |
+| `OPENCODE_API_KEY` | *(required)* | OpenCode API key for LLM analysis |
 | `FFMPEG_PATH` | `C:\Projects\...\ffmpeg.exe` | Path to ffmpeg binary |
 | `TTS_VOICE` | `en-US-ChristopherNeural` | Edge-TTS voice for narration |
 | `MAX_OUTPUT_DURATION` | `95` | Maximum reel duration (seconds) |
@@ -123,7 +123,7 @@ See [docs/API.md](docs/API.md) for full endpoint documentation.
 
 1. **Download** — yt-dlp with retry logic and format selection
 2. **Transcribe** — Whisper large-v3-turbo (GPU, lazy-loaded)
-3. **Analyze** — NVIDIA LLM generates structured ReelPlan (clips + narration)
+3. **Analyze** — OpenCode LLM generates structured ReelPlan (clips + narration)
 4. **Clip** — Parallel ffmpeg cutting with NVENC acceleration
 5. **TTS** — Edge-TTS narration generation (hook + commentary)
 6. **Caption** — ASS subtitle generation with keyword highlighting
@@ -171,7 +171,7 @@ unhuman-clips/
 │   │   ├── narration_validator.py  # Timing overlap detection
 │   │   └── sanitize.py         # Text sanitization
 │   └── providers/
-│       └── llm.py              # NVIDIA LLM API client
+│       └── llm.py              # OpenCode LLM API client
 ├── tests/                      # pytest test suite (143 tests)
 ├── scripts/                    # Utility scripts
 ├── frontend/                   # Electron + renderer UI

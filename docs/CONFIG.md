@@ -8,7 +8,7 @@ All settings are configured via environment variables in `backend/.env`. The ser
 
 | Variable | Type | Description |
 |----------|------|-------------|
-| `NVIDIA_API_KEY` | `string` | NVIDIA API key for LLM analysis. Get one at [build.nvidia.com](https://build.nvidia.com) |
+| `OPENCODE_API_KEY` | `string` | OpenCode API key for LLM analysis |
 | `FFMPEG_PATH` | `string` (file path) | Path to ffmpeg binary. Examples: `/usr/bin/ffmpeg`, `C:\ffmpeg\bin\ffmpeg.exe` |
 
 ---
@@ -17,11 +17,9 @@ All settings are configured via environment variables in `backend/.env`. The ser
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `NVIDIA_BASE_URL` | `https://integrate.api.nvidia.com/v1` | NVIDIA API endpoint |
-| `NVIDIA_MODEL` | `stepfun-ai/step-3.7-flash` | Primary LLM model |
-| `NVIDIA_MODEL_FALLBACK` | `stepfun-ai/step-3.7-flash` | Fallback model on primary failure |
-| `NVIDIA_MAX_TOKENS` | `8192` | Max tokens for LLM response |
-| `NVIDIA_TEMPERATURE` | `0.7` | LLM temperature (0.0–1.0) |
+| `OPENCODE_BASE_URL` | `https://opencode.ai/zen/v1` | OpenCode API endpoint |
+| `OPENCODE_MODEL` | `mimo-v2.5-free` | LLM model |
+| `PLAN_MODE` | `executor` | Reel planning mode. `executor` = LLM plans story structure only, Python picks all clips deterministically (consistent output). `llm` = legacy multi-stage LLM that picks exact clip timestamps |
 
 ---
 
@@ -31,11 +29,31 @@ All settings are configured via environment variables in `backend/.env`. The ser
 |----------|---------|-------------|
 | `DOWNLOAD_MAX_HEIGHT` | `1080` | Max video resolution to download |
 | `DOWNLOAD_FORMAT` | `bestvideo[height<=1080]+bestaudio/best[height<=1080]` | yt-dlp format selector |
-| `MAX_OUTPUT_DURATION` | `95` | Maximum output reel duration (seconds) |
-| `MIN_OUTPUT_DURATION` | `75` | Minimum output reel duration (seconds) |
+| `MAX_OUTPUT_DURATION` | `100` | Maximum output reel duration (seconds) |
+| `MIN_OUTPUT_DURATION` | `90` | Minimum output reel duration (seconds) |
 | `TARGET_GROUP_DURATION` | `120` | Ideal group duration for LLM planning (seconds) |
 | `ALLOW_CPU_FFMPEG_FALLBACK` | `0` | Set `1` to allow CPU encoding when NVENC fails |
 | `CLIP_PADDING_FRAMES` | `15` | Extra frames to add around each clip for clean cuts |
+
+### Multimodal Enrichment
+
+Scene-cut detection runs on the CPU through OpenCV. OCR uses an OpenAI-compatible
+vision endpoint and never allocates local GPU memory.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MULTIMODAL_ENABLED` | `1` | Enable scene detection and OCR enrichment. |
+| `ENTITY_MIN_SEGMENT_SECONDS` | `20` | Minimum source duration for an entity segment after cut coalescing. |
+| `SCENE_SAMPLE_FPS` | `2` | CPU frame sample rate for scene-cut detection. |
+| `SCENE_CUT_THRESHOLD` | `0.45` | Normalized histogram/pixel-difference cut threshold. |
+| `OCR_SAMPLE_INTERVAL_SECONDS` | `4` | Fallback OCR sampling interval. |
+| `OCR_MAX_FRAMES` | `240` | Maximum OCR frames per source video. |
+| `OCR_MAX_CONCURRENCY` | `20` | Maximum simultaneous hosted OCR requests. |
+| `VISION_BASE_URL` | `http://localhost:20128/v1` | OpenAI-compatible OmniRoute endpoint. |
+| `VISION_MODEL` | `mimo-v2.5` | Vision-capable model exposed by the endpoint. |
+| `VISION_API_KEY` | `OPENCODE_API_KEY` | Optional endpoint key; falls back to the OpenCode key. |
+| `VISION_OCR_ENABLED` | `1` | Disable only hosted OCR while retaining CPU scene cuts. |
+| `VISION_TIMEOUT_SECONDS` | `30` | Timeout for one hosted OCR request. |
 
 ---
 
@@ -125,17 +143,16 @@ These are used when VAD-based ducking is disabled or as fallback:
 
 ```env
 # Required
-NVIDIA_API_KEY=nvapi-xxxxxxxxxxxxxxxxxxxxx
+OPENCODE_API_KEY=oc-xxxxxxxxxxxxxxxxxxxxx
 FFMPEG_PATH=C:\ffmpeg\bin\ffmpeg.exe
 
 # LLM
-NVIDIA_MODEL=stepfun-ai/step-3.7-flash
-NVIDIA_MODEL_FALLBACK=stepfun-ai/step-3.7-flash
+OPENCODE_MODEL=mimo-v2.5-free
 
 # Video
 DOWNLOAD_MAX_HEIGHT=1080
-MAX_OUTPUT_DURATION=95
-MIN_OUTPUT_DURATION=75
+MAX_OUTPUT_DURATION=120
+MIN_OUTPUT_DURATION=90
 
 # TTS
 TTS_VOICE=en-US-ChristopherNeural

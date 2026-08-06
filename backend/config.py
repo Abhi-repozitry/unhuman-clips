@@ -13,15 +13,43 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 __all__ = [
-    "BASE_DIR", "DOWNLOADS_DIR", "WORKING_DIR", "OUTPUTS_DIR", "CLIPS_DIR",
-    "get_job_working_dir", "validate_config", "cleanup_stale_files",
-    "FFMPEG_PATH", "FFPROBE_PATH",
-    "NVIDIA_API_KEY", "NVIDIA_BASE_URL", "NVIDIA_MODEL", "NVIDIA_MODEL_FALLBACK",
-    "OPENCODE_API_KEY", "OPENCODE_BASE_URL", "OPENCODE_MODEL",
-    "MAX_INPUT_TOKENS", "MAX_OUTPUT_TOKENS",
+    "AI_PROVIDER",
+    "BASE_DIR",
+    "CLIPS_DIR",
+    "DOWNLOADS_DIR",
+    "ENTITY_MIN_SEGMENT_SECONDS",
+    "ENTITY_MAX_SEGMENTS_MULTIPLIER",
+    "FFMPEG_PATH",
+    "FFPROBE_PATH",
+    "MAX_INPUT_TOKENS",
+    "MAX_OUTPUT_TOKENS",
     "MIN_CONTENT_DURATION",
-    "WHISPER_MODEL_SIZE", "WHISPER_COMPUTE_TYPE_CUDA", "WHISPER_COMPUTE_TYPE_CPU",
+    "MIN_ENTITY_REEL_SECONDS",
+    "MIN_USABLE_BLOCK_FRACTION",
+    "MULTIMODAL_ENABLED",
+    "OCR_MAX_CONCURRENCY",
+    "OCR_MAX_FRAMES",
+    "OCR_MODE",
+    "OCR_SAMPLE_INTERVAL_SECONDS",
+    "OPENCODE_API_KEY",
+    "OPENCODE_BASE_URL",
+    "OPENCODE_MODEL",
+    "OUTPUTS_DIR",
+    "PLAN_MODE",
+    "SCENE_CUT_THRESHOLD",
+    "SCENE_SAMPLE_FPS",
     "TTS_VOICE",
+    "VISION_API_KEY",
+    "VISION_BASE_URL",
+    "VISION_MODEL",
+    "VISION_OCR_ENABLED",
+    "VISION_TIMEOUT_SECONDS",
+    "WHISPER_COMPUTE_TYPE_CPU",
+    "WHISPER_COMPUTE_TYPE_CUDA",
+    "WHISPER_MODEL_SIZE",
+    "WORKING_DIR",
+    "get_job_working_dir",
+    "validate_config",
 ]
 
 logger = logging.getLogger(__name__)
@@ -51,34 +79,36 @@ WHISPER_MODEL_SIZE = os.environ.get("WHISPER_MODEL_SIZE", "large-v3-turbo")
 WHISPER_COMPUTE_TYPE_CUDA = os.environ.get("WHISPER_COMPUTE_TYPE_CUDA", "float16")
 WHISPER_COMPUTE_TYPE_CPU = os.environ.get("WHISPER_COMPUTE_TYPE_CPU", "int8")
 
-NVIDIA_API_KEY = os.environ.get("NVIDIA_API_KEY")
-NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
-NVIDIA_MODEL = os.environ.get("NVIDIA_MODEL", "stepfun-ai/step-3.7-flash")
-NVIDIA_MODEL_FALLBACK = os.environ.get("NVIDIA_MODEL_FALLBACK", "stepfun-ai/step-3.7-flash")
-
 OPENCODE_API_KEY = os.environ.get("OPENCODE_API_KEY")
 OPENCODE_BASE_URL = os.environ.get("OPENCODE_BASE_URL", "https://opencode.ai/zen/v1")
 OPENCODE_MODEL = os.environ.get("OPENCODE_MODEL", "mimo-v2.5-free")
 
-MAX_INPUT_TOKENS = int(os.environ.get("MAX_INPUT_TOKENS", "80000"))
-MAX_OUTPUT_TOKENS = int(os.environ.get("MAX_OUTPUT_TOKENS", "16384"))
-REASONING_EFFORT = os.environ.get("REASONING_EFFORT", "high")
+# AI Provider: "mimo" for OpenCode API
+AI_PROVIDER = os.environ.get("AI_PROVIDER", "mimo")
+
+MAX_INPUT_TOKENS = int(os.environ.get("MAX_INPUT_TOKENS", "134464"))
+MAX_OUTPUT_TOKENS = int(os.environ.get("MAX_OUTPUT_TOKENS", "65536"))
+REASONING_EFFORT = os.environ.get("REASONING_EFFORT", "max")
 
 CLIP_COUNT_MIN = int(os.environ.get("CLIP_COUNT_MIN", "6"))
 CLIP_COUNT_MAX = int(os.environ.get("CLIP_COUNT_MAX", "12"))
-CLIP_DURATION_SOFT_MIN = float(os.environ.get("CLIP_DURATION_SOFT_MIN", "10"))
+CLIP_DURATION_SOFT_MIN = float(os.environ.get("CLIP_DURATION_SOFT_MIN", "6"))
 CLIP_DURATION_SOFT_MAX = float(os.environ.get("CLIP_DURATION_SOFT_MAX", "30"))
 HOOK_SECONDS = float(os.environ.get("HOOK_SECONDS", "3"))
 INSIGHT_SECONDS_MAX = float(os.environ.get("INSIGHT_SECONDS_MAX", "4"))
-MIN_OUTPUT_DURATION = int(os.environ.get("MIN_OUTPUT_DURATION", "90"))
+MIN_OUTPUT_DURATION = int(os.environ.get("MIN_OUTPUT_DURATION", "80"))
 MAX_OUTPUT_DURATION = int(os.environ.get("MAX_OUTPUT_DURATION", "100"))
+# Entity-mode reel minimum: distinct from global MIN_OUTPUT_DURATION.
+# A candidate with Ns of usable content should produce ~N*1.3s, not be
+# clamped to the video-level 90s floor.
+MIN_ENTITY_REEL_SECONDS = int(os.environ.get("MIN_ENTITY_REEL_SECONDS", "15"))
 # Minimum seconds of actual clip content required per group.
 # Compositor extends last clip into source if clips fall short.
-MIN_CONTENT_DURATION = float(os.environ.get("MIN_CONTENT_DURATION", "70"))
+MIN_CONTENT_DURATION = float(os.environ.get("MIN_CONTENT_DURATION", "90"))
 
 OUTPUT_WIDTH = 1080
 OUTPUT_HEIGHT = 1350
-OUTPUT_FPS = 30
+OUTPUT_FPS = 60
 
 DOWNLOAD_MAX_HEIGHT = int(os.environ.get("DOWNLOAD_MAX_HEIGHT", "1080"))
 
@@ -112,8 +142,38 @@ MAX_GROUP_RETRIES = int(os.environ.get("MAX_GROUP_RETRIES", "2"))
 # timeline overlap, the weaker group is pruned
 GROUP_OVERLAP_THRESHOLD = float(os.environ.get("GROUP_OVERLAP_THRESHOLD", "0.5"))
 
+# If fewer than this fraction of blocks in a window pass the importance>=25
+# usability gate (e.g. VAD produced no speech energy), the gate is relaxed to
+# avoid starving the planner of pickable content. 0.0 disables the fallback.
+MIN_USABLE_BLOCK_FRACTION = float(os.environ.get("MIN_USABLE_BLOCK_FRACTION", "0.3"))
+
 # Fast mode: skip expensive operations for faster iteration during development
 FAST_MODE = os.environ.get("FAST_MODE", "0") == "1"
+
+# Plan mode:
+#   "executor" (default) — LLM produces a story plan (regions/beats only, no
+#       timestamps); Python deterministically maps beats to clips. Consistent
+#       output for identical input.
+#   "llm" — legacy multi-stage path: LLM picks exact clip timestamps.
+PLAN_MODE = os.environ.get("PLAN_MODE", "executor")
+
+# Multimodal enrichment is CPU/hosted only: scene detection uses OpenCV on the
+# CPU, and OCR is sent through an OpenAI-compatible vision endpoint.
+MULTIMODAL_ENABLED = os.environ.get("MULTIMODAL_ENABLED", "1") == "1"
+ENTITY_MIN_SEGMENT_SECONDS = float(os.environ.get("ENTITY_MIN_SEGMENT_SECONDS", "20"))
+ENTITY_MAX_SEGMENTS_MULTIPLIER = int(os.environ.get("ENTITY_MAX_SEGMENTS_MULTIPLIER", "3"))
+SCENE_SAMPLE_FPS = float(os.environ.get("SCENE_SAMPLE_FPS", "2"))
+SCENE_CUT_THRESHOLD = float(os.environ.get("SCENE_CUT_THRESHOLD", "0.45"))
+OCR_SAMPLE_INTERVAL_SECONDS = float(os.environ.get("OCR_SAMPLE_INTERVAL_SECONDS", "4"))
+OCR_MAX_FRAMES = int(os.environ.get("OCR_MAX_FRAMES", "240"))
+OCR_MAX_CONCURRENCY = int(os.environ.get("OCR_MAX_CONCURRENCY", "20"))
+VISION_OCR_ENABLED = os.environ.get("VISION_OCR_ENABLED", "1") == "1"
+VISION_BASE_URL = os.environ.get("VISION_BASE_URL", "http://localhost:20128/v1")
+VISION_MODEL = os.environ.get("VISION_MODEL", "mimo-v2.5-free")
+VISION_API_KEY = os.environ.get("VISION_API_KEY") or OPENCODE_API_KEY
+VISION_TIMEOUT_SECONDS = float(os.environ.get("VISION_TIMEOUT_SECONDS", "30"))
+# OCR mode: "keep" (use OCR results) or "skip" (skip OCR, default)
+OCR_MODE = os.environ.get("OCR_MODE", "skip")
 
 
 def validate_config() -> list[str]:
@@ -141,13 +201,13 @@ def validate_config() -> list[str]:
     else:
         logger.info("Config: ffmpeg found at %s", FFMPEG_PATH)
 
-    # --- Check NVIDIA API key ---
-    if not NVIDIA_API_KEY:
+    # --- Check OpenCode API key ---
+    if not OPENCODE_API_KEY:
         warnings.append(
-            "NVIDIA_API_KEY not set. LLM analysis will use fallback heuristic plan."
+            "OPENCODE_API_KEY not set. LLM analysis will use fallback heuristic plan."
         )
     else:
-        logger.info("Config: NVIDIA API key is set")
+        logger.info("Config: OpenCode API key is set")
 
     # --- Check Whisper model ---
     logger.info("Config: Whisper model=%s, compute_type_cuda=%s",
@@ -178,10 +238,28 @@ def validate_config() -> list[str]:
         warnings.append(f"VAD_THRESHOLD ({VAD_THRESHOLD}) must be in [0.0, 1.0].")
     if not (0.0 <= VAD_DUCKING_DEPTH <= 1.0):
         warnings.append(f"VAD_DUCKING_DEPTH ({VAD_DUCKING_DEPTH}) must be in [0.0, 1.0].")
+    if not (0.0 <= MIN_USABLE_BLOCK_FRACTION <= 1.0):
+        warnings.append(f"MIN_USABLE_BLOCK_FRACTION ({MIN_USABLE_BLOCK_FRACTION}) must be in [0.0, 1.0].")
     if MAX_WORKERS < 1:
         warnings.append(f"MAX_WORKERS ({MAX_WORKERS}) must be >= 1.")
     if GPU_SEMAPHORE_SIZE < 1:
         warnings.append(f"GPU_SEMAPHORE_SIZE ({GPU_SEMAPHORE_SIZE}) must be >= 1.")
+    if SCENE_SAMPLE_FPS <= 0:
+        warnings.append(f"SCENE_SAMPLE_FPS ({SCENE_SAMPLE_FPS}) must be > 0.")
+    if ENTITY_MIN_SEGMENT_SECONDS <= 0:
+        warnings.append(f"ENTITY_MIN_SEGMENT_SECONDS ({ENTITY_MIN_SEGMENT_SECONDS}) must be > 0.")
+    if not (0.0 < SCENE_CUT_THRESHOLD <= 1.0):
+        warnings.append(f"SCENE_CUT_THRESHOLD ({SCENE_CUT_THRESHOLD}) must be in (0.0, 1.0].")
+    if OCR_SAMPLE_INTERVAL_SECONDS <= 0:
+        warnings.append(f"OCR_SAMPLE_INTERVAL_SECONDS ({OCR_SAMPLE_INTERVAL_SECONDS}) must be > 0.")
+    if OCR_MAX_FRAMES < 1:
+        warnings.append(f"OCR_MAX_FRAMES ({OCR_MAX_FRAMES}) must be >= 1.")
+    if OCR_MAX_CONCURRENCY < 1:
+        warnings.append(f"OCR_MAX_CONCURRENCY ({OCR_MAX_CONCURRENCY}) must be >= 1.")
+    if VISION_TIMEOUT_SECONDS <= 0:
+        warnings.append(f"VISION_TIMEOUT_SECONDS ({VISION_TIMEOUT_SECONDS}) must be > 0.")
+    if OCR_MODE not in ("keep", "skip"):
+        warnings.append(f"OCR_MODE ({OCR_MODE}) must be 'keep' or 'skip'.")
 
     # --- Validate output dimensions ---
     if OUTPUT_WIDTH <= 0 or OUTPUT_HEIGHT <= 0:
@@ -204,45 +282,3 @@ def validate_config() -> list[str]:
 _validation_warnings = validate_config()
 for _w in _validation_warnings:
     logger.warning("Config: %s", _w)
-
-
-def cleanup_stale_files(max_age_hours: int = 24) -> int:
-    """Remove temp/working files older than max_age_hours.
-
-    Cleans up:
-      - Working directory intermediate files (group_*.mp4, group_*.wav, etc.)
-      - Stale concat file lists (_concat_*.txt)
-      - Empty directories
-
-    Returns the number of files removed.
-    """
-    import time
-    now = time.time()
-    cutoff = now - (max_age_hours * 3600)
-    removed = 0
-
-    for directory in (WORKING_DIR, CLIPS_DIR):
-        if not directory.exists():
-            continue
-        for path in directory.rglob("*"):
-            if path.is_file():
-                try:
-                    if path.stat().st_mtime < cutoff:
-                        path.unlink()
-                        removed += 1
-                except OSError:
-                    pass
-
-    # Remove empty subdirectories in working dir
-    if WORKING_DIR.exists():
-        for d in sorted(WORKING_DIR.iterdir(), key=lambda p: len(p.parts), reverse=True):
-            if d.is_dir():
-                try:
-                    if not any(d.iterdir()):
-                        d.rmdir()
-                except OSError:
-                    pass
-
-    if removed:
-        logger.info("Cleanup: removed %d stale files (max age %dh)", removed, max_age_hours)
-    return removed

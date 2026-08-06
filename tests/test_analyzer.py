@@ -5,6 +5,7 @@ import json
 
 import pytest
 
+from backend.models import SourceMetadata
 from backend.pipeline.analyzer import (
     _compute_group_count_ceiling,
     _compute_group_count_floor,
@@ -12,10 +13,12 @@ from backend.pipeline.analyzer import (
     _extract_json_object,
     _format_blocks_for_llm,
     _format_full_transcript,
+    _identify_content,
     _normalize_clip_range,
     _rank_hook_candidates,
     _score_clip_as_hook,
     _try_repair_truncated_json,
+    detect_content_type,
 )
 
 
@@ -173,6 +176,101 @@ class TestFormatBlocksForLlm:
         ]
         result = _format_blocks_for_llm(blocks, top_n=2)
         assert "TOP-2" in result
+
+    def test_top_n_excludes_lower_importance_blocks(self):
+        from backend.pipeline.analyzer import SemanticBlock
+
+        blocks = [
+            SemanticBlock(
+                block_id=i,
+                start=float(i * 10),
+                end=float(i * 10 + 5),
+                text=f"block {i}",
+                speech_energy=0.5,
+                volume_db=None,
+                silence_before=False,
+                black_frame=False,
+                freeze=False,
+                importance=float(i * 10),
+                peak_offset=0.0,
+            )
+            for i in range(4)
+        ]
+
+        result = _format_blocks_for_llm(blocks, top_n=2)
+
+        assert "block 0" not in result
+        assert "block 1" not in result
+        assert "block 2" in result
+        assert "block 3" in result
+
+
+class TestIdentifier:
+    @staticmethod
+    def _blocks():
+        from backend.pipeline.analyzer import SemanticBlock
+
+        return [
+            SemanticBlock(
+                block_id=0,
+                start=0.0,
+                end=8.0,
+                text="Contestant Maya enters the challenge.",
+                speech_energy=0.8,
+                volume_db=-12.0,
+                silence_before=True,
+                black_frame=False,
+                freeze=False,
+                importance=80.0,
+                peak_offset=4.0,
+            )
+        ]
+
+    def test_identifier_uses_confirmed_channel_metadata(self, monkeypatch):
+        from backend.pipeline import analyzer as analyzer_module
+
+        calls = []
+
+        def fake_call_llm(*args, **kwargs):
+            messages = args[0]
+            calls.append((messages, kwargs))
+            return json.dumps({
+                "creator_name": "Guessed Creator",
+                "content_format": "multi-contestant challenge",
+                "detected_genre": "game_challenge",
+                "structure": "multi_entity",
+                "entity_names": ["Maya", "Maya", "Chris"],
+                "hook_recommendation": "skip",
+                "planning_notes": "Keep each contestant self-contained. Preserve each outcome.",
+            })
+
+        monkeypatch.setattr(analyzer_module, "_call_llm", fake_call_llm)
+        identity = _identify_content(
+            "Secret millionaire",
+            "A contestant challenge",
+            SourceMetadata(channel_name="KSI", channel_description="Challenge creator"),
+            self._blocks(),
+            None,
+            None,
+            [],
+        )
+
+        assert identity is not None
+        assert identity.creator_name == "KSI"
+        assert identity.entity_names == ["Maya", "Chris"]
+        assert calls[0][1]["stage_name"] == "identifier"
+        assert "Channel name: KSI" in calls[0][0][1]["content"]
+
+    def test_identifier_failure_does_not_raise(self, monkeypatch):
+        from backend.pipeline import analyzer as analyzer_module
+
+        monkeypatch.setattr(analyzer_module, "_call_llm", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("down")))
+
+        assert _identify_content("Title", "", None, self._blocks(), None, None, []) is None
+
+    def test_identifier_genre_can_corroborate_borderline_python_signal(self):
+        assert detect_content_type("challenge", "", [], identifier_genre=None) == "general"
+        assert detect_content_type("challenge", "", [], identifier_genre="game_challenge") == "game_challenge"
 
 
 class TestExtractJsonObject:

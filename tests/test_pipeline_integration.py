@@ -6,7 +6,6 @@ Marked as @pytest.mark.integration so they can be excluded with:
 from __future__ import annotations
 
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -19,7 +18,6 @@ from backend.models import (
     StructureAnalysis,
     VideoJob,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -98,17 +96,6 @@ class TestPipelineIntegration:
 
     def test_transcript_to_reel_plan_flow(self):
         """Simulate: transcript -> analyzer -> reel plan -> clip windows."""
-        transcript = [
-            {"start": 0.0, "end": 5.0, "text": "Welcome to the show."},
-            {"start": 5.5, "end": 12.0, "text": "Today we explore something amazing."},
-            {"start": 12.5, "end": 18.0, "text": "This changed everything."},
-            {"start": 18.5, "end": 24.0, "text": "Nobody expected what happened."},
-            {"start": 24.5, "end": 30.0, "text": "The results were shocking."},
-            {"start": 30.5, "end": 36.0, "text": "Scientists were amazed."},
-            {"start": 36.5, "end": 42.0, "text": "A breakthrough was announced."},
-            {"start": 42.5, "end": 48.0, "text": "The world took notice."},
-        ]
-
         plan = _make_reel_plan()
 
         # Extract clip windows from plan

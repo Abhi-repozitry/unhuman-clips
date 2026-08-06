@@ -1,14 +1,10 @@
 providers:
-  nvidia_nim:
-    primary: stepfun-ai/step-3.7-flash
-    fallback: stepfun-ai/step-3.7-flash
-    base_url: https://integrate.api.nvidia.com/v1
-    api_key_env: NVIDIA_API_KEY
-
   opencode:
     primary: mimo-v2.5-free
+    fallback: mimo-v2.5-free
     base_url: https://opencode.ai/zen/v1
     api_key_env: OPENCODE_API_KEY
+    reasoning_effort: max
 
 rate_limits:
   global:

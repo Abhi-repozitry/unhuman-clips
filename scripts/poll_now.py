@@ -1,4 +1,6 @@
-import requests, time, json
+import time
+
+import requests
 
 API = "http://127.0.0.1:9000"
 job_id = "c7453e6e-1dca-4d85-b599-438b0028133c"

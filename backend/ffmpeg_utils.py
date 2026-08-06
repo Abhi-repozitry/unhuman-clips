@@ -14,7 +14,7 @@ import subprocess
 import threading
 from functools import lru_cache
 
-__all__ = ["get_ffmpeg", "get_ffprobe", "get_encoder"]
+__all__ = ["get_encoder", "get_ffmpeg", "get_ffprobe"]
 
 
 @lru_cache(maxsize=1)

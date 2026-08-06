@@ -5,10 +5,12 @@ from pipeline worker threads, with throttled queue-based broadcasting.
 """
 from __future__ import annotations
 
+import contextlib
 import threading
 import time
+from collections.abc import Callable
 from datetime import datetime
-from typing import Any, Callable
+from typing import Any
 
 from backend.models import VideoJob
 
@@ -115,7 +117,5 @@ class ProgressReporter:
             if now - self._last_broadcast < self._broadcast_interval:
                 return
             self._last_broadcast = now
-        try:
-            self.enqueue_broadcast(self.job)
-        except Exception:
-            pass  # Queue full or closed — drop update
+        with contextlib.suppress(Exception):
+            self.enqueue_broadcast(self.job)  # Queue full or closed — drop update

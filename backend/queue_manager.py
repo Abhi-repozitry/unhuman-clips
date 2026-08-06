@@ -6,21 +6,24 @@ through GroupOrchestrator, with checkpoint-based resumability.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import queue
-from typing import Any, Callable
+from collections.abc import Callable
+from datetime import UTC
+from typing import Any
 
 from backend.config import GPU_SEMAPHORE_SIZE, get_job_working_dir
-from backend.models import JobStatus, LLMInteraction, OutputReel, ReelPlan, VideoJob
+from backend.models import HookMode, JobStatus, LLMInteraction, MultimodalSignals, OutputReel, ReelPlan, SourceMetadata, VideoJob
+from backend.pipeline.analyzer import select_reel_plan
 from backend.pipeline.checkpoint import PipelineCheckpoint
 from backend.pipeline.downloader import download_video, validate_downloaded_video
-from backend.pipeline.analyzer import select_reel_plan
 from backend.pipeline.orchestrator import GroupOrchestrator
 from backend.pipeline.timeline_builder import build_rich_timeline
 from backend.pipeline.transcriber import transcribe_video
 from backend.progress import ProgressReporter
 
-__all__ = ["QueueManager", "format_bytes", "format_speed", "format_eta"]
+__all__ = ["QueueManager", "format_bytes", "format_eta", "format_speed"]
 
 logger = logging.getLogger(__name__)
 
@@ -69,14 +72,17 @@ class QueueManager:
 
     def enqueue_broadcast(self, job: VideoJob) -> None:
         """Thread-SAFE: put a job update into the broadcast queue from ANY thread."""
-        try:
+        with contextlib.suppress(queue.Full):
             self._broadcast_queue.put_nowait(job)
-        except queue.Full:
-            pass  # Drop oldest under backpressure
 
-    def add_job(self, url: str, generate_captions: bool = True) -> VideoJob:
+    def add_job(
+        self,
+        url: str,
+        generate_captions: bool = True,
+        hook_mode: HookMode = "auto",
+    ) -> VideoJob:
         """Create a new job, enqueue it, and return the job object."""
-        job = VideoJob(url=url, generate_captions=generate_captions)
+        job = VideoJob(url=url, generate_captions=generate_captions, hook_mode=hook_mode)
         self.jobs[job.id] = job
         self.queue.put_nowait(job.id)
         # Immediately enqueue a broadcast so the frontend sees the new job
@@ -96,11 +102,11 @@ class QueueManager:
 
     def cleanup_old_jobs(self, max_age_hours: float = 24.0) -> int:
         """Remove completed/error jobs older than max_age_hours. Returns count removed."""
-        from datetime import datetime, timedelta, timezone
-        cutoff = datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
+        from datetime import datetime, timedelta
+        cutoff = datetime.now(UTC) - timedelta(hours=max_age_hours)
         to_remove = []
         for job_id, job in self.jobs.items():
-            if job.status in ("DONE", "ERROR") and job.created_at.replace(tzinfo=timezone.utc) < cutoff:
+            if job.status in ("DONE", "ERROR") and job.created_at.replace(tzinfo=UTC) < cutoff:
                 to_remove.append(job_id)
         for job_id in to_remove:
             del self.jobs[job_id]
@@ -212,7 +218,10 @@ class QueueManager:
         # Check for download checkpoint
         download_ckpt = ckpt.load_stage("download")
         if download_ckpt and download_ckpt.get("source_path"):
-            job.title = download_ckpt.get("title")
+            metadata_data = download_ckpt.get("source_metadata")
+            if isinstance(metadata_data, dict):
+                job.source_metadata = SourceMetadata.model_validate(metadata_data)
+            job.title = (job.source_metadata.title if job.source_metadata else None) or download_ckpt.get("title")
             job.source_path = download_ckpt["source_path"]
             reporter.log_info(f"Resuming from checkpoint: download already complete ({job.source_path})")
             result = download_ckpt  # Use checkpoint data for downstream fields
@@ -220,14 +229,22 @@ class QueueManager:
             result = await asyncio.to_thread(
                 download_video, job.url, str(job_download_dir), sync_progress_hook
             )
-            job.title = result.get("title")
+            metadata_data = result.get("source_metadata")
+            if isinstance(metadata_data, dict):
+                job.source_metadata = SourceMetadata.model_validate(metadata_data)
+            job.title = (job.source_metadata.title if job.source_metadata else None) or result.get("title")
             job.source_path = result.get("source_path")
 
             if not job.source_path:
                 raise RuntimeError("Download succeeded but source_path was not produced by yt-dlp.")
 
             reporter.log_info(f"Downloaded: {job.title} -> {job.source_path}")
-            ckpt.save_stage("download", {"title": job.title, "source_path": job.source_path, "description": result.get("description", "")})
+            ckpt.save_stage("download", {
+                "title": job.title,
+                "source_path": job.source_path,
+                "description": result.get("description", ""),
+                "source_metadata": job.source_metadata.model_dump() if job.source_metadata else None,
+            })
 
         # Validate the downloaded video
         validation = await asyncio.to_thread(validate_downloaded_video, job.source_path)
@@ -244,6 +261,7 @@ class QueueManager:
 
         # Stage 2: TRANSCRIBING
         job.stage_index = 2
+        job.progress = 0.0
         job.stage_data = {"total_segments": 0, "current_segment": 0}
         reporter.update_stage(JobStatus.TRANSCRIBING, "Loading Whisper model...", 0, 2)
 
@@ -253,8 +271,21 @@ class QueueManager:
             job.transcript = transcribe_ckpt["transcript"]
             reporter.log_info(f"Resuming from checkpoint: transcription already complete ({len(job.transcript)} segments)")
         else:
+            import re as _re
+
             def transcriber_progress(msg: str, prog: float):
-                job.stage_data = {"total_segments": 0, "current_segment": 0, "message": msg, "progress": prog}
+                total_segs = 0
+                cur_segs = 0
+                m = _re.search(r"segment\s+(\d+)/(\d+)", msg)
+                if m:
+                    cur_segs = int(m.group(1))
+                    total_segs = int(m.group(2))
+                job.stage_data = {
+                    "total_segments": total_segs,
+                    "current_segment": cur_segs,
+                    "message": msg,
+                    "progress": prog,
+                }
                 reporter.progress_callback(msg, prog)
 
             job.transcript = await asyncio.to_thread(transcribe_video, job.source_path, transcriber_progress)
@@ -269,6 +300,7 @@ class QueueManager:
 
         # Stage 3: BUILDING RICH TIMELINE
         job.stage_index = 3
+        job.progress = 0.0
         job.total_stages = 9
         job.stage_data = {"status": "building_timeline", "message": "Building Rich Timeline (VAD + FFmpeg metrics)..."}
         reporter.update_stage(JobStatus.BUILDING_TIMELINE, "Building Rich Timeline...", 0, 3)
@@ -282,7 +314,13 @@ class QueueManager:
         else:
             def timeline_progress(msg: str, prog: float):
                 existing = job.stage_data if isinstance(job.stage_data, dict) else {}
-                job.stage_data = {**existing, "status": "building_timeline", "message": msg, "progress": prog}
+                # Parse FFmpeg metrics progress: "FFmpeg metrics 45/120 segments..."
+                import re as _re
+                m = _re.search(r"FFmpeg metrics\s+(\d+)/(\d+)", msg)
+                extra = {}
+                if m:
+                    extra = {"current_segment": int(m.group(1)), "total_segments": int(m.group(2))}
+                job.stage_data = {**existing, "status": "building_timeline", "message": msg, "progress": prog, **extra}
                 reporter.progress_callback(msg, prog)
 
             job.rich_timeline = await asyncio.to_thread(
@@ -299,6 +337,7 @@ class QueueManager:
 
         # Stage 4: ANALYZING
         job.stage_index = 4
+        job.progress = 0.0
         job.stage_data = {"status": "sending", "message": "Sending Rich Timeline to LLM..."}
         reporter.update_stage(JobStatus.ANALYZING, "Sending Rich Timeline to LLM...", 0, 4)
 
@@ -310,26 +349,43 @@ class QueueManager:
             reel_plan = ReelPlan.model_validate(analyze_ckpt["reel_plan"])
             reporter.log_info(f"Resuming from checkpoint: analysis already complete ({len(reel_plan.reel_groups)} groups)")
         else:
+            multimodal_signals = None
+            multimodal_ckpt = ckpt.load_stage("multimodal")
+            if multimodal_ckpt:
+                try:
+                    multimodal_signals = MultimodalSignals.model_validate(multimodal_ckpt)
+                    reporter.log_info("Resuming from checkpoint: multimodal signals already built")
+                except ValueError:
+                    logger.warning("Ignoring invalid multimodal checkpoint for job %s", job.id)
+
             def analyzer_progress(msg: str, prog: float):
                 existing = job.stage_data if isinstance(job.stage_data, dict) else {}
                 job.stage_data = {**existing, "status": "processing", "message": msg, "progress": prog}
                 reporter.progress_callback(msg, prog)
 
-            video_description = result.get("description", "")
+            video_description = (
+                job.source_metadata.description if job.source_metadata else result.get("description", "")
+            )
             try:
                 reel_plan = await asyncio.wait_for(
                     asyncio.to_thread(
                         select_reel_plan, job.transcript, job.title or "", video_description,
                         analyzer_progress, reporter, llm_interactions,
                         rich_timeline=job.rich_timeline,
+                        source_path=job.source_path,
+                        source_metadata=job.source_metadata,
+                        hook_mode=job.hook_mode,
+                        multimodal_signals=multimodal_signals,
                     ),
                     timeout=2700.0,
                 )
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 raise RuntimeError(
                     "ANALYZING exceeded 45-minute hard ceiling — LLM never responded "
-                    "in time even after retries. Check NVIDIA API status."
-                )
+                    "in time even after retries. Check OpenCode API status."
+                ) from None
+            if reel_plan.multimodal_signals is not None:
+                ckpt.save_stage("multimodal", reel_plan.multimodal_signals.model_dump())
             ckpt.save_stage("analyze", {"reel_plan": reel_plan.model_dump()})
 
         if llm_interactions:
@@ -343,8 +399,35 @@ class QueueManager:
             existing = job.stage_data if isinstance(job.stage_data, dict) else {}
             job.stage_data = {**existing, "status": "fallback", "message": "LLM unavailable, using heuristic fallback plan."}
         job.reel_plan = reel_plan
+        job.content_identity = reel_plan.content_identity
         job.num_output_groups = len(reel_plan.reel_groups)
         job.current_group_index = 0
+
+        # Expose OCR / multimodal stats to frontend
+        if reel_plan.multimodal_signals is not None:
+            ms = reel_plan.multimodal_signals
+            mm_dict = {
+                "scene_cuts": len(ms.scene_cut_at),
+                "ocr_frames_sampled": len(ms.on_screen_text),
+                "ocr_names_found": sum(1 for s in ms.on_screen_text if s.text),
+            }
+            job.stage_data["multimodal_stats"] = mm_dict
+            reporter.set_stage_data_key("multimodal_stats", mm_dict)
+
+        # Expose content identity (Identifier output) to frontend
+        if reel_plan.content_identity is not None:
+            ci = reel_plan.content_identity
+            ci_dict = {
+                "creator_name": ci.creator_name,
+                "content_format": ci.content_format,
+                "detected_genre": ci.detected_genre,
+                "structure": ci.structure,
+                "entity_names": ci.entity_names,
+                "hook_recommendation": ci.hook_recommendation,
+                "planning_notes": ci.planning_notes,
+            }
+            job.stage_data["content_identity"] = ci_dict
+            reporter.set_stage_data_key("content_identity", ci_dict)
 
         # Initialize OutputReel objects for each group
         job.outputs = [
@@ -358,8 +441,36 @@ class QueueManager:
         ]
 
         total_clips = sum(len(g.source_clips) for g in reel_plan.reel_groups)
+        total_duration = sum(g.estimated_duration_seconds for g in reel_plan.reel_groups)
+        genre_key = ""
+        if reel_plan.structure_analysis:
+            genre_key = reel_plan.structure_analysis.video_type
+        groups_summary = []
+        for g in reel_plan.reel_groups:
+            rs = g.reel_summary
+            groups_summary.append({
+                "title": rs.title,
+                "short_description": rs.short_description,
+                "narrative_angle": rs.narrative_angle,
+                "key_moment": rs.key_moment,
+                "source_understanding": rs.source_understanding,
+                "duration": g.estimated_duration_seconds,
+                "clips": len(g.source_clips),
+                "narration": len(g.narration_events),
+                "reasoning": g.group_reasoning,
+            })
         existing = job.stage_data if isinstance(job.stage_data, dict) else {}
-        job.stage_data = {**existing, "status": "done", "groups_found": job.num_output_groups, "total_source_clips": total_clips}
+        output_summary = {
+            "genre": genre_key,
+            "total_duration": total_duration,
+            "total_clips": total_clips,
+            "groups": groups_summary,
+            "worth_breakdown": getattr(reel_plan, "worth_breakdown", {}),
+        }
+        job.stage_data = {
+            **existing, "status": "done", "groups_found": job.num_output_groups,
+            "total_source_clips": total_clips, "output_summary": output_summary,
+        }
         reporter.log_info(f"Analyzed: {job.num_output_groups} output group(s), {total_clips} source clips")
 
         # Initialize clip details for tracking
@@ -388,7 +499,7 @@ class QueueManager:
 
         job.status = JobStatus.DONE
         job.progress = 100.0
-        job.stage_data = {"status": "done"}
+        job.stage_data = {"status": "done", "output_summary": output_summary}
         reporter.update_stage(JobStatus.DONE, "All groups complete!", 100, 9)
         reporter.log_info(f"Job {job.id} complete with {job.num_output_groups} output(s)")
         self.enqueue_broadcast(job)

@@ -25,7 +25,7 @@ backend/
 │   ├── narration_validator.py  # Speech overlap detection, timing adjustment
 │   └── sanitize.py         # Text sanitization for ASS/TTS/ffmpeg
 ├── providers/
-│   └── llm.py              # NVIDIA LLM API client with retry + caching
+│   └── llm.py              # OpenCode LLM API client with retry + caching
 └── requirements.txt        # Python dependencies
 ```
 
@@ -163,7 +163,7 @@ If transcription fails, check:
 |-------|-------|----------|
 | `ffmpeg not found` | Wrong path in `FFMPEG_PATH` | Set correct path in `.env` or add ffmpeg to PATH |
 | `h264_nvenc not available` | No NVIDIA GPU or wrong drivers | Set `ALLOW_CPU_FFMPEG_FALLBACK=1` |
-| `NVIDIA_API_KEY not set` | Missing API key | Get key from build.nvidia.com, add to `.env` |
+| `OPENCODE_API_KEY not set` | Missing API key | Set it in `backend/.env` |
 | `Whisper CUDA model failed to load` | CUDA/cuDNN mismatch | Reinstall PyTorch with correct CUDA version |
 | `edge-tts failed` | Network issue or invalid voice | Check network, verify `TTS_VOICE` value |
 

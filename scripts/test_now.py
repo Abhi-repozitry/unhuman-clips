@@ -1,8 +1,13 @@
 """
 Quick test: POST job, poll every 5s, report duration of each output group.
 """
-import os, json, time, sys, traceback, requests
+import json
+import sys
+import time
+import traceback
 from pathlib import Path
+
+import requests
 
 API = "http://127.0.0.1:9000"
 TEST_URL = "https://youtu.be/Ah_uuTwGOYU?si=pAu07P3P1y88giFu"
@@ -42,7 +47,7 @@ def poll_all_jobs(job_id: str, timeout_s: int = 1800):
         err = target.get("error")
         stage = target.get("current_stage") or target.get("stage_index")
         num_groups = target.get("num_output_groups", 0)
-        outputs = target.get("outputs", [])
+        target.get("outputs", [])
         logs = target.get("logs", [])
         print(f"  [t={int(deadline - time.time())}s] stage={stage} status={status} progress={progress}% groups={num_groups} err={err}")
         if logs and len(logs) != last_logs:
@@ -90,7 +95,7 @@ def main():
             dur = o.get("duration_seconds", 0)
             if 90 <= dur <= 100:
                 valid_groups += 1
-        print(f"\n=== RESULT ===")
+        print("\n=== RESULT ===")
         print(f"Total groups: {total_groups}")
         print(f"Groups in 90-100s range: {valid_groups}/{total_groups}")
         if total_groups > 0 and valid_groups < total_groups:

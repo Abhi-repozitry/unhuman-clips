@@ -1,7 +1,7 @@
-import requests
-import time
 import json
-import sys
+import time
+
+import requests
 
 BASE = "http://127.0.0.1:9000"
 url = "https://youtu.be/Z0PbIam6PdU?si=P3hmiR4o0NFC668A"
@@ -37,7 +37,7 @@ try:
             last_progress = progress
 
         if status == "DONE":
-            print(f"\n=== JOB DONE ===")
+            print("\n=== JOB DONE ===")
             outputs = j.get("outputs", [])
             print(f"Outputs: {len(outputs)} group(s)")
             for i, o in enumerate(outputs):
@@ -50,7 +50,7 @@ try:
                 print(f"  Group {g['group_index']}: {len(g['source_clips'])} clips, {len(g['narration_events'])} narrations, est={g.get('estimated_duration_seconds')}s")
             break
         elif status == "ERROR":
-            print(f"\n=== ERROR ===")
+            print("\n=== ERROR ===")
             print(f"Error: {error}")
             print(f"Stage data: {json.dumps(stage_data, indent=2)}")
             break

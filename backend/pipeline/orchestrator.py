@@ -2,14 +2,17 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from backend.config import (
     MAX_OUTPUT_DURATION,
     MIN_CONTENT_DURATION,
-    MIN_OUTPUT_DURATION, get_job_working_dir,
+    MIN_OUTPUT_DURATION,
+    get_job_working_dir,
 )
 from backend.models import JobStatus, NarrationEvent, ReelGroup, VideoJob
 from backend.output_manager import OutputManager
@@ -37,6 +40,18 @@ class GroupOrchestrator:
         self.enqueue_broadcast = enqueue_broadcast
         self.output_manager = OutputManager()
         self.ckpt = PipelineCheckpoint(get_job_working_dir(job.id))
+        # Accumulators for multi-group job field aggregation.  Per-group
+        # stages extend these; the job fields are set to the live list so
+        # the frontend always sees the full cross-group count.
+        self._all_clip_paths: list[str] = []
+        self._all_commentary_audio: list[dict] = []
+        self._all_caption_paths: list[str] = []
+
+    def _is_executor_mode(self) -> bool:
+        """Executor plans own every number deterministically — the legacy
+        repairs (clip stretching, duration floors) must not run on them."""
+        plan = self.job.reel_plan
+        return plan is not None and getattr(plan, "plan_mode", "llm") == "executor"
 
     # ------------------------------------------------------------------
     # Stage: CLIPPING
@@ -60,9 +75,12 @@ class GroupOrchestrator:
 
         if checkpoint and "clip_paths" in checkpoint:
             reporter.log_info(f"Group {group_idx+1}: Resuming from checkpoint (clips already cut)")
+            self._all_clip_paths.extend(checkpoint["clip_paths"])
+            self.job.clip_paths = self._all_clip_paths
             return checkpoint["clip_paths"]
 
         self.job.stage_index = 5
+        self.job.progress = 0.0
         self.job.stage_data = {
             "status": "cutting",
             "group_index": group_idx,
@@ -84,17 +102,14 @@ class GroupOrchestrator:
             }
             reporter.progress_callback(msg, prog)
 
-        group_clip_paths = await asyncio.to_thread(
-            cut_group_clips, source_path, [c.model_dump() for c in group.source_clips],
-            self.job.id, group_idx, clipper_progress, reporter
-        )
-
-        self.job.stage_data = {"status": "done", "group_index": group_idx, "clips_cut": len(group_clip_paths)}
-        reporter.log_info(f"Group {group_idx+1}: Cut {len(group_clip_paths)} clips")
-
-        # Safety: expand clips if content is still below minimum
+        # Safety: expand clips if content is still below minimum. Legacy LLM
+        # mode only — executor plans are deterministic and must never be
+        # stretched (this used to inflate clips to CLIP_DURATION_SOFT_MAX and
+        # then cut them AFTER the ranges changed, desyncing the cut files
+        # from the plan). Expansion now happens BEFORE cutting so the files
+        # always match the final ranges.
         actual_clip_dur = sum(c.source_end - c.source_start for c in group.source_clips)
-        if actual_clip_dur < MIN_CONTENT_DURATION:
+        if not self._is_executor_mode() and actual_clip_dur < MIN_CONTENT_DURATION:
             from backend.pipeline.plan_validator import _expand_clips_to_fill_gap
             clips_dicts = [c.model_dump() for c in group.source_clips]
             source_dur = float(self.job.transcript[-1]["end"]) if self.job.transcript and len(self.job.transcript) > 0 else 0.0
@@ -112,6 +127,15 @@ class GroupOrchestrator:
                 from backend.models import SourceClip
                 group.source_clips = [SourceClip(**c) for c in clips_dicts]
 
+        group_clip_paths = await asyncio.to_thread(
+            cut_group_clips, source_path, [c.model_dump() for c in group.source_clips],
+            self.job.id, group_idx, clipper_progress, reporter
+        )
+
+        self.job.stage_data = {"status": "done", "group_index": group_idx, "clips_cut": len(group_clip_paths)}
+        reporter.log_info(f"Group {group_idx+1}: Cut {len(group_clip_paths)} clips")
+        self._all_clip_paths.extend(group_clip_paths)
+        self.job.clip_paths = self._all_clip_paths
         self.ckpt.save_stage(ckpt_key, {"clip_paths": group_clip_paths})
         return group_clip_paths
 
@@ -143,15 +167,21 @@ class GroupOrchestrator:
         # (the source video's original audio serves as the hook)
         has_hook_clip = any(c.is_hook_clip for c in group.source_clips)
 
+        skipped_hooks = []
         for e in raw_narration_events:
-            if e.event_type.strip().lower() in ("hook", "commentary"):
-                # Skip hook narration if hook clip provides original audio
-                if has_hook_clip and e.event_type.strip().lower() == "hook":
-                    dropped.append(e)
+            if e.event_type.strip().lower() in ("hook", "start", "commentary"):
+                # Skip opening narration (hook/start) if hook clip provides original audio
+                if has_hook_clip and e.event_type.strip().lower() in ("hook", "start"):
+                    skipped_hooks.append(e)
                     continue
                 group_narration_events.append(e)
             else:
                 dropped.append(e)
+        if skipped_hooks:
+            reporter.log_info(
+                f"Group {group_idx+1}: hook narration skipped "
+                f"({len(skipped_hooks)} event(s) — hook clip provides original audio)"
+            )
         if dropped:
             reporter.log_info(
                 f"[WARN] Group {group_idx+1}: dropped {len(dropped)} narration event(s) "
@@ -190,6 +220,7 @@ class GroupOrchestrator:
 
         total_narration = len(group_narration_events)
         self.job.stage_index = 6
+        self.job.progress = 0.0
         self.job.stage_data = {
             "status": "voicing",
             "group_index": group_idx,
@@ -201,6 +232,8 @@ class GroupOrchestrator:
 
         if checkpoint and "narration_audio" in checkpoint:
             reporter.log_info(f"Group {group_idx+1}: Resuming from checkpoint (TTS already generated)")
+            self._all_commentary_audio.extend(checkpoint["narration_audio"])
+            self.job.commentary_audio = self._all_commentary_audio
             return checkpoint["narration_audio"], group_narration_events
 
         group_narration_audio = []
@@ -243,11 +276,16 @@ class GroupOrchestrator:
         self.job.narration_audio = group_narration_audio
         self.job.stage_data = {"status": "done", "group_index": group_idx, "files_generated": len(group_narration_audio)}
         reporter.log_info(f"Group {group_idx+1}: Generated {len(group_narration_audio)} narration audio files")
+        self._all_commentary_audio.extend(group_narration_audio)
+        self.job.commentary_audio = self._all_commentary_audio
 
         # Narration timing validation
         total_clip_dur = sum((c.source_end - c.source_start) for c in group.source_clips)
         max_nar_end = max((nar.get("reel_end", 0) for nar in group_narration_audio), default=0.0)
-        target_dur = max(total_clip_dur, max_nar_end, group.estimated_duration_seconds, float(MIN_OUTPUT_DURATION))
+        # Use per-unit target when available (entity mode), not the global
+        # MIN_OUTPUT_DURATION floor which would inflate small entity groups.
+        dur_floor = group.unit_dur_min if group.unit_dur_min > 0 else float(MIN_OUTPUT_DURATION)
+        target_dur = max(total_clip_dur, max_nar_end, group.estimated_duration_seconds, dur_floor)
         target_dur = min(target_dur, float(MAX_OUTPUT_DURATION))
 
         # Use actual clip content duration for narration placement — narration
@@ -293,6 +331,7 @@ class GroupOrchestrator:
         checkpoint = self.ckpt.load_stage(ckpt_key)
 
         self.job.stage_index = 7
+        self.job.progress = 0.0
         self.job.stage_data = {
             "status": "captioning",
             "group_index": group_idx,
@@ -304,6 +343,8 @@ class GroupOrchestrator:
 
         if checkpoint and "clip_captions" in checkpoint:
             reporter.log_info(f"Group {group_idx+1}: Resuming from checkpoint (captions already generated)")
+            self._all_caption_paths.extend(checkpoint["clip_captions"])
+            self.job.caption_paths = self._all_caption_paths
             return checkpoint["clip_captions"], checkpoint["narration_captions"]
 
         group_clip_captions = []
@@ -371,6 +412,8 @@ class GroupOrchestrator:
         self.job.caption_paths = group_clip_captions
         self.job.stage_data = {"status": "done", "group_index": group_idx, "clip_captions": len(group_clip_captions), "narration_captions": len(group_narration_captions)}
         reporter.log_info(f"Group {group_idx+1}: Generated {len(group_clip_captions)} clip + {len(group_narration_captions)} narration captions")
+        self._all_caption_paths.extend(group_clip_captions)
+        self.job.caption_paths = self._all_caption_paths
 
         self.ckpt.save_stage(ckpt_key, {
             "clip_captions": group_clip_captions,
@@ -407,6 +450,7 @@ class GroupOrchestrator:
         checkpoint = self.ckpt.load_stage(ckpt_key)
 
         self.job.stage_index = 8
+        self.job.progress = 0.0
         self.job.stage_data = {
             "status": "compositing",
             "group_index": group_idx,
@@ -442,6 +486,9 @@ class GroupOrchestrator:
             group.estimated_duration_seconds,
             float(self.job.transcript[-1]["end"]) if self.job.transcript and len(self.job.transcript) > 0 else 0.0,
             compositor_progress,
+            # Executor mode: plan's content length IS the reel length (no floor).
+            # Legacy mode: enforce MIN_OUTPUT_DURATION floor.
+            min_duration=0.0 if self._is_executor_mode() else float(MIN_OUTPUT_DURATION),
         )
 
         if isinstance(compose_result, dict):
@@ -489,6 +536,7 @@ class GroupOrchestrator:
             Tuple of (final_path, duration_seconds).
         """
         self.job.stage_index = 9
+        self.job.progress = 0.0
         self.job.stage_data = {
             "status": "editing",
             "group_index": group_idx,
@@ -527,22 +575,16 @@ class GroupOrchestrator:
             self.ckpt.clear_stage(f"group_{group_idx}_{stage_suffix}")
         # Remove partial clip files
         for path in working_dir.glob(f"group_{group_idx}_clip_*.mp4"):
-            try:
+            with contextlib.suppress(OSError):
                 path.unlink()
-            except OSError:
-                pass
         # Remove partial TTS audio
         for path in working_dir.glob(f"group_{group_idx}_narration_*.wav"):
-            try:
+            with contextlib.suppress(OSError):
                 path.unlink()
-            except OSError:
-                pass
         # Remove partial caption files
         for path in working_dir.glob(f"group_{group_idx}_*_caption_*.ass"):
-            try:
+            with contextlib.suppress(OSError):
                 path.unlink()
-            except OSError:
-                pass
         logger.info("Cleaned up partial artifacts for group %d", group_idx)
 
     async def run_group(
@@ -597,6 +639,7 @@ class GroupOrchestrator:
                     group_narration_captions = []
                     # Update stage to show we're working on commentary captions
                     self.job.stage_index = 7
+                    self.job.progress = 0.0
                     self.job.stage_data = {
                         "status": "captioning",
                         "group_index": group_idx,
@@ -627,13 +670,14 @@ class GroupOrchestrator:
                             "reel_end": nar["reel_end"],
                             "path": str(narr_caption_path),
                         })
-                    self.job.caption_paths = []
+                    self.job.caption_paths = self._all_caption_paths
                     self.job.stage_data = {
                         "status": "done",
                         "group_index": group_idx,
                         "clip_captions": 0,
                         "narration_captions": len(group_narration_captions),
                         "skipped_clip_captions": True,
+                        "captions_disabled": True,
                     }
                     reporter.log_info(f"Group {group_idx+1}: Generated {len(group_narration_captions)} commentary captions (clip captions skipped)")
                 group_output_path = await self.run_compositing(

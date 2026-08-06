@@ -7,8 +7,9 @@ from __future__ import annotations
 
 import os
 import subprocess
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Callable
+from typing import Any
 
 from backend.config import CLIPS_DIR
 from backend.ffmpeg_utils import get_encoder, get_ffmpeg
@@ -78,19 +79,14 @@ def cut_clips(
         end = window["end"]
         out_path = str(CLIPS_DIR / f"{job_id}_clip_{i}.mp4")
         duration = max(0.1, end - start)
-        cmd = [
-            get_ffmpeg(), "-ss", f"{start:.6f}", "-i", source_path,
-            "-t", f"{duration:.6f}",
-            "-movflags", "+faststart",
-            "-avoid_negative_ts", "make_zero",
-        ] + encoder_opts + ["-c:a", "aac", "-b:a", "192k", "-y", out_path]
+        cmd = [get_ffmpeg(), "-ss", f"{start:.6f}", "-i", source_path, "-t", f"{duration:.6f}", "-movflags", "+faststart", "-avoid_negative_ts", "make_zero", *encoder_opts, "-c:a", "aac", "-b:a", "192k", "-y", out_path]
 
         try:
             subprocess.run(cmd, capture_output=True, check=True, timeout=300)
         except subprocess.CalledProcessError as e:
             raise RuntimeError(f"FFmpeg clip failed: {e.stderr.decode('utf-8', errors='replace')}") from e
         except subprocess.TimeoutExpired:
-            raise RuntimeError(f"FFmpeg clip timed out after 300s for clip {i}")
+            raise RuntimeError(f"FFmpeg clip timed out after 300s for clip {i}") from None
 
         if reporter:
             reporter.update_clip_progress(i, "clipping_done", 100)
@@ -99,11 +95,9 @@ def cut_clips(
     max_workers = min(4, total)
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = {pool.submit(_cut_one, i, w): i for i, w in enumerate(clip_windows)}
-        completed = 0
-        for future in as_completed(futures):
+        for completed, future in enumerate(as_completed(futures), start=1):
             idx = futures[future]
             clip_paths[idx] = future.result()
-            completed += 1
             if progress_cb:
                 progress_cb(f"Cut {completed}/{total} clips", (completed / total) * 100)
 
@@ -148,19 +142,14 @@ def cut_group_clips(
         end = clip["source_end"]
         out_path = str(CLIPS_DIR / f"{job_id}_group{group_idx}_clip_{i}.mp4")
         duration = max(0.1, end - start)
-        cmd = [
-            get_ffmpeg(), "-ss", f"{start:.6f}", "-i", source_path,
-            "-t", f"{duration:.6f}",
-            "-movflags", "+faststart",
-            "-avoid_negative_ts", "make_zero",
-        ] + encoder_opts + ["-c:a", "aac", "-b:a", "192k", "-y", out_path]
+        cmd = [get_ffmpeg(), "-ss", f"{start:.6f}", "-i", source_path, "-t", f"{duration:.6f}", "-movflags", "+faststart", "-avoid_negative_ts", "make_zero", *encoder_opts, "-c:a", "aac", "-b:a", "192k", "-y", out_path]
 
         try:
             subprocess.run(cmd, capture_output=True, check=True, timeout=300)
         except subprocess.CalledProcessError as e:
             raise RuntimeError(f"FFmpeg clip failed: {e.stderr.decode('utf-8', errors='replace')}") from e
         except subprocess.TimeoutExpired:
-            raise RuntimeError(f"FFmpeg clip timed out after 300s for group {group_idx} clip {i}")
+            raise RuntimeError(f"FFmpeg clip timed out after 300s for group {group_idx} clip {i}") from None
 
         if reporter:
             reporter.update_clip_progress(i, "clipping_done", 100)
@@ -170,11 +159,9 @@ def cut_group_clips(
     max_workers = min(4, total)
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = {pool.submit(_cut_one, i, clip): i for i, clip in enumerate(source_clips)}
-        completed = 0
-        for future in as_completed(futures):
+        for completed, future in enumerate(as_completed(futures), start=1):
             idx = futures[future]
             clip_paths[idx] = future.result()
-            completed += 1
             if progress_cb:
                 progress_cb(f"Group {group_idx+1}: Cut {completed}/{total} clips", (completed / total) * 100)
 

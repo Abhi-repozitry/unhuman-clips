@@ -108,7 +108,7 @@ def validate_and_adjust_narration_timings(
         overlap, texts = get_speech_overlap(reel_s, reel_e)
         overlap_ratio = overlap / duration if duration > 0 else 0.0
 
-        if event_type in ("commentary", "hook") and overlap_ratio > 0.10:
+        if event_type in ("commentary", "hook", "start") and overlap_ratio > 0.10:
             sample_text = texts[0][:60] + "..." if texts else ""
             reporter.log_info(
                 f"[WARN] Group {group_idx+1}: {event_type.capitalize()} narration '{nar['text'][:40]}...' "

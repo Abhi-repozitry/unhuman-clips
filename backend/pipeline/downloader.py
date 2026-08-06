@@ -8,20 +8,109 @@ from __future__ import annotations
 import json
 import logging
 import os
-import shutil
 import subprocess
 import time
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import yt_dlp
 
 from backend.config import DOWNLOAD_MAX_HEIGHT, FFMPEG_PATH
 from backend.ffmpeg_utils import get_ffmpeg, get_ffprobe
 
-__all__ = ["download_video", "validate_downloaded_video"]
+__all__ = [
+    "download_video",
+    "fetch_video_metadata",
+    "normalize_source_metadata",
+    "validate_downloaded_video",
+]
 
 logger = logging.getLogger(__name__)
+
+
+def _clean_text(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    return value or None
+
+
+def _first_text(*values: object) -> str | None:
+    for value in values:
+        if text := _clean_text(value):
+            return text
+    return None
+
+
+def _optional_int(value: object) -> int | None:
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def normalize_source_metadata(info: dict[str, Any]) -> dict[str, Any]:
+    """Extract a small, stable source metadata contract from yt-dlp output."""
+    return {
+        "video_id": _first_text(info.get("id")),
+        "title": _first_text(info.get("title")),
+        "description": _first_text(info.get("description")) or "",
+        "channel_name": _first_text(
+            info.get("channel"), info.get("uploader"), info.get("creator")
+        ),
+        "channel_description": _first_text(
+            info.get("channel_description"), info.get("uploader_description")
+        ),
+        "channel_id": _first_text(info.get("channel_id")),
+        "channel_url": _first_text(info.get("channel_url"), info.get("uploader_url")),
+        "uploader": _first_text(info.get("uploader")),
+        "uploader_id": _first_text(info.get("uploader_id")),
+        "uploader_url": _first_text(info.get("uploader_url")),
+        "channel_follower_count": _optional_int(info.get("channel_follower_count")),
+    }
+
+
+def _find_cookie_file() -> Path | None:
+    root_dir = Path(__file__).resolve().parent.parent.parent
+    desktop_dir = Path.home() / "Desktop"
+    cookie_candidates = [
+        root_dir / "cookies.txt",
+        desktop_dir / "cookies.txt",
+        desktop_dir / "antigravity.google_cookies.txt",
+        root_dir / "backend" / "storage" / "cookies.txt",
+        root_dir / "backend" / "cookies.txt",
+    ]
+    return next((p for p in cookie_candidates if p.exists() and p.stat().st_size > 0), None)
+
+
+def fetch_video_metadata(url: str) -> dict[str, Any]:
+    """Fetch yt-dlp metadata without downloading media for job preflight."""
+    if not url or not url.strip():
+        raise RuntimeError("A video URL is required for metadata preflight.")
+
+    ydl_opts: dict[str, Any] = {
+        "skip_download": True,
+        "noplaylist": True,
+        "no_color": True,
+        "quiet": True,
+        "no_warnings": True,
+        "socket_timeout": 30,
+        "retries": 2,
+        "extractor_retries": 2,
+    }
+    if cookie_file := _find_cookie_file():
+        ydl_opts["cookiefile"] = str(cookie_file)
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            result = ydl.extract_info(url, download=False)
+    except Exception as e:
+        raise RuntimeError(f"Could not fetch video metadata: {e}") from e
+
+    if not isinstance(result, dict):
+        raise RuntimeError("yt-dlp returned invalid metadata for this URL.")
+    return normalize_source_metadata(result)
 
 
 def download_video(
@@ -115,15 +204,7 @@ def download_video(
 
     # Cookie file for YouTube auth — check multiple standard locations
     root_dir = Path(__file__).resolve().parent.parent.parent
-    desktop_dir = Path.home() / "Desktop"
-    cookie_candidates = [
-        root_dir / "cookies.txt",
-        desktop_dir / "cookies.txt",
-        desktop_dir / "antigravity.google_cookies.txt",
-        root_dir / "backend" / "storage" / "cookies.txt",
-        root_dir / "backend" / "cookies.txt",
-    ]
-    found_cookie = next((p for p in cookie_candidates if p.exists() and p.stat().st_size > 0), None)
+    found_cookie = _find_cookie_file()
 
     ydl_opts = {
         "format": format_selector,
@@ -257,6 +338,7 @@ def download_video(
 
     logger.info(f"Download complete: {source_path}")
     result["source_path"] = source_path
+    result["source_metadata"] = normalize_source_metadata(result)
     return result
 
 

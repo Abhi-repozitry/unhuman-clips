@@ -1,10 +1,30 @@
 """Pydantic models for video jobs, reel plans, and pipeline data structures."""
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from enum import StrEnum
-from pydantic import BaseModel, Field
 import uuid
+from datetime import UTC, datetime
+from enum import StrEnum
+from typing import Literal
+
+from pydantic import BaseModel, Field
+
+HookMode = Literal["required", "skip", "auto"]
+
+
+class SourceMetadata(BaseModel):
+    """Ground-truth source data normalized from yt-dlp's info payload."""
+
+    video_id: str | None = None
+    title: str | None = None
+    description: str = ""
+    channel_name: str | None = None
+    channel_description: str | None = None
+    channel_id: str | None = None
+    channel_url: str | None = None
+    uploader: str | None = None
+    uploader_id: str | None = None
+    uploader_url: str | None = None
+    channel_follower_count: int | None = None
 
 
 class OutputReel(BaseModel):
@@ -35,8 +55,8 @@ class SourceClip(BaseModel):
 
 class NarrationEvent(BaseModel):
     event_type: str
-    reel_start: float
-    reel_end: float
+    reel_start: float = 0.0
+    reel_end: float = 0.0
     text: str
     persona: str | None = None
     voice_id: str | None = None
@@ -49,6 +69,59 @@ class ReelGroup(BaseModel):
     reel_summary: ReelSummary
     source_clips: list[SourceClip]
     narration_events: list[NarrationEvent]
+    # Per-unit duration targets stashed by execute_plan for downstream use
+    # (orchestrator narration timing, QA bounds). Default 0 = not set.
+    unit_dur_min: float = 0.0
+    unit_dur_max: float = 0.0
+    # Completeness critic verdict populated by analyzer post-execution.
+    completeness_critic: dict | None = None
+
+
+class ContentIdentity(BaseModel):
+    """Semantic source identity supplied by the Identifier LLM stage."""
+
+    creator_name: str | None = None
+    content_format: str
+    detected_genre: str
+    structure: Literal["single_narrative", "multi_entity"]
+    entity_names: list[str] = Field(default_factory=list)
+    hook_recommendation: Literal["hook", "skip"]
+    planning_notes: str
+    # Arc style drives payoff requirements: "reveal" and "showcase" need a
+    # payoff beat (winner reveal, final moment); "quiz" (question-answer
+    # format) does not — the reel just ends after the last real content.
+    arc_style: Literal["reveal", "showcase", "quiz"] = "reveal"
+
+
+class OnScreenTextSignal(BaseModel):
+    """OCR result associated with a sampled source frame."""
+
+    timestamp: float
+    text: str | None = None
+    scene_cut_at: float | None = None
+
+
+class MultimodalSignals(BaseModel):
+    """CPU vision and hosted OCR signals available to downstream planning."""
+
+    scene_cut_at: list[float] = Field(default_factory=list)
+    on_screen_text: list[OnScreenTextSignal] = Field(default_factory=list)
+
+
+class EntitySegment(BaseModel):
+    """A deterministic source-time window for one person, contestant, or act."""
+
+    entity_segment_id: str
+    entity_name: str | None = None
+    start: float
+    end: float
+    block_ids: list[int] = Field(default_factory=list)
+    speaker_ids: list[str] = Field(default_factory=list)
+    evidence: list[str] = Field(default_factory=list)
+    # For non-adjacent merged segments, stores the actual time sub-ranges
+    # (union of each original segment's block time ranges). Empty means
+    # the segment is contiguous and start/end are authoritative.
+    effective_ranges: list[tuple[float, float]] = Field(default_factory=list)
 
 
 class ReelPlan(BaseModel):
@@ -57,6 +130,12 @@ class ReelPlan(BaseModel):
     explanations: list[str] = Field(default_factory=list)
     structure_analysis: StructureAnalysis | None = None
     is_fallback: bool = False
+    plan_mode: str = "llm"  # "executor" = deterministic Python layout (no legacy repairs allowed)
+    worth_breakdown: dict = Field(default_factory=dict)
+    content_identity: ContentIdentity | None = None
+    multimodal_signals: MultimodalSignals | None = None
+    entity_segments: list[EntitySegment] = Field(default_factory=list)
+    entity_grouped: bool = False
 
 
 class FFmpegMetrics(BaseModel):
@@ -88,6 +167,7 @@ class RichTimelineSegment(BaseModel):
     has_question: bool = False
     has_exclamation: bool = False
     has_emphasis: bool = False
+    speaker_id: str | None = None
 
 
 class RichTimeline(BaseModel):
@@ -156,8 +236,11 @@ class VideoJob(BaseModel):
     progress: float = 0.0
     title: str | None = None
     error: str | None = None
-    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     source_path: str | None = None
+    source_metadata: SourceMetadata | None = None
+    content_identity: ContentIdentity | None = None
+    hook_mode: HookMode = "auto"
     transcript: list[dict] | None = None
     clip_windows: list[dict] | None = None
     commentary_lines: list[dict] | None = None

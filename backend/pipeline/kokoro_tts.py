@@ -11,13 +11,13 @@ import logging
 import os
 import subprocess
 import time
-from typing import Callable
+from collections.abc import Callable
 
 import numpy as np
-import torch
 import soundfile as sf
+import torch
 
-from backend.ffmpeg_utils import get_ffmpeg, get_ffprobe
+from backend.ffmpeg_utils import get_ffprobe
 
 __all__ = ["synthesize_kokoro"]
 

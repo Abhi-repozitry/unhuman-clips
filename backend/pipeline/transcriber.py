@@ -5,13 +5,16 @@ Handles CUDA runtime library preloading for NVIDIA GPU support.
 """
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import logging
 import os
 import sys
 import threading
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable
+
+from backend.config import WHISPER_COMPUTE_TYPE_CPU, WHISPER_COMPUTE_TYPE_CUDA, WHISPER_MODEL_SIZE
 
 __all__ = ["transcribe_video"]
 
@@ -89,10 +92,8 @@ def _prepare_cuda_runtime_libraries() -> list[str]:
         # Also use add_dll_directory if available (Python 3.8+)
         if hasattr(os, "add_dll_directory"):
             for d in lib_dirs:
-                try:
+                with contextlib.suppress(Exception):
                     os.add_dll_directory(str(d))
-                except Exception:
-                    pass
     else:
         # Keep this useful for subprocesses spawned by the app as well.
         existing = [p for p in os.environ.get("LD_LIBRARY_PATH", "").split(":") if p]
@@ -136,8 +137,6 @@ def _prepare_cuda_runtime_libraries() -> list[str]:
 _cuda_preloaded = False
 _model_lock = threading.Lock()
 _model_load_failed = False
-
-from backend.config import WHISPER_MODEL_SIZE, WHISPER_COMPUTE_TYPE_CUDA, WHISPER_COMPUTE_TYPE_CPU
 
 _model = None
 _model_loaded = False
@@ -208,7 +207,7 @@ def transcribe_video(video_path: str, progress_cb: Callable[[str, float], None] 
         raise FileNotFoundError(f"Video file not found: {video_path}")
 
     try:
-        segments, info = _model.transcribe(video_path, word_timestamps=True)
+        segments, _info = _model.transcribe(video_path, word_timestamps=True)
         result = []
         seg_list = list(segments)
         total = len(seg_list)

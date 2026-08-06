@@ -170,6 +170,46 @@ class TestFinalizeEdit:
             finalize_edit(sample_reel_plan_dict, source_duration=60.0, min_groups=99)
 
 
+class TestFinalizeEditPreserveLayout:
+    """Executor mode: layout is guaranteed by Python, so destructive legacy
+    repairs (expansion, pacing swaps, diversity relocation) must not run."""
+
+    def _plan_dict(self, sample_reel_plan_dict) -> dict:
+        group = sample_reel_plan_dict["reel_groups"][0]
+        group["source_clips"] = [
+            {"source_start": 219.7, "source_end": 224.9, "reason": "HOOK: curiosity gap", "is_hook_clip": True},
+            {"source_start": 243.6, "source_end": 248.7, "reason": "ESCALATION 1: tension"},
+            {"source_start": 248.7, "source_end": 263.7, "reason": "ESCALATION 2: tension"},
+            {"source_start": 285.0, "source_end": 289.3, "reason": "PAYOFF: reveal"},
+        ]
+        group["estimated_duration_seconds"] = 39.9
+        return sample_reel_plan_dict
+
+    def test_preserve_layout_keeps_clips_untouched(self, sample_reel_plan_dict):
+        plan = finalize_edit(self._plan_dict(sample_reel_plan_dict), source_duration=300.0, preserve_layout=True)
+        clips = plan.reel_groups[0].source_clips
+        assert [(c.source_start, c.source_end) for c in clips] == [
+            (219.7, 224.9), (243.6, 248.7), (248.7, 263.7), (285.0, 289.3)
+        ]
+        assert len(clips) == 4
+
+    def test_preserve_layout_never_stretches_beyond_executor_caps(self, sample_reel_plan_dict):
+        plan = finalize_edit(self._plan_dict(sample_reel_plan_dict), source_duration=300.0, preserve_layout=True)
+        for c in plan.reel_groups[0].source_clips:
+            assert c.source_end - c.source_start <= 15.0 + 1e-9
+
+    def test_legacy_path_mutates_same_input(self, sample_reel_plan_dict):
+        plan = finalize_edit(self._plan_dict(sample_reel_plan_dict), source_duration=300.0, preserve_layout=False)
+        assert [(c.source_start, c.source_end) for c in plan.reel_groups[0].source_clips] != [
+            (219.7, 224.9), (243.6, 248.7), (248.7, 263.7), (285.0, 289.3)
+        ]
+
+    def test_preserve_layout_floor_enforcement(self, sample_reel_plan_dict):
+        with pytest.raises(RuntimeError, match="fell below minimum"):
+            finalize_edit(self._plan_dict(sample_reel_plan_dict), source_duration=300.0,
+                          min_groups=99, preserve_layout=True)
+
+
 class TestEstimateClipImportance:
     """Test clip importance estimation from reason text."""
 
@@ -264,7 +304,7 @@ class TestRepairClipDiversity:
             {"source_start": 5.0, "source_end": 10.0, "reason": "b"},  # 0.1s gap
             {"source_start": 12.0, "source_end": 17.0, "reason": "c"},
         ]}]
-        repairs = repair_clip_diversity(groups, source_duration=100.0)
+        repair_clip_diversity(groups, source_duration=100.0)
         # Clip 0 end should NOT exceed clip 1 start
         assert groups[0]["source_clips"][0]["source_end"] <= groups[0]["source_clips"][1]["source_start"]
 
@@ -274,7 +314,7 @@ class TestRepairClipDiversity:
             {"source_start": 0.5, "source_end": 5.5, "reason": "b"},  # overlaps with a
             {"source_start": 10.0, "source_end": 15.0, "reason": "c"},
         ]}]
-        repairs = repair_clip_diversity(groups, source_duration=100.0)
+        repair_clip_diversity(groups, source_duration=100.0)
         # After repair, clips should be more spread out
         starts = sorted(c["source_start"] for c in groups[0]["source_clips"])
         assert starts[-1] - starts[0] >= 5.0
@@ -296,7 +336,7 @@ class TestEnforceClipPacingEdgeCases:
             {"source_start": 0.0, "source_end": 3.0, "reason": "SHORT: a"},
             {"source_start": 10.0, "source_end": 13.0, "reason": "SHORT: b"},
         ]}]
-        adjustments = enforce_clip_pacing(groups)
+        enforce_clip_pacing(groups)
         # Only 2 SHORTs, not 3+ — no merge needed
         assert len(groups[0]["source_clips"]) == 2
 
@@ -305,7 +345,7 @@ class TestEnforceClipPacingEdgeCases:
             {"source_start": 0.0, "source_end": 30.0, "reason": "LONG: first"},
             {"source_start": 35.0, "source_end": 65.0, "reason": "LONG: second"},
         ]}]
-        adjustments = enforce_clip_pacing(groups)
+        enforce_clip_pacing(groups)
         durs = [c["source_end"] - c["source_start"] for c in groups[0]["source_clips"]]
         assert all(d >= 3.0 for d in durs)
 
@@ -368,7 +408,39 @@ class TestExpandClipsToFillGap:
         clips = [
             {"source_start": 0.0, "source_end": 5.0, "reason": "SHORT a"},
         ]
-        expanded = _expand_clips_to_fill_gap(clips, source_duration=30.0, target_total=40.0)
+        _expand_clips_to_fill_gap(clips, source_duration=30.0, target_total=40.0)
         # Can expand to source_duration (30s) but can't reach 40s target
         total = sum(c["source_end"] - c["source_start"] for c in clips)
         assert total <= 30.0  # Can't exceed source_duration
+
+    def test_forward_extension_blocked_by_overlapping_clip(self):
+        # Regression: an esc-style clip must never swallow a clip whose range
+        # starts inside it (the payoff/hook). The old bound only considered
+        # clips starting at/after cur_end, so it extended straight over them.
+        clips = [
+            {"source_start": 10.0, "source_end": 25.0, "reason": "ESC"},
+            {"source_start": 20.0, "source_end": 26.0, "reason": "PAYOFF"},
+        ]
+        _expand_clips_to_fill_gap(clips, source_duration=100.0, target_total=60.0)
+        assert clips[0]["source_end"] == 25.0
+
+    def test_backward_extension_blocked_by_overlapping_clip(self):
+        # A clip that ends inside the payoff's range blocks backward extension.
+        clips = [
+            {"source_start": 10.0, "source_end": 16.0, "reason": "PAYOFF"},
+            {"source_start": 5.0, "source_end": 12.0, "reason": "ESC"},
+        ]
+        _expand_clips_to_fill_gap(clips, source_duration=100.0, target_total=60.0)
+        payoff = next(c for c in clips if c["reason"] == "PAYOFF")
+        assert payoff["source_start"] == 10.0
+
+    def test_never_extends_into_other_clip_forward(self):
+        clips = [
+            {"source_start": 0.0, "source_end": 8.0, "reason": "SHORT a"},
+            {"source_start": 12.0, "source_end": 20.0, "reason": "SHORT b"},
+            {"source_start": 26.0, "source_end": 30.0, "reason": "SHORT c"},
+        ]
+        _expand_clips_to_fill_gap(clips, source_duration=60.0, target_total=45.0)
+        clips.sort(key=lambda c: c["source_start"])
+        for i in range(len(clips) - 1):
+            assert clips[i]["source_end"] <= clips[i + 1]["source_start"]

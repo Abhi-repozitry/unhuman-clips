@@ -1,8 +1,6 @@
 """Tests for backend.pipeline.timeline_builder — Rich Timeline construction."""
 from __future__ import annotations
 
-import pytest
-
 from backend.models import FFmpegMetrics, RichTimeline, RichTimelineSegment
 from backend.pipeline.timeline_builder import (
     _check_silence_before,

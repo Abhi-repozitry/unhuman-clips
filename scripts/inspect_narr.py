@@ -1,4 +1,6 @@
-import requests, json
+
+import requests
+
 r = requests.get('http://127.0.0.1:9000/jobs', timeout=10).json()
 for j in r:
     if j['id'] != '1fe173f5-dd52-4087-bd57-cd57394d31c2':

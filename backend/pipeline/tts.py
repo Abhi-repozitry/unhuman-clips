@@ -6,7 +6,7 @@ and audio validation to catch empty/truncated responses.
 from __future__ import annotations
 
 import logging
-from typing import Callable
+from collections.abc import Callable
 
 from backend.pipeline.kokoro_tts import synthesize_kokoro
 

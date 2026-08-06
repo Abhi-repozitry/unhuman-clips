@@ -5,7 +5,7 @@ commentary/narration captions at top, with key word color highlighting.
 """
 from __future__ import annotations
 
-from typing import Callable
+from collections.abc import Callable
 
 from backend.config import CAPTION_FONT
 from backend.pipeline.sanitize import sanitize_text
@@ -187,7 +187,7 @@ def generate_clip_ass(
     try:
         with open(out_path, "w", encoding="utf-8") as f:
             f.write(ass_content)
-    except IOError as e:
+    except OSError as e:
         raise RuntimeError(f"Failed to write ASS file: {e}") from e
 
     if progress_cb:
@@ -252,7 +252,7 @@ def generate_commentary_ass(
     try:
         with open(out_path, "w", encoding="utf-8") as f:
             f.write(ass_content)
-    except IOError as e:
+    except OSError as e:
         raise RuntimeError(f"Failed to write ASS file: {e}") from e
 
     if progress_cb:
