@@ -214,6 +214,36 @@ class LLMInteraction(BaseModel):
     stage_name: str = ""  # e.g., "reel_plan", "reel_plan_retry" — the pipeline stage this interaction belongs to
 
 
+class AnalyzerPhaseStatus(StrEnum):
+    """Lifecycle of a single sub-phase inside the ANALYZING stage."""
+
+    PENDING = "pending"
+    RUNNING = "running"
+    DONE = "done"
+    SKIPPED = "skipped"
+    ERROR = "error"
+
+
+class AnalyzerPhase(BaseModel):
+    """One structured sub-phase of the analyzer (identifier, OCR, story planner, ...).
+
+    Emitted by ProgressReporter.set_analyzer_phase_plan / append_analyzer_phases /
+    update_analyzer_phase so the frontend can render real progress instead of
+    parsing free-text log lines. `id` is stable and matches the analyzer's
+    internal stage_name — see analyzer.ANALYZER_PHASE_REGISTRY.
+    """
+
+    id: str
+    label: str
+    kind: Literal["llm", "python"]
+    status: AnalyzerPhaseStatus = AnalyzerPhaseStatus.PENDING
+    progress: float = 0.0
+    detail: dict | None = None
+    error: str | None = None
+    started_at: datetime | None = None
+    ended_at: datetime | None = None
+
+
 class JobStatus(StrEnum):
     QUEUED = "QUEUED"
     DOWNLOADING = "DOWNLOADING"
@@ -253,6 +283,7 @@ class VideoJob(BaseModel):
     current_stage: str | None = None
     sub_stage: str | None = None
     sub_stage_progress: float = 0.0
+    analyzer_phases: list[AnalyzerPhase] = Field(default_factory=list)
     stage_index: int = 0
     total_stages: int = 9
     logs: list[str] = Field(default_factory=list)

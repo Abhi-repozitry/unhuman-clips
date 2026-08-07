@@ -319,21 +319,23 @@ async def enrich_multimodal_signals(
         return MultimodalSignals()
 
     import backend.config as _cfg
+
+    scene_cut_at, source_duration = await asyncio.to_thread(detect_scene_cuts, source_path)
+
     if _cfg.OCR_MODE == "skip":
-        logger.info("enrich_multimodal_signals: OCR_MODE=skip, skipping scene detection and OCR entirely")
+        logger.info("enrich_multimodal_signals: OCR_MODE=skip, skipping OCR only")
         if interactions is not None:
             interactions.append(LLMInteraction(
                 timestamp=_now_timestamp(),
                 type="response",
                 role="assistant",
-                content=f"Multimodal skipped (OCR_MODE={_cfg.OCR_MODE})",
-                full_content=f"Skipped scene detection and OCR: OCR_MODE={_cfg.OCR_MODE}",
+                content=f"OCR skipped (mode={_cfg.OCR_MODE})",
+                full_content=f"Skipped OCR only: OCR_MODE={_cfg.OCR_MODE}",
                 model=VISION_MODEL,
-                stage_name="multimodal",
+                stage_name="ocr",
             ))
-        return MultimodalSignals()
+        return MultimodalSignals(scene_cut_at=scene_cut_at)
 
-    scene_cut_at, source_duration = await asyncio.to_thread(detect_scene_cuts, source_path)
     candidates = select_frame_candidates(scene_cut_at, source_duration)
     on_screen_text = await _ocr_samples(source_path, candidates, interactions)
     logger.info(

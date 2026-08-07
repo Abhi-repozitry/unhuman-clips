@@ -76,6 +76,83 @@ logger = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Analyzer phase registry — single source of truth for the structured,
+# frontend-facing breakdown of the ANALYZING stage. `id` values here MUST
+# match the `stage_name=` passed to `_call_llm` (for kind="llm" phases) or the
+# id used in the manual `reporter.update_analyzer_phase(...)` calls scattered
+# through this module (for kind="python" phases). See progress.ProgressReporter.
+# ─────────────────────────────────────────────────────────────────────────────
+
+ANALYZER_PHASE_REGISTRY: dict[str, dict[str, str]] = {
+    "semantic_blocks": {"label": "Semantic Blocks", "kind": "python"},
+    "identifier": {"label": "Content Identifier", "kind": "llm"},
+    "multimodal_ocr": {"label": "Multimodal & OCR", "kind": "python"},
+    "content_classification": {"label": "Content Classification", "kind": "python"},
+    # Story-planner branch — exactly one of these three runs per job.
+    "entity_group_planner": {"label": "Story Planner · Entity", "kind": "llm"},
+    "genre_story_planner": {"label": "Story Planner · Genre", "kind": "llm"},
+    "structure_planner": {"label": "Story Planner · Structure", "kind": "llm"},
+    # Clip selection — executor mode ranks beats to moments; legacy mode plans clips directly.
+    "moment_beat_matcher": {"label": "Clip Selection", "kind": "llm"},
+    "clip_planner": {"label": "Clip Selection", "kind": "llm"},
+    "plan_execution": {"label": "Plan Execution", "kind": "python"},
+    "completeness_critic": {"label": "Completeness QA", "kind": "llm"},
+    # Narration writer — executor mode vs legacy mode use different prompts.
+    "script_narration_writer": {"label": "Narration Writer", "kind": "llm"},
+    "narration_writer": {"label": "Narration Writer", "kind": "llm"},
+    "narration_placement": {"label": "Narration Placement", "kind": "python"},
+    "critic": {"label": "Critic Pass", "kind": "llm"},
+    "validation_finalize": {"label": "Validation & Finalize", "kind": "python"},
+}
+
+
+def _phase(*ids: str) -> list[dict[str, str]]:
+    """Look up one or more phase ids in the registry as ordered plan entries."""
+    return [{"id": i, **ANALYZER_PHASE_REGISTRY[i]} for i in ids]
+
+
+def _build_analyzer_phase_plan(
+    *,
+    entity_grouped: bool,
+    plan_mode: str,
+    fast_mode: bool = False,
+) -> list[dict[str, str]]:
+    """Return the exact ordered list of phases that WILL run for this job.
+
+    Pure and deterministic — no I/O, no reporter — so it's unit-testable on
+    its own. This is the branch decision made explicit: which planner runs
+    (entity vs genre vs legacy structure), and whether the critic pass is
+    skipped (FAST_MODE, legacy path only).
+
+    `multimodal_ocr` is always listed — whether it actually runs (vs is
+    skipped because MULTIMODAL_ENABLED is off or OCR_MODE="skip") is a
+    runtime status, not a plan-shape decision, and is reported via
+    reporter.update_analyzer_phase("multimodal_ocr", "skipped") at the point
+    that decision is made.
+    """
+    plan = _phase("semantic_blocks", "identifier", "multimodal_ocr", "content_classification")
+
+    if plan_mode == "executor":
+        planner_id = "entity_group_planner" if entity_grouped else "genre_story_planner"
+        plan += _phase(planner_id, "moment_beat_matcher", "plan_execution")
+        plan += _phase("script_narration_writer", "narration_placement")
+        plan += _phase("validation_finalize")
+        # Completeness critic is a read-only quality gate that runs AFTER
+        # finalize_edit in executor mode — not before, unlike the legacy
+        # path's critic (which revises the draft before validation). Skipped
+        # entirely (not just fast) under FAST_MODE — see _completeness_critic.
+        if not fast_mode:
+            plan += _phase("completeness_critic")
+    else:
+        plan += _phase("structure_planner", "clip_planner", "narration_writer")
+        if not fast_mode:
+            plan += _phase("critic")
+        plan += _phase("validation_finalize")
+
+    return plan
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Debug artifact dump — consolidated pipeline stage outputs per job
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1609,6 +1686,10 @@ def _run_preplanning_enrichment(
         interactions,
     )
     if not MULTIMODAL_ENABLED or not source_path:
+        if progress_cb:
+            progress_cb("Skipping multimodal enrichment (disabled)...", 10)
+        if reporter:
+            reporter.update_analyzer_phase("multimodal_ocr", "skipped", detail={"reason": "disabled"})
         return content_identity, cached_multimodal_signals
     # Invalidate stale cache: if cached signals are empty but OCR is now enabled,
     # re-run multimodal enrichment instead of returning the empty cache.
@@ -1618,10 +1699,16 @@ def _run_preplanning_enrichment(
             cached_multimodal_signals.scene_cut_at
             or cached_multimodal_signals.on_screen_text
         )
-        if has_data or OCR_MODE == "skip":
+        if has_data:
+            if progress_cb:
+                progress_cb("Using cached multimodal signals...", 10)
+            if reporter:
+                reporter.update_analyzer_phase("multimodal_ocr", "skipped", detail={"reason": "cached"})
             return content_identity, cached_multimodal_signals
     if progress_cb:
         progress_cb("Running multimodal enrichment (scene detection + OCR)...", 10)
+    if reporter:
+        reporter.update_analyzer_phase("multimodal_ocr", "running")
     # Safe asyncio execution: if an event loop is already running (e.g. from
     # FastAPI or asyncio.to_thread), use loop.run_until_complete instead of
     # asyncio.run() which would crash with "RuntimeError: event loop already running".
@@ -1629,12 +1716,25 @@ def _run_preplanning_enrichment(
         loop = asyncio.get_running_loop()
     except RuntimeError:
         loop = None
-    if loop is not None:
-        import concurrent.futures
-        with concurrent.futures.ThreadPoolExecutor() as pool:
-            result = pool.submit(asyncio.run, _run_multimodal(source_path, interactions)).result()
-    else:
-        result = asyncio.run(_run_multimodal(source_path, interactions))
+    try:
+        if loop is not None:
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                result = pool.submit(asyncio.run, _run_multimodal(source_path, interactions)).result()
+        else:
+            result = asyncio.run(_run_multimodal(source_path, interactions))
+    except Exception as e:
+        if reporter:
+            reporter.update_analyzer_phase("multimodal_ocr", "error", error=str(e)[:300])
+        raise
+    if reporter:
+        reporter.update_analyzer_phase(
+            "multimodal_ocr", "done", progress=100,
+            detail={
+                "scene_cuts": len(result.scene_cut_at or []),
+                "ocr_text_events": len(result.on_screen_text or []),
+            },
+        )
     return content_identity, result
 
 
@@ -1851,42 +1951,51 @@ def _call_llm(
     model = OPENCODE_MODEL
 
     logger.info(f"Calling LLM ({stage_name}) provider={AI_PROVIDER} model={model}")
+    if reporter:
+        reporter.update_analyzer_phase(stage_name, "running")
     from backend.providers.llm import call_llm
-    raw_content = call_llm(
-        messages=messages,
-        model=model,
-        api_key=OPENCODE_API_KEY or "",
-        base_url=OPENCODE_BASE_URL,
-        temperature=0.1,
-        max_tokens=max_tokens,
-        timeout=480.0,
-        reporter=reporter,
-        interactions=interactions,
-        stage_name=stage_name,
-        reasoning_effort=reasoning_effort,
-    )
-
-    if reporter and interactions is not None:
-        reporter.set_stage_data_key(
-            "llm_interactions", [i.model_dump() for i in interactions]
-        )
     try:
-        from backend.config import WORKING_DIR
-        debug_path = WORKING_DIR / f"llm_debug_{stage_name}_{int(time.time())}.txt"
-        debug_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(debug_path, "w", encoding="utf-8") as f:
-            f.write(raw_content)
-    except Exception as log_e:
-        logger.warning(f"Failed to write LLM debug log: {log_e}")
-
-    if not _response_has_json(raw_content):
-        preview = raw_content[:300] if raw_content else "<empty>"
-        logger.warning(
-            f"LLM returned no JSON ({stage_name}) provider={AI_PROVIDER} model={model} "
-            f"len={len(raw_content)} preview={preview}"
+        raw_content = call_llm(
+            messages=messages,
+            model=model,
+            api_key=OPENCODE_API_KEY or "",
+            base_url=OPENCODE_BASE_URL,
+            temperature=0.1,
+            max_tokens=max_tokens,
+            timeout=480.0,
+            reporter=reporter,
+            interactions=interactions,
+            stage_name=stage_name,
+            reasoning_effort=reasoning_effort,
         )
-        raise ValueError(f"No JSON object in LLM response (len={len(raw_content)})")
 
+        if reporter and interactions is not None:
+            reporter.set_stage_data_key(
+                "llm_interactions", [i.model_dump() for i in interactions]
+            )
+        try:
+            from backend.config import WORKING_DIR
+            debug_path = WORKING_DIR / f"llm_debug_{stage_name}_{int(time.time())}.txt"
+            debug_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(debug_path, "w", encoding="utf-8") as f:
+                f.write(raw_content)
+        except Exception as log_e:
+            logger.warning(f"Failed to write LLM debug log: {log_e}")
+
+        if not _response_has_json(raw_content):
+            preview = raw_content[:300] if raw_content else "<empty>"
+            logger.warning(
+                f"LLM returned no JSON ({stage_name}) provider={AI_PROVIDER} model={model} "
+                f"len={len(raw_content)} preview={preview}"
+            )
+            raise ValueError(f"No JSON object in LLM response (len={len(raw_content)})")
+    except Exception as e:
+        if reporter:
+            reporter.update_analyzer_phase(stage_name, "error", error=str(e)[:300])
+        raise
+
+    if reporter:
+        reporter.update_analyzer_phase(stage_name, "done", progress=100)
     return raw_content.strip()
 
 
@@ -3037,6 +3146,14 @@ def select_reel_plan(
 ) -> ReelPlan:
     if progress_cb:
         progress_cb("Building semantic blocks...", 5)
+    if reporter:
+        # Announce the fixed prefix immediately — the branch-specific tail
+        # (story planner / clip selection / narration writer / ...) is
+        # appended once entity_grouped and PLAN_MODE are known, below.
+        reporter.set_analyzer_phase_plan(
+            _phase("semantic_blocks", "identifier", "multimodal_ocr", "content_classification")
+        )
+        reporter.update_analyzer_phase("semantic_blocks", "running")
 
     if not transcript:
         raise RuntimeError("Transcript is empty; cannot build reel plan.")
@@ -3062,6 +3179,11 @@ def select_reel_plan(
     # ── Python: semantic blocks + importance ──
     blocks = _build_semantic_blocks(rich_timeline, transcript)
     blocks_text = _format_blocks_for_llm(blocks)
+    if reporter:
+        reporter.update_analyzer_phase(
+            "semantic_blocks", "done", progress=100,
+            detail={"block_count": len(blocks)},
+        )
 
     # ── LLM #0 Identifier — semantic guidance only ──
     if progress_cb:
@@ -3081,6 +3203,8 @@ def select_reel_plan(
     # ── Python: content type detection (hardcoded, committed early) ──
     if progress_cb:
         progress_cb("Detecting content type...", 8)
+    if reporter:
+        reporter.update_analyzer_phase("content_classification", "running")
     content_type = detect_content_type(
         video_title,
         video_description,
@@ -3092,6 +3216,23 @@ def select_reel_plan(
     entity_segments, entity_grouped = _segment_entities(
         blocks, rich_timeline, multimodal_signals, content_identity, source_duration
     )
+
+    if reporter:
+        from backend.config import FAST_MODE, PLAN_MODE
+        reporter.update_analyzer_phase(
+            "content_classification", "done", progress=100,
+            detail={
+                "content_type": content_type,
+                "entity_grouped": entity_grouped,
+                "entity_segment_count": len(entity_segments),
+            },
+        )
+        # Branch is now known — announce the rest of the roadmap (the fixed
+        # prefix was already announced at the top of this function).
+        full_plan = _build_analyzer_phase_plan(
+            entity_grouped=entity_grouped, plan_mode=PLAN_MODE, fast_mode=FAST_MODE,
+        )
+        reporter.append_analyzer_phases(full_plan[4:])  # skip the already-announced prefix
 
     # Augment blocks_text with on-screen text (OCR) if available — helps
     # genre planner identify structured content (rounds, scores, names).
@@ -3361,7 +3502,19 @@ def select_reel_plan(
 
     if progress_cb:
         progress_cb("Validating plan...", 90)
-    reel_plan = finalize_edit(draft, source_duration, min_groups=min_groups, content_type=content_type)
+    if reporter:
+        reporter.update_analyzer_phase("validation_finalize", "running")
+    try:
+        reel_plan = finalize_edit(draft, source_duration, min_groups=min_groups, content_type=content_type)
+    except Exception as e:
+        if reporter:
+            reporter.update_analyzer_phase("validation_finalize", "error", error=str(e)[:300])
+        raise
+    if reporter:
+        reporter.update_analyzer_phase(
+            "validation_finalize", "done", progress=100,
+            detail={"groups": len(reel_plan.reel_groups)},
+        )
 
     if progress_cb:
         progress_cb(f"Built reel plan with {len(reel_plan.reel_groups)} group(s)", 100)
@@ -3691,6 +3844,8 @@ def _select_reel_plan_executor(
     # ── Python: execute the plan into concrete clips ──
     if progress_cb:
         progress_cb("Executing plan (Python)...", 45)
+    if reporter:
+        reporter.update_analyzer_phase("plan_execution", "running")
     groups = execute_plan(
         plan, blocks, source_duration, reel_dur_min, reel_dur_max, relevance,
         content_type=content_type,
@@ -3714,6 +3869,11 @@ def _select_reel_plan_executor(
     )
     logger.info(f"POST QA: {len(groups)} groups survived QA checks")
     post_qa_groups = [g.copy() for g in groups]
+    if reporter:
+        reporter.update_analyzer_phase(
+            "plan_execution", "done", progress=100,
+            detail={"groups": len(groups)},
+        )
 
     # ── LLM #2 Narration Writer (text only — Python owns numbers) ──
     if progress_cb:
@@ -3768,8 +3928,16 @@ def _select_reel_plan_executor(
     # ── Python: place narration from the final clip layout ──
     if progress_cb:
         progress_cb("Placing narration (Python)...", 80)
+    if reporter:
+        reporter.update_analyzer_phase("narration_placement", "running")
     for g in groups:
         g["narration_events"] = place_narration_events(g)
+    if reporter:
+        total_events = sum(len(g.get("narration_events", [])) for g in groups)
+        reporter.update_analyzer_phase(
+            "narration_placement", "done", progress=100,
+            detail={"narration_events": total_events},
+        )
 
     draft = {
         "structure_analysis": sa,
@@ -3791,11 +3959,23 @@ def _select_reel_plan_executor(
     # ── Python validator owns final numbers ──
     if progress_cb:
         progress_cb("Validating plan...", 90)
+    if reporter:
+        reporter.update_analyzer_phase("validation_finalize", "running")
     # Entity content: no floor enforcement — low-quality entities intentionally dropped
     effective_min_groups = 1 if entity_grouped else min_groups
-    reel_plan = finalize_edit(
-        draft, source_duration, min_groups=effective_min_groups, preserve_layout=True, content_type=content_type
-    )
+    try:
+        reel_plan = finalize_edit(
+            draft, source_duration, min_groups=effective_min_groups, preserve_layout=True, content_type=content_type
+        )
+    except Exception as e:
+        if reporter:
+            reporter.update_analyzer_phase("validation_finalize", "error", error=str(e)[:300])
+        raise
+    if reporter:
+        reporter.update_analyzer_phase(
+            "validation_finalize", "done", progress=100,
+            detail={"groups": len(reel_plan.reel_groups)},
+        )
 
     # ── LLM completeness critic (read-only quality gate) ──
     critic_groups_for_llm = [g.model_dump() for g in reel_plan.reel_groups]

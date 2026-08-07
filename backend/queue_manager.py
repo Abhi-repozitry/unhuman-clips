@@ -13,7 +13,7 @@ from collections.abc import Callable
 from datetime import UTC
 from typing import Any
 
-from backend.config import GPU_SEMAPHORE_SIZE, get_job_working_dir
+from backend.config import GPU_SEMAPHORE_SIZE, cleanup_job_files, get_job_working_dir
 from backend.models import HookMode, JobStatus, LLMInteraction, MultimodalSignals, OutputReel, ReelPlan, SourceMetadata, VideoJob
 from backend.pipeline.analyzer import select_reel_plan
 from backend.pipeline.checkpoint import PipelineCheckpoint
@@ -94,14 +94,18 @@ class QueueManager:
         return sorted(self.jobs.values(), key=lambda j: j.created_at)
 
     def delete_job(self, job_id: str) -> bool:
-        """Delete a job by ID. Returns True if found and removed, False otherwise."""
+        """Delete a job by ID and clean up its files. Returns True if found and removed."""
         if job_id in self.jobs:
             del self.jobs[job_id]
+            try:
+                cleanup_job_files(job_id)
+            except Exception as e:
+                logger.warning("File cleanup failed for deleted job %s: %s", job_id, e)
             return True
         return False
 
     def cleanup_old_jobs(self, max_age_hours: float = 24.0) -> int:
-        """Remove completed/error jobs older than max_age_hours. Returns count removed."""
+        """Remove completed/error jobs older than max_age_hours and clean up their files. Returns count removed."""
         from datetime import datetime, timedelta
         cutoff = datetime.now(UTC) - timedelta(hours=max_age_hours)
         to_remove = []
@@ -110,6 +114,10 @@ class QueueManager:
                 to_remove.append(job_id)
         for job_id in to_remove:
             del self.jobs[job_id]
+            try:
+                cleanup_job_files(job_id)
+            except Exception as e:
+                logger.warning("File cleanup failed for old job %s: %s", job_id, e)
         return len(to_remove)
 
     async def broadcast_drain_loop(self, broadcast_fn: Callable[[VideoJob], Any]) -> None:
@@ -148,6 +156,11 @@ class QueueManager:
                 job.status = JobStatus.ERROR
                 job.error = str(e)
                 self.enqueue_broadcast(job)
+                # Cleanup on error too
+                try:
+                    cleanup_job_files(job.id)
+                except Exception as cleanup_err:
+                    logger.warning("Error cleanup failed for %s: %s", job.id, cleanup_err)
             finally:
                 self.queue.task_done()
 
@@ -503,3 +516,9 @@ class QueueManager:
         reporter.update_stage(JobStatus.DONE, "All groups complete!", 100, 9)
         reporter.log_info(f"Job {job.id} complete with {job.num_output_groups} output(s)")
         self.enqueue_broadcast(job)
+
+        # Auto-cleanup: remove working dir and temp files after successful completion
+        try:
+            cleanup_job_files(job.id)
+        except Exception as e:
+            logger.warning("Post-job cleanup failed for %s: %s", job.id, e)

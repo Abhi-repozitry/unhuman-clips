@@ -12,7 +12,7 @@ from collections.abc import Callable
 from datetime import datetime
 from typing import Any
 
-from backend.models import VideoJob
+from backend.models import AnalyzerPhase, AnalyzerPhaseStatus, VideoJob
 
 __all__ = ["ProgressReporter"]
 
@@ -49,6 +49,65 @@ class ProgressReporter:
         with self._lock:
             self.job.sub_stage = sub_stage
             self.job.sub_stage_progress = progress
+        self._broadcast()
+
+    def set_analyzer_phase_plan(self, phases: list[dict[str, Any]]) -> None:
+        """Replace the analyzer phase list with a fresh, ordered, all-pending plan.
+
+        Call once the set of phases that will run is known (e.g. the fixed
+        prefix at the start of ANALYZING, or again once branch/entity_grouped
+        is resolved and the rest of the roadmap is known). Each dict needs
+        at minimum {"id", "label", "kind"} — see analyzer.ANALYZER_PHASE_REGISTRY.
+        """
+        with self._lock:
+            self.job.analyzer_phases = [
+                AnalyzerPhase(id=p["id"], label=p["label"], kind=p["kind"])
+                for p in phases
+            ]
+        self._broadcast()
+
+    def append_analyzer_phases(self, phases: list[dict[str, Any]]) -> None:
+        """Append additional pending phases once a branch decision extends the plan."""
+        with self._lock:
+            existing_ids = {p.id for p in self.job.analyzer_phases}
+            for p in phases:
+                if p["id"] in existing_ids:
+                    continue
+                self.job.analyzer_phases.append(
+                    AnalyzerPhase(id=p["id"], label=p["label"], kind=p["kind"])
+                )
+        self._broadcast()
+
+    def update_analyzer_phase(
+        self,
+        phase_id: str,
+        status: str,
+        progress: float = 0.0,
+        detail: dict[str, Any] | None = None,
+        error: str | None = None,
+    ) -> None:
+        """Update one analyzer phase by id (running/done/skipped/error) and broadcast.
+
+        Defensive: if the phase wasn't in the plan (drift between the registry
+        and what actually ran), it's appended rather than silently dropped —
+        the UI should never show progress for a phase it never announced.
+        """
+        with self._lock:
+            phase = next((p for p in self.job.analyzer_phases if p.id == phase_id), None)
+            if phase is None:
+                phase = AnalyzerPhase(id=phase_id, label=phase_id.replace("_", " ").title(), kind="python")
+                self.job.analyzer_phases.append(phase)
+            phase.status = AnalyzerPhaseStatus(status)
+            phase.progress = progress
+            if detail is not None:
+                phase.detail = detail
+            if error is not None:
+                phase.error = error
+            now = datetime.now()
+            if phase.status == AnalyzerPhaseStatus.RUNNING and phase.started_at is None:
+                phase.started_at = now
+            if phase.status in (AnalyzerPhaseStatus.DONE, AnalyzerPhaseStatus.SKIPPED, AnalyzerPhaseStatus.ERROR):
+                phase.ended_at = now
         self._broadcast()
 
     def log(self, message: str, level: str = "info") -> None:

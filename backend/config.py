@@ -48,6 +48,7 @@ __all__ = [
     "WHISPER_COMPUTE_TYPE_CUDA",
     "WHISPER_MODEL_SIZE",
     "WORKING_DIR",
+    "cleanup_job_files",
     "get_job_working_dir",
     "validate_config",
 ]
@@ -73,6 +74,35 @@ def get_job_working_dir(job_id: str) -> Path:
     path = WORKING_DIR / job_id
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def cleanup_job_files(job_id: str) -> None:
+    """Remove all temporary files for a job: working dir, clips, and LLM debug logs."""
+    import shutil
+
+    # 1. Remove the job's working directory (checkpoints, intermediate files, downloads)
+    job_work_dir = WORKING_DIR / job_id
+    if job_work_dir.exists():
+        try:
+            shutil.rmtree(job_work_dir)
+            logger.info("Cleaned up working dir: %s", job_work_dir)
+        except Exception as e:
+            logger.warning("Failed to clean working dir %s: %s", job_work_dir, e)
+
+    # 2. Remove clip files for this job
+    for clip_path in CLIPS_DIR.glob(f"{job_id}_*.mp4"):
+        try:
+            clip_path.unlink()
+            logger.info("Cleaned up clip: %s", clip_path)
+        except Exception as e:
+            logger.warning("Failed to clean clip %s: %s", clip_path, e)
+
+    # 3. Remove LLM debug logs from WORKING_DIR root
+    for debug_file in WORKING_DIR.glob("llm_debug_*.txt"):
+        try:
+            debug_file.unlink()
+        except Exception:
+            pass
 
 
 WHISPER_MODEL_SIZE = os.environ.get("WHISPER_MODEL_SIZE", "large-v3-turbo")
