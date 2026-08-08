@@ -126,7 +126,7 @@ CLIP_DURATION_SOFT_MIN = float(os.environ.get("CLIP_DURATION_SOFT_MIN", "6"))
 CLIP_DURATION_SOFT_MAX = float(os.environ.get("CLIP_DURATION_SOFT_MAX", "30"))
 HOOK_SECONDS = float(os.environ.get("HOOK_SECONDS", "3"))
 INSIGHT_SECONDS_MAX = float(os.environ.get("INSIGHT_SECONDS_MAX", "4"))
-MIN_OUTPUT_DURATION = int(os.environ.get("MIN_OUTPUT_DURATION", "80"))
+MIN_OUTPUT_DURATION = int(os.environ.get("MIN_OUTPUT_DURATION", "90"))
 MAX_OUTPUT_DURATION = int(os.environ.get("MAX_OUTPUT_DURATION", "100"))
 # Entity-mode reel minimum: distinct from global MIN_OUTPUT_DURATION.
 # A candidate with Ns of usable content should produce ~N*1.3s, not be
@@ -154,7 +154,7 @@ VAD_THRESHOLD = float(os.environ.get("VAD_THRESHOLD", "0.5"))
 VAD_PRE_BUFFER_SECONDS = float(os.environ.get("VAD_PRE_BUFFER_SECONDS", "0.4"))
 VAD_POST_BUFFER_SECONDS = float(os.environ.get("VAD_POST_BUFFER_SECONDS", "0.25"))
 VAD_SCURVE_RAMP_SECONDS = float(os.environ.get("VAD_SCURVE_RAMP_SECONDS", "0.15"))
-VAD_DUCKING_DEPTH = float(os.environ.get("VAD_DUCKING_DEPTH", "0.97"))
+VAD_DUCKING_DEPTH = float(os.environ.get("VAD_DUCKING_DEPTH", "0.85"))
 VAD_SILENCE_THRESHOLD = float(os.environ.get("VAD_SILENCE_THRESHOLD", "0.3"))
 
 # Audio mixing constants — narration must be LOUD to be clearly audible over background

@@ -69,6 +69,31 @@ def _resample(audio_arr: np.ndarray, src_sr: int, dst_sr: int) -> np.ndarray:
     return resampler(wav).squeeze().numpy()
 
 
+def _sanitize_tts_text(text: str) -> str:
+    """Clean text for TTS to avoid phonemizer warnings.
+
+    Replaces or removes characters that confuse the phonemizer: special
+    unicode, excessive punctuation, abbreviations with periods, etc.
+    """
+    import re
+
+    cleaned = text.strip()
+
+    cleaned = cleaned.replace("…", "...")
+    cleaned = cleaned.replace(""", '"').replace(""", '"')
+    cleaned = cleaned.replace("'", "'").replace("'", "'")
+    cleaned = cleaned.replace("\u2013", "-").replace("\u2014", "-")
+    cleaned = cleaned.replace("\u202f", " ").replace("\u00a0", " ")
+
+    cleaned = re.sub(r"\.{2,}", ".", cleaned)
+
+    cleaned = re.sub(r"([!?]){2,}", r"\1", cleaned)
+
+    cleaned = re.sub(r"\s+", " ", cleaned)
+
+    return cleaned.strip()
+
+
 def synthesize_kokoro(
     text: str,
     out_path: str,
@@ -82,6 +107,10 @@ def synthesize_kokoro(
     """
     if not text or not text.strip():
         raise RuntimeError("synthesize_kokoro called with empty text")
+
+    text = _sanitize_tts_text(text)
+    if not text:
+        raise RuntimeError("sanitize_tts_text produced empty output")
 
     if progress_cb:
         progress_cb("Loading English TTS model...", 5)

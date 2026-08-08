@@ -270,7 +270,7 @@ GENRE_GENERAL          = "general"           # Fallback — no strong signal
 # Identifier corroboration is deliberately small: Python's keyword and block
 # signals still determine the genre, but an agreeing Identifier can lift a
 # borderline, otherwise-supported genre over the commitment threshold.
-IDENTIFIER_GENRE_BONUS = 1.0
+IDENTIFIER_GENRE_BONUS = 5.0
 
 # ── Genre Registry ──────────────────────────────────────────────────────────
 # Each entry defines: keywords, which block flag boosts the score, and the
@@ -713,6 +713,22 @@ _ENTITY_NAME_STOP_WORDS = {
     "a", "an", "and", "challenge", "contestant", "episode", "follow", "for",
     "finally", "he", "i", "like", "my", "round", "she", "subscribe", "the",
     "then", "they", "this", "we", "winner", "youtube",
+    # Whisper filler words — capitalized at sentence starts, not real entities
+    "oh", "you", "yes", "no", "well", "whoa", "who", "what", "how", "why",
+    "so", "right", "okay", "ok", "hey", "hi", "hello", "wow", "ah", "um",
+    "yeah", "nah", "sure", "really", "just", "now", "here", "there",
+    "that", "this", "those", "these", "will", "we're", "you're", "they're",
+    "he's", "she's", "it's", "i'm", "can't", "don't", "won't", "let's",
+    "going", "come", "look", "got", "get", "go", "see", "know", "think",
+    # Additional Whisper artifacts — common words misidentified as entity names
+    "ai", "to", "was", "you'll", "we'll", "they'll", "he'll", "she'll",
+    "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
+    "first", "last", "next", "back", "new", "old", "big", "little",
+    "every", "each", "all", "some", "many", "much", "very",
+    "still", "even", "also", "too", "only", "just", "already",
+    "thing", "things", "way", "time", "day", "man", "guy",
+    "okay", "alright", "oh", "ah", "wow", "ooh", "ugh",
+    "yeah", "yep", "nope", "nah", "uh", "hm", "hmm",
 }
 _TITLE_CASE_NAME = re.compile(r"\b[A-Z][A-Za-z'\-]*(?:\s+[A-Z][A-Za-z'\-]*){0,2}\b")
 
@@ -935,7 +951,8 @@ def _segment_entities(
         # Podcasts/interviews produce many speaker-change segments without
         # distinct names — they should use the genre planner, not entity mode.
         named_segments = [s for s in qualifying_segments if s.entity_name]
-        if len(named_segments) >= 3:
+        distinct_names = {s.entity_name for s in named_segments}
+        if len(distinct_names) >= 3:
             entity_grouped = True
     logger.info(
         "ENTITY SEGMENTATION: %d segments (%d qualifying), grouped=%s",
@@ -944,69 +961,72 @@ def _segment_entities(
     return entity_segments, entity_grouped
 
 
-def _cap_entity_segments(
+def _score_entity_segment(
+    segment: EntitySegment,
+    blocks: list,
+) -> float:
+    """Score an entity segment for reel-worthiness.
+
+    Higher score = better standalone reel subject. Considers duration,
+    evidence quality, named identity, and content richness.
+    """
+    score = 0.0
+
+    duration = segment.end - segment.start
+    score += duration * 2.0
+
+    evidence_set = set(segment.evidence)
+    if "speaker_id" in evidence_set:
+        score += 30.0
+    if "ocr" in evidence_set or "identifier_transcript" in evidence_set:
+        score += 20.0
+    if "transcript_name" in evidence_set:
+        score += 10.0
+    if evidence_set == {"scene_cut"}:
+        score -= 15.0
+
+    if segment.entity_name:
+        score += 25.0
+
+    segment_blocks = [b for b in blocks if b.block_id in segment.block_ids]
+    if segment_blocks:
+        avg_importance = sum(getattr(b, "importance", 0) for b in segment_blocks) / len(segment_blocks)
+        score += avg_importance * 10.0
+        word_density = sum(getattr(b, "word_density", 0) for b in segment_blocks) / len(segment_blocks)
+        score += word_density * 20.0
+
+    return score
+
+
+def _select_top_entity_segments(
     segments: list[EntitySegment],
     max_count: int,
     blocks: list,
 ) -> list[EntitySegment]:
-    """Merge shortest adjacent segments until under max_count.
+    """Select the top N entity segments by reel-worthiness score.
 
-    Priority: merge scene_cut-only segments first (lowest quality evidence),
-    then merge shortest-duration segments. Always merges adjacent segments
-    to preserve temporal continuity.
+    Unlike the old merge-based approach, this preserves each selected
+    segment's narrative integrity — no hybrid multi-entity units.
     """
     if len(segments) <= max_count:
         return segments
 
-    # Sort by duration ascending — shortest first to merge
-    segs = list(segments)
-    while len(segs) > max_count:
-        # Find the best adjacent pair to merge: prefer scene_cut-only, then shortest
-        best_idx = -1
-        best_score = float("inf")
-        for i in range(len(segs) - 1):
-            a, b = segs[i], segs[i + 1]
-            # Score: lower is better. Scene_cut-only gets a big bonus (merged first)
-            a_scene_only = a.evidence == ["scene_cut"]
-            b_scene_only = b.evidence == ["scene_cut"]
-            score = (a.end - a.start) + (b.end - b.start)
-            if a_scene_only and b_scene_only:
-                score -= 1000  # strong preference
-            elif a_scene_only or b_scene_only:
-                score -= 500
-            if score < best_score:
-                best_score = score
-                best_idx = i
+    scored = [
+        (seg, _score_entity_segment(seg, blocks))
+        for seg in segments
+    ]
+    scored.sort(key=lambda x: -x[1])
 
-        if best_idx < 0:
-            break
+    selected = [s for s, _ in scored[:max_count]]
+    selected.sort(key=lambda s: s.start)
 
-        # Merge segs[best_idx] and segs[best_idx + 1]
-        a, b = segs[best_idx], segs[best_idx + 1]
-        merged_ids = list(dict.fromkeys(a.block_ids + b.block_ids))  # dedupe, preserve order
-        merged_speakers = sorted(set(a.speaker_ids) | set(b.speaker_ids))
-        merged_evidence = sorted(set(a.evidence) | set(b.evidence))
-        merged_name = a.entity_name or b.entity_name
+    removed = len(segments) - len(selected)
+    logger.info(
+        f"Entity segment selection: {len(segments)} → {len(selected)} segments "
+        f"(removed {removed} lowest-scored, kept top {max_count} by content quality)"
+    )
 
-        # Reassign block entity_segment_ids
-        merged_id = a.entity_segment_id
-        for block in blocks:
-            if block.entity_segment_id == b.entity_segment_id:
-                block.entity_segment_id = merged_id
-
-        merged = EntitySegment(
-            entity_segment_id=merged_id,
-            entity_name=merged_name,
-            start=a.start,
-            end=b.end,
-            block_ids=merged_ids,
-            speaker_ids=merged_speakers,
-            evidence=merged_evidence,
-        )
-        segs[best_idx] = merged
-        segs.pop(best_idx + 1)
-
-    # Reassign sequential IDs
+    segs = selected
     for i, seg in enumerate(segs):
         new_id = f"entity-{i + 1}"
         if seg.entity_segment_id != new_id:
@@ -1015,7 +1035,6 @@ def _cap_entity_segments(
                     block.entity_segment_id = new_id
             seg.entity_segment_id = new_id
 
-    logger.info(f"Entity segment cap: merged {len(segments)} → {len(segs)} segments")
     return segs
 
 
@@ -1401,6 +1420,19 @@ def _build_semantic_blocks(
             has_question, has_exclamation, has_emphasis,
             has_curiosity_gap, has_pattern_interrupt, has_social_proof, has_viral_trigger,
         )
+        # Post-importance adjustment: penalize verbose commentary with no engagement flags.
+        # High word density (>2.0 wps) means lots of talking — if none of it has
+        # engagement flags (question/exclamation) or retention flags (stakes/viral/etc),
+        # it's likely filler commentary that shouldn't score as high-importance content.
+        has_any_flag = any((
+            has_question, has_exclamation, has_emphasis,
+            has_vulgarity, has_dating, has_roast, has_stakes,
+            has_curiosity_gap, has_pattern_interrupt, has_social_proof, has_viral_trigger,
+        ))
+        if not has_any_flag and avg_word_density > 2.0:
+            importance = max(0.0, importance - 15.0)
+        elif not has_any_flag and avg_word_density > 1.5:
+            importance = max(0.0, importance - 8.0)
         blocks.append(SemanticBlock(
             block_id=len(blocks),
             start=start,
@@ -1533,7 +1565,6 @@ OUTPUT -- STRICT JSON ONLY
   "detected_genre": "one allowed genre",
   "structure": "single_narrative|multi_entity",
   "entity_names": ["named person or act"],
-  "hook_recommendation": "hook|skip",
   "planning_notes": "2-4 sentence strategy"
 }}"""
 
@@ -1685,7 +1716,8 @@ def _run_preplanning_enrichment(
         reporter,
         interactions,
     )
-    if not MULTIMODAL_ENABLED or not source_path:
+    from backend.config import OCR_MODE as _OCR_MODE
+    if not MULTIMODAL_ENABLED or not source_path or _OCR_MODE == "skip":
         if progress_cb:
             progress_cb("Skipping multimodal enrichment (disabled)...", 10)
         if reporter:
@@ -1777,6 +1809,7 @@ def _score_clip_as_hook(
     - Shorter duration (fast hooks)
     - Position not at the very start (curiosity gap)
     - Retention signals: curiosity_gap, viral_trigger, pattern_interrupt
+    - Content substance: penalize clips with very few words (fluff)
     """
     clip_start = clip.get("source_start", 0.0)
     clip_end = clip.get("source_end", 0.0)
@@ -1804,6 +1837,16 @@ def _score_clip_as_hook(
     avg_imp = sum(b.importance for b in blocks_in_clip) / len(blocks_in_clip)
     score += avg_imp * 0.25  # 0-25 points
 
+    # Content substance penalty: clips with very few total words are likely
+    # fluff (exclamations, reactions) not meaningful intros.
+    total_words = sum(len(b.text.split()) for b in blocks_in_clip)
+    words_per_second = total_words / max(clip_duration, 0.1)
+    if words_per_second < 1.0:
+        # Very low word density = fluff (shouting, reactions, filler)
+        score -= 15.0
+    elif words_per_second < 1.5:
+        score -= 5.0
+
     # Shorter clips make better hooks (faster payoff)
     if clip_duration <= 5.0:
         score += 15.0
@@ -1828,7 +1871,7 @@ def _score_clip_as_hook(
     if any(b.has_pattern_interrupt for b in blocks_in_clip):
         score += 8.0   # pattern interrupt = stops scrolling
 
-    return min(100.0, score)
+    return max(0.0, min(100.0, score))
 
 
 def _rank_hook_candidates(
@@ -2140,21 +2183,21 @@ def _compute_group_count_ceiling(source_duration_seconds: float) -> int:
 
     Duration-based ceilings:
     - <6 min    → 1 group (single Short)
-    - 7-10 min  → 2 groups max
-    - 11-25 min → 6 groups max
-    - 26-35 min → 8 groups max
-    - >35 min   → 10 groups max
+    - 6-20 min  → 7 groups max
+    - 21-30 min → 9 groups max
+    - 31-47 min → 12 groups max
+    - >47 min   → 15 groups max
     """
     minutes = source_duration_seconds / 60.0
     if minutes < 6:
         return 1
-    if minutes <= 10:
-        return 2
-    if minutes <= 25:
-        return 6
-    if minutes <= 35:
-        return 8
-    return 10
+    if minutes <= 20:
+        return 7
+    if minutes <= 30:
+        return 9
+    if minutes <= 47:
+        return 12
+    return 15
 
 
 def _compute_group_count_floor(source_duration_seconds: float) -> int:
@@ -2162,21 +2205,21 @@ def _compute_group_count_floor(source_duration_seconds: float) -> int:
 
     Duration-based floors:
     - <6 min    → 1 group
-    - 6-10 min  → 1 group
-    - 11-25 min → 3 groups
-    - 26-35 min → 4 groups
-    - >35 min   → 5 groups
+    - 6-20 min  → 4 groups
+    - 21-30 min → 5 groups
+    - 31-47 min → 6 groups
+    - >47 min   → 7 groups
     """
     minutes = source_duration_seconds / 60.0
     if minutes < 6:
         return 1
-    if minutes <= 10:
-        return 1
-    if minutes <= 25:
-        return 3
-    if minutes <= 35:
+    if minutes <= 20:
         return 4
-    return 5
+    if minutes <= 30:
+        return 5
+    if minutes <= 47:
+        return 6
+    return 7
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2191,43 +2234,46 @@ def _compute_group_count_floor(source_duration_seconds: float) -> int:
 
 _GENRE_PLANNING_RULES: dict[str, str] = {
     GENRE_GAME_CHALLENGE: """CONTENT-SPECIFIC RULES (game/challenge):
-- Hook MUST be a STAKES or INTERRUPT moment. The prize reveal, the wildest near-miss, or the dramatic start.
-  NEVER an intro/greeting. If someone says the prize amount or the rules, that's your hook.
+- Start MUST be a STAKES or INTERRUPT moment. The prize reveal, the wildest near-miss, or the dramatic start.
+  NEVER an intro/greeting. If someone says the prize amount or the rules, that's your opening.
+  SKIP past any "welcome back", "today we're doing", or channel plugs — find the first REAL action moment.
 - Escalation: build through near-misses, competitor reactions, mounting pressure. Each beat should feel harder than the last.
 - Payoff MUST be the actual winner reveal, elimination announcement, or stunt result. The payoff is the chronologically latest strong moment — not a reaction from earlier.
 - NEVER combine two separate game rounds into one unit unless they share a single winner reveal.
-- Prioritize blocks with STAKES flags for both hook AND payoff selections.
-- If a challenge has multiple elimination rounds, each MAJOR elimination can be its own unit.""",
+- Prioritize blocks with STAKES flags for both start AND payoff selections.
+- If a challenge has multiple elimination rounds, each MAJOR elimination can be its own unit.
+- Each unit MUST contain blocks with SUBSTANCE (sentences, descriptions, commentary) — not just short exclamations like "Come on!" or "Oh!".
+  Check the block text: if most blocks are under 5 words, the unit needs different content.""",
 
     GENRE_DATING_REALITY: """CONTENT-SPECIFIC RULES (dating/reality):
-- Hook MUST be the most awkward, charged, or surprising moment. Someone says something shocking, a reaction shot before context, a flirtatious callout, a blunt rejection.
+- Start MUST be the most awkward, charged, or surprising moment. Someone says something shocking, a reaction shot before context, a flirtatious callout, a blunt rejection.
   NEVER an introduction or someone saying their name/age.
 - Escalation: build through flirtation, tension, or confrontation. If someone gets roasted, escalate through the roast.
 - Payoff MUST be the strongest emotional reaction: rejection, acceptance, embarrassed laugh, definitive punchline.
-- DATING and ROAST flags mark the best hook AND payoff candidates.
-- HOT clips (VULGAR/DATING flags) should anchor hook position.
+- DATING and ROAST flags mark the best start AND payoff candidates.
+- HOT clips (VULGAR/DATING flags) should anchor the opening position.
 - If the same couple/interaction spans multiple scenes, that's ONE unit. Different interactions = different units.""",
 
     GENRE_ROAST_REACTION: """CONTENT-SPECIFIC RULES (roast/reaction):
-- Hook MUST be the moment that demands a reaction: shocking claim, brutal opener, or a reaction shot before you see what caused it.
+- Start MUST be the moment that demands a reaction: shocking claim, brutal opener, or a reaction shot before you see what caused it.
 - Escalation: increasingly savage comments, mounting reactions, or growing embarrassment. Each clip more intense than the last.
 - Payoff MUST be the hardest punchline, the most brutal callout, or the most shocked reaction. The mic-drop moment, not the setup.
-- ROAST and VULGAR flags = best candidates for hook and payoff.
+- ROAST and VULGAR flags = best candidates for start and payoff.
 - NEVER end on a setup. The viewer must see the REACTION or COMEBACK.
-- Rating/review content: hook = the most controversial rating; payoff = creator's response or most extreme rating reveal.""",
+- Rating/review content: start = the most controversial rating; payoff = creator's response or most extreme rating reveal.""",
 
     GENRE_PODCAST: """CONTENT-SPECIFIC RULES (podcast/interview):
-- Hook MUST be the most provocative or surprising claim. Something that demands context. "I lost everything" or "That's when I realized no one cared."
+- Start MUST be the most provocative or surprising claim. Something that demands context. "I lost everything" or "That's when I realized no one cared."
   NEVER small talk, introductions, or topic transitions.
 - Escalation: the story's context, mounting details, the tension of not yet knowing the resolution.
 - Payoff: the insight, the surprising reveal, the "I never knew that" or "oh wow" moment.
 - Units should be TOPICALLY unified: one unit = one major story or insight thread.
-- Prioritize high word-density blocks (fast-talking, emphatic speech) for hooks.
-- Questions (Q flag) are strong hook candidates — they create the curiosity gap.""",
+- Prioritize high word-density blocks (fast-talking, emphatic speech) for openings.
+- Questions (Q flag) are strong opening candidates — they create the curiosity gap.""",
 
     GENRE_VLOG_PERSONAL: """CONTENT-SPECIFIC RULES (vlog/personal story):
-- Hook MUST be the PEAK EMOTIONAL MOMENT or the most visually dramatic beat — the big reveal, the meeting, the surprise, the "finally" moment.
-  NEVER the travel footage, walking around, or "hey guys welcome back." The hook should make someone think "I need to see how this happened."
+- Start MUST be the PEAK EMOTIONAL MOMENT or the most visually dramatic beat — the big reveal, the meeting, the surprise, the "finally" moment.
+  NEVER the travel footage, walking around, or "hey guys welcome back." The opening should make someone think "I need to see how this happened."
 - Escalation: build through the journey/anticipation leading to the peak. Show the effort, the travel, the near-misses.
 - Payoff: the resolution of the personal story — the photo taken, the gift received, the surprise reaction, the emotional climax.
 - Vlog content lives and dies on PERSONAL MOMENTS. Prioritize blocks with exclamations, questions, and high energy.
@@ -2235,7 +2281,7 @@ _GENRE_PLANNING_RULES: dict[str, str] = {
 - The viewer must feel the creator's emotion — cut anything that feels like filler or generic B-roll narration.""",
 
     GENRE_EXPERIMENT: """CONTENT-SPECIFIC RULES (experiment/what-if):
-- Hook MUST be the hypothesis, the question, or the most dramatic result teaser. "What happens if you..." or a flash of the final result.
+- Start MUST be the hypothesis, the question, or the most dramatic result teaser. "What happens if you..." or a flash of the final result.
 - Escalation: show the setup, the process, the building tension. Each step should raise the question "will it work?"
 - Payoff MUST be the actual result — the answer to the question. The moment of truth, the reveal, the success or failure.
 - Prioritize STAKES flags — experiments with risk or stakes are more compelling.
@@ -2243,7 +2289,7 @@ _GENRE_PLANNING_RULES: dict[str, str] = {
 - Social experiments: treat the subjects' reactions as escalation; the conclusion/reveal is the payoff.""",
 
     GENRE_SPORTS_FITNESS: """CONTENT-SPECIFIC RULES (sports/fitness):
-- Hook MUST be the most spectacular play, the peak action moment, or the stakes (championship, record attempt).
+- Start MUST be the most spectacular play, the peak action moment, or the stakes (championship, record attempt).
   NEVER warm-up footage, pre-game interviews, or walking to the field.
 - Escalation: build through increasingly intense plays, near-misses, score changes, or training progression.
 - Payoff: the winning moment, the record broken, the final score, or the transformation result (for fitness).
@@ -2252,7 +2298,7 @@ _GENRE_PLANNING_RULES: dict[str, str] = {
 - Sports content needs FAST PACING. Prefer shorter clips with higher energy density.""",
 
     GENRE_COMEDY_SKETCH: """CONTENT-SPECIFIC RULES (comedy/sketch):
-- Hook MUST be the setup of the joke — the premise that creates the comedic expectation. Or a flash-forward to the punchline without context.
+- Start MUST be the setup of the joke — the premise that creates the comedic expectation. Or a flash-forward to the punchline without context.
 - Escalation: the absurdity builds, the misunderstanding deepens, the situation spirals.
 - Payoff MUST be the punchline, the big reveal, or the climactic comedic moment. The laugh should be at the end.
 - Timing is everything. Don't cut a beat too early or too late — the comedic beat must land.
@@ -2260,22 +2306,22 @@ _GENRE_PLANNING_RULES: dict[str, str] = {
 - NEVER explain the joke in escalation — let the visual/dialogue do it.""",
 
     GENRE_TUTORIAL: """CONTENT-SPECIFIC RULES (tutorial/how-to):
-- Hook MUST be the finished result or the specific problem being solved. Show WHY someone should watch.
-  NEVER "hey guys today we're going to..." The hook is the payoff shown first.
+- Start MUST be the finished result or the specific problem being solved. Show WHY someone should watch.
+  NEVER "hey guys today we're going to..." The opening is the payoff shown first.
 - Escalation: the most interesting or surprising steps. Skip boring setup — show the transformation points.
 - Payoff: the completed result, the before/after, the final product. The "wow it actually worked" moment.
 - Prioritize steps where something visibly changes — cutting, transforming, assembling.
 - Skip intro chatter, sponsor segments, and long explanations. Keep only the doing.""",
 
     GENRE_MUSIC_PERF: """CONTENT-SPECIFIC RULES (music/performance):
-- Hook MUST be the most powerful vocal moment, the best riff, or the crowd's peak reaction. Drop the viewer into the climax, not the intro.
+- Start MUST be the most powerful vocal moment, the best riff, or the crowd's peak reaction. Drop the viewer into the climax, not the intro.
 - Escalation: the build-up, the verse that leads to the chorus, the crowd's growing energy.
 - Payoff: the final chorus, the high note, the crowd eruption, or the performance's emotional peak.
 - Energy and rhythm matter most. Prefer blocks with high speech_energy and exclamation flags.
 - NEVER start with tuning, setup, or "testing 1-2-3." Start mid-performance.""",
 
     GENRE_NEWS_DOC: """CONTENT-SPECIFIC RULES (news/documentary):
-- Hook MUST be the most shocking fact, the key revelation, or the central question. Name the event or the stakes plainly.
+- Start MUST be the most shocking fact, the key revelation, or the central question. Name the event or the stakes plainly.
 - Escalation: build through evidence, testimony, developing events. Each beat adds new information.
 - Payoff: the conclusion, the verdict, the consequence, or the unanswered question that haunts.
 - STAKES flags mark the most consequential moments — use them.
@@ -2285,11 +2331,11 @@ _GENRE_PLANNING_RULES: dict[str, str] = {
 
 # Fallback rules for any genre not in the dictionary (including GENRE_GENERAL)
 _GENRE_PLANNING_RULES_DEFAULT = """CONTENT-SPECIFIC RULES (general):
-- Hook: the moment that creates the strongest curiosity — a question, a dramatic statement, or a visual that demands context. NEVER a greeting, intro, or channel plug.
+- Start: the moment that creates the strongest curiosity — a question, a dramatic statement, or a visual that demands context. NEVER a greeting, intro, or channel plug.
 - Escalation: tension building toward the payoff. Each beat more intense or revealing than the last.
 - Payoff: the answer to the curiosity, the climax, the outcome. Whatever makes the viewer think "that was worth watching."
 - Read the blocks carefully. Let the CONTENT dictate the arc, not a formula. A cooking video's payoff is the dish; a confession's payoff is the truth; a prank's payoff is the reaction.
-- Engagement flags (VULGAR, DATING, ROAST, STAKES) mark high-interest moments — weight them heavily for hook and payoff."""
+- Engagement flags (VULGAR, DATING, ROAST, STAKES) mark high-interest moments — weight them heavily for start and payoff."""
 
 
 def _prompt_planner_for_genre(
@@ -2304,11 +2350,12 @@ def _prompt_planner_for_genre(
     content_identity: ContentIdentity | None = None,
     reel_dur_min: int = 80,
     reel_dur_max: int = 100,
+    hook_mode: HookMode = "skip",
 ) -> str:
     """Build the unified story planner prompt with genre-specific rules injected.
 
     ONE prompt handles all 12+ genres. The genre-specific rules section tells
-    the LLM what makes a good hook/escalation/payoff for THIS content type.
+    the LLM what makes a good start/escalation/payoff for THIS content type.
     """
     genre_rules = _GENRE_PLANNING_RULES.get(content_type, _GENRE_PLANNING_RULES_DEFAULT)
     identity_context = ""
@@ -2323,6 +2370,14 @@ Named entities/acts: {entity_names}
 Planning notes: {content_identity.planning_notes}
 """
 
+    arc_rules = """5. For each unit's arc: exactly one "start" (position "start"), zero to four "escalation", exactly one "payoff" (position "end"). Max 6 beats total.
+   - "start" = introduces the challenge, person, or context — this IS the opening beat. Make the intent specific and curiosity-driving (e.g. "Chef Marco's ridiculous 60-second plating challenge" not just "introduce the scene").
+   - "escalation" = builds tension toward the payoff
+   - "payoff" = the resolution or reveal"""
+    arc_example = """        {{"beat": "start", "position": "start", "flags": [], "intent": "specific curiosity-driving opening moment"}},
+        {{"beat": "escalation", "position": "any", "flags": [], "intent": "..."}},
+        {{"beat": "payoff", "position": "end", "flags": [], "intent": "..."}}"""
+
     return f"""You are an editorial structure planner for YouTube Shorts.
 Your ONLY job: identify the strongest standalone story units worth turning into individual Shorts.
 You NEVER pick timestamps, clip ranges, or narration. Another system selects the exact clips.
@@ -2334,6 +2389,8 @@ Description: {video_description[:500000]}
 Duration: {source_duration:.1f}s
 Content type detected: {content_type}
 TARGET REEL DURATION: {reel_dur_min}-{reel_dur_max}s per reel. Plan units that contain enough content for this duration range.
+MIN CONTENT DURATION: {reel_dur_min}s — each unit must have at least this much usable content.
+MAX CONTENT DURATION: {reel_dur_max}s — each unit should not exceed this much content.
 Produce {min_groups}-{max_groups} units. Fewer strong stories always beats more weak ones.
 {identity_context}
 
@@ -2342,6 +2399,11 @@ CRITICAL FULL VIDEO MANDATE:
 - The climax, winner reveal, and final resolution of any story ALWAYS lie near the end of the video.
 - Never stop at the first half of the video. The story unit MUST encompass the full setup-to-climax journey.
 
+CHALLENGE NUMBERING:
+- For competition/challenge content: number each unit by the challenge order in the video (e.g. "Challenge 1", "Challenge 2", etc.)
+- Use the block timestamps to identify where each challenge begins and ends
+- Each unit should cover one complete challenge from start to finish
+
 SEMANTIC BLOCKS (pre-scored by Python -- imp=importance 0-100, flags mark engagement):
 {blocks_text}
 
@@ -2349,19 +2411,15 @@ PRECOMPUTED USABLE SECONDS BY REGION:
 {usable_hints}
 
 UNIVERSAL STORY ARC RULES
-1. A unit is ONLY worth a reel if it has a complete arc: a hook that creates curiosity,
-   a start that introduces the scene, escalation that builds tension, and a payoff that resolves it.
+1. A unit is ONLY worth a reel if it has a complete arc: a start that introduces the scene,
+   escalation that builds tension, and a payoff that resolves it.
 2. Choose region from where the unit's story lives: "early" = 0-25%, "mid" = 25-75%, "late" = 75-100%.
    Multiple units may share a region.
 3. HARD RULE: the unit with priority=1 MUST be "early". Its reel is the first one the viewer sees.
 4. priority=1 means must-include, 2 nice-to-have, 3 bonus.
-5. For each unit's arc: zero or one "hook" (position "start"), exactly one "start" (position "start"), zero to four "escalation", exactly one "payoff" (position "end"). Max 7 beats total.
-   - "hook" = curiosity trigger that opens the reel (only when hook_mode=required)
-   - "start" = introduces the scene, person, or context
-   - "escalation" = builds tension toward the payoff
-   - "payoff" = the resolution or reveal
+{arc_rules}
 6. flags tells the clip picker which engagement signals mark each beat's moment: VULGAR, DATING, ROAST, STAKES.
-7. intent: one short phrase describing what the beat must deliver.
+7. intent: one short phrase describing what the beat must deliver. The start beat's intent is especially important — it must open the reel with a specific, intriguing moment.
 8. Blocks with CUR_GAP (curiosity gap), INTERRUPT (pattern interrupt), SOCIAL (social proof), or VIRAL (viral trigger) flags are high-retention moments -- prioritize them.
 
 {genre_rules}
@@ -2376,10 +2434,7 @@ OUTPUT -- STRICT JSON ONLY (no timestamps anywhere, no reasoning text outside JS
       "priority": 1,
       "region": "early|mid|late",
       "arc": [
-        {{"beat": "hook", "position": "start", "flags": [], "intent": "..."}},
-        {{"beat": "start", "position": "start", "flags": [], "intent": "..."}},
-        {{"beat": "escalation", "position": "any", "flags": [], "intent": "..."}},
-        {{"beat": "payoff", "position": "end", "flags": [], "intent": "..."}}
+{arc_example}
       ]
     }}
   ]
@@ -2415,14 +2470,16 @@ def _prompt_planner_entity(
     reel_dur_min: int = 80,
     reel_dur_max: int = 100,
     content_type: str = "",
+    min_groups: int = 3,
+    max_groups: int = 6,
 ) -> str:
     """Build the entity-mode planner prompt.
 
     Python pre-seeds one candidate per entity segment. The LLM only returns
-    merge groups of adjacent segments. No timestamps or durations are exposed
+    merge groups of related segments. No timestamps or durations are exposed
     as LLM decisions.
     """
-    # Build segment descriptions with speaker IDs and usable content time
+    # Build segment descriptions with speaker IDs, usable content time, and top blocks
     block_lookup = {b.block_id: b for b in blocks}
     segment_lines = []
     for seg in entity_segments:
@@ -2436,10 +2493,31 @@ def _prompt_planner_entity(
         )
         evidence_str = ", ".join(seg.evidence) if seg.evidence else "none"
         speakers_str = ", ".join(seg.speaker_ids) if seg.speaker_ids else "none"
+        seg_blocks = [block_lookup[bid] for bid in seg.block_ids if bid in block_lookup]
+        seg_blocks.sort(key=lambda b: b.importance, reverse=True)
+        top_blocks = seg_blocks[:3]
+        block_details = []
+        for tb in top_blocks:
+            flags = ", ".join(
+                f for f, has in (
+                    ("STAKES", tb.has_stakes), ("VULGAR", tb.has_vulgarity),
+                    ("ROAST", tb.has_roast), ("CUR_GAP", tb.has_curiosity_gap),
+                    ("VIRAL", tb.has_viral_trigger), ("INTERRUPT", tb.has_pattern_interrupt),
+                ) if has
+            ) or "no flags"
+            text = (tb.text or "").strip().replace("\n", " ")
+            if len(text) > 100:
+                text = text[:100].rstrip() + "..."
+            wps = tb.word_density if tb.word_density > 0 else 0.0
+            block_details.append(
+                f"    B{tb.block_id} [{tb.start:.0f}-{tb.end:.0f}s] imp={tb.importance:.0f} wps={wps:.1f} [{flags}]: \"{text}\""
+            )
+        details_str = "\n".join(block_details) if block_details else "    (no blocks)"
         segment_lines.append(
             f"  {seg.entity_segment_id}: \"{entity_name}\" | "
             f"{seg.start:.1f}-{seg.end:.1f}s ({duration:.1f}s, ~{usable:.0f}s usable) | "
-            f"{block_count} blocks | speakers: {speakers_str} | evidence: {evidence_str}"
+            f"{block_count} blocks | speakers: {speakers_str} | evidence: {evidence_str}\n"
+            f"    TOP BLOCKS (highest importance first):\n{details_str}"
         )
     segments_text = "\n".join(segment_lines)
 
@@ -2470,7 +2548,7 @@ Named entities: {entity_names}
 Planning notes: {content_identity.planning_notes}
 """
 
-    return f"""You are a reel grouping assistant for multi-entity content.
+    return f"""You are a reel grouping assistant for multi-entity challenge content.
 Your ONLY job: group the pre-identified entity segments into standalone Short reels.
 You NEVER pick timestamps, clip ranges, or narration. Another system selects the exact clips.
 You decide WHICH segments belong together in one reel.
@@ -2479,31 +2557,33 @@ SOURCE
 Title: {video_title}
 Description: {video_description[:500000]}
 Duration: {source_duration:.1f}s
-TARGET REEL DURATION: {reel_dur_min}-{reel_dur_max}s per reel. Group segments so each reel has enough content for this duration range.
+TARGET: {min_groups}-{max_groups} reels, each 90-100s long. Each reel must be ONE isolated challenge.
 {identity_section}
 {_entity_genre_section(content_type)}
 ENTITY SEGMENTS (pre-identified by Python — DO NOT infer new segments):
-Each segment is a contiguous window of one person, contestant, or act.
+Each segment is a short window of one person, contestant, or act.
 {segments_text}
 {speaker_section}
 RULES
-1. Each segment appears in exactly one reel group.
-2. A reel group can contain ONE or MORE adjacent segments.
-3. "Adjacent" means consecutive in the list above (entity-1 & entity-2, entity-2 & entity-3, etc.).
-4. Segments sharing the same speaker ID likely feature the same person — strongly prefer merging them.
-5. Consider entity name, narrative arc, and content flow when grouping.
-6. Two segments should merge ONLY if they tell a stronger story together.
-7. No timestamps or durations — Python owns all numbers.
-8. Fewer, stronger reels always beats more weak ones.
-9. A complete reel needs: introduction of the person/situation, tension building, and a payoff/resolution.
+1. Create {min_groups}-{max_groups} reel groups (based on content).
+2. Each segment appears in exactly one reel group.
+3. Group segments that are part of the SAME challenge/contest into one reel.
+4. DIFFERENT challenges/contests MUST be in SEPARATE groups (never mix).
+5. Each group must have enough content for 90+ seconds of clips.
+6. Segments sharing the same speaker ID or entity name are the same person — merge them.
+7. Consider timing: segments close in time are likely the same challenge.
+8. No timestamps or durations — Python owns all numbers.
+9. Each reel should have: introduction, tension building, and payoff/resolution.
+10. Use the TOP BLOCKS to judge content quality: segments with STAKES/VIRAL/INTERRUPT flags are high-value.
+11. Combine SHORT + MEDIUM + LONG clips within each group to fill the reel.
 
 OUTPUT — STRICT JSON ONLY (no timestamps, no reasoning text outside JSON)
 {{
   "video_type": "entity",
   "merge_groups": [
-    {{"segment_ids": ["entity-1"]}},
-    {{"segment_ids": ["entity-2", "entity-3", "entity-4"]}},
-    {{"segment_ids": ["entity-5"]}}
+    {{"segment_ids": ["entity-1", "entity-2"]}},
+    {{"segment_ids": ["entity-3"]}},
+    {{"segment_ids": ["entity-4", "entity-5", "entity-6"]}}
   ]
 }}"""
 
@@ -2770,7 +2850,7 @@ def _prompt_completeness_critic(groups: list[dict]) -> str:
         clips_summary = []
         for c in g.get("source_clips", []):
             clips_summary.append({
-                "beat": c.get("_beat", "unknown"),
+                "beat": c.get("beat") or c.get("_beat", "unknown"),
                 "source_start": c.get("source_start"),
                 "source_end": c.get("source_end"),
                 "text_hint": (c.get("text") or c.get("reason") or "")[:80],
@@ -3042,12 +3122,22 @@ _GENRE_WRITER_STYLES: dict[str, str] = {
         "BANNED: 'This is crazy', 'No way', 'Insane', 'Literally dying', 'I can not even', 'Watch what happens', 'You won't believe'\n"
     ),
 }
+
+
+def _writer_opening_event_type(hook_mode: str) -> str:
+    """Return the opening event type for the narrator based on hook_mode."""
+    return "hook" if hook_mode == "required" else "start"
+
+
 def _prompt_writer(
     video_title: str,
     groups: list[dict],
     structure: dict,
     blocks_hint: str,
     video_type: str = "other",
+    hook_mode: str = "skip",
+    reel_dur_min: int = 90,
+    reel_dur_max: int = 100,
 ) -> str:
     groups_json = json.dumps(groups, ensure_ascii=False, indent=2)
     structure_json = json.dumps(structure, ensure_ascii=False, indent=2)
@@ -3063,7 +3153,7 @@ def _prompt_writer(
         reel_start = clips_sorted[0].get("source_start", 0)
         parts = []
         for c in clips_sorted:
-            beat = c.get("_beat", "content")
+            beat = c.get("beat") or c.get("_beat", "content")
             rel_start = round(c.get("source_start", 0) - reel_start, 1)
             rel_end = round(c.get("source_end", 0) - reel_start, 1)
             parts.append(f"{rel_start}-{rel_end}s:{beat}")
@@ -3081,6 +3171,8 @@ Do NOT change clips, groups, or any number.
 
 Video title: {video_title}
 Content type: {video_type}
+Hook mode: {hook_mode} ({'generate a curiosity-triggering hook opening' if hook_mode == 'required' else 'use a plain start opening, no hook'})
+TARGET REEL DURATION: {reel_dur_min}-{reel_dur_max}s per reel. Write narration that fits this duration range — not too short, not too long.
 
 VIDEO TYPE / STRUCTURE:
 {structure_json}
@@ -3102,6 +3194,7 @@ OUTPUT — STRICT JSON ONLY (no reel_start, no reel_end, no seconds)
   "reel_groups": [
     {{
       "group_index": 0,
+      "group_name": "copy the unit name exactly from the GROUPS input above",
       "reel_summary": {{
         "title": "...",
         "short_description": "...",
@@ -3110,8 +3203,7 @@ OUTPUT — STRICT JSON ONLY (no reel_start, no reel_end, no seconds)
         "key_moment": "..."
       }},
       "narration_events": [
-        {{"event_type": "hook", "text": "...", "persona": null}},
-        {{"event_type": "start", "text": "...", "persona": null}},
+        {{"event_type": "{_writer_opening_event_type(hook_mode)}", "text": "...", "persona": null}},
         {{"event_type": "commentary", "text": "...", "persona": "neutral"}},
         {{"event_type": "commentary", "text": "...", "persona": "neutral"}}
       ]
@@ -3119,9 +3211,13 @@ OUTPUT — STRICT JSON ONLY (no reel_start, no reel_end, no seconds)
   ]
 }}
 
+CRITICAL: You MUST return exactly the same number of groups as provided in the GROUPS input.
+Each reel_group MUST include "group_name" matching the unit name from the input.
+Do NOT reorder groups — return them in the same order as the input.
+
 RULES for event types:
-- "hook": Opens the reel with a curiosity trigger or emotional hook (when present in arc).
-- "start": Introduces the scene/person when no hook is present (plain identification, no dramatic framing).
+- "hook": Opens the reel with a curiosity trigger or emotional hook (only when hook_mode is "required").
+- "start": Introduces the scene/person when no hook is present (plain identification, no dramatic framing). Used when hook_mode is "skip".
 - "commentary": Mid-reel observations. Persona is one of: neutral, hype, deadpan, roast, sarcastic, brutally_honest, friendly, curious, skeptical, moved, expert, patient, honest, amused, grounded, concerned, analytical, restrained.
 - Only ONE opening event per reel (either hook OR start, never both).
 - Always include exactly 2 commentary events per reel."""
@@ -3141,7 +3237,7 @@ def select_reel_plan(
     rich_timeline: RichTimeline | None = None,
     source_path: str | None = None,
     source_metadata: SourceMetadata | None = None,
-    hook_mode: HookMode = "auto",
+    hook_mode: HookMode = "skip",
     multimodal_signals: MultimodalSignals | None = None,
 ) -> ReelPlan:
     if progress_cb:
@@ -3243,21 +3339,19 @@ def select_reel_plan(
         if ocr_lines:
             blocks_text += "\n\nON-SCREEN TEXT (OCR — may include scores, round numbers, names):\n" + "\n".join(ocr_lines)
 
-    # ── Entity segment cap: merge shortest adjacent segments if over limit ──
+    # ── Entity segment selection: keep top N by content quality ──
     max_segments = max_groups * ENTITY_MAX_SEGMENTS_MULTIPLIER
-    if entity_grouped and len(entity_segments) > max_segments:
-        logger.info(
-            f"Entity segment cap: {len(entity_segments)} segments exceeds "
-            f"{max_groups} * {ENTITY_MAX_SEGMENTS_MULTIPLIER} = {max_segments} — merging"
-        )
-        entity_segments = _cap_entity_segments(entity_segments, max_segments, blocks)
 
     # ── Entity pre-merge: combine consecutive segments sharing same speaker ──
     if entity_grouped and entity_segments:
         entity_segments = _premerge_entity_segments(entity_segments, blocks)
-        # Safety-net cap after pre-merge
-        if len(entity_segments) > max_segments:
-            entity_segments = _cap_entity_segments(entity_segments, max_segments, blocks)
+
+    if entity_grouped and len(entity_segments) > max_segments:
+        logger.info(
+            f"Entity segment selection: {len(entity_segments)} segments exceeds "
+            f"{max_segments} — selecting top {max_segments} by content quality"
+        )
+        entity_segments = _select_top_entity_segments(entity_segments, max_segments, blocks)
 
     # ── Python: audience worth gate ──
     if progress_cb:
@@ -3541,7 +3635,7 @@ def select_reel_plan(
 # Executor mode — LLM plans (structure only), Python picks every number
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _prompt_ranker(plan: "StoryPlan", blocks: list[SemanticBlock], source_duration: float, content_type: str = "") -> str:
+def _prompt_ranker(plan: "StoryPlan", blocks: list[SemanticBlock], source_duration: float, content_type: str = "", content_identity: ContentIdentity | None = None, reel_dur_min: int = 90, reel_dur_max: int = 100) -> str:
     """Build the beat-relevance ranking prompt (block IDs only, no timestamps).
 
     The ranker is the semantic layer of the executor: it tells Python WHICH
@@ -3552,17 +3646,32 @@ def _prompt_ranker(plan: "StoryPlan", blocks: list[SemanticBlock], source_durati
 
     windows = _unit_windows(plan, source_duration, content_type=content_type)
 
+    identity_hint = ""
+    if content_identity:
+        entity_names = ", ".join(content_identity.entity_names) or "none"
+        identity_hint = (
+            f"\nIDENTIFIER CONTEXT: Creator={content_identity.creator_name or 'unconfirmed'}, "
+            f"Structure={content_identity.structure}, Entities={entity_names}\n"
+            f"Planning notes: {content_identity.planning_notes}\n"
+        )
+
     lines = [
         "You are a scene-matching assistant for a Shorts editor.",
         "Given story units and their beat intents, rank candidate blocks (by ID) by how well each block DELIVERS the intent.",
         "",
+        f"TARGET REEL DURATION: {reel_dur_min}-{reel_dur_max}s per reel. Each unit needs enough blocks to fill this duration.",
+        "",
         "RULES",
         "1. Rank by CONTENT MATCH, not importance: a calm setup block is wrong for an escalation intent even if it scored high.",
-        '2. One ranked list per beat key: "hook", "start", "escalation" (all escalation beats share one list), "payoff".',
+        '2. One ranked list per beat key: "start", "escalation" (all escalation beats share one list), "payoff".',
+        '   If a unit has a "hook" beat, include it as a separate key.',
         "3. Best block first. Only use IDs from the provided BLOCKS lists. Lists may stay empty or short.",
-        '4. STRICT JSON ONLY: {"0": {"hook": [3, 7], "start": [5], "escalation": [12, 4], "payoff": [18]}, ...}',
+        '4. STRICT JSON ONLY: {"0": {"start": [5], "escalation": [12, 4], "payoff": [18]}, ...}',
         "5. For PAYOFF beats, strongly prefer blocks with the LATEST source timestamps — the winner reveal or final reaction must come LAST.",
-        "6. For START beats, prefer the earliest strong block that introduces the scene or person.",
+        "6. For START beats, prefer the earliest strong block that introduces the scene or person. Prefer blocks mentioning the entity names from the identifier context.",
+        "7. For START beats: AVOID blocks with very short text (< 10 words) or low word density (wps < 1.5). These are likely exclamations/reactions, not meaningful intros.",
+        "8. Check timestamps: if a block is very early (first 10% of the unit window), verify it contains actual content, not just greeting/intro fluff.",
+        identity_hint,
         "",
     ]
     for u in plan.units:
@@ -3597,7 +3706,8 @@ def _prompt_ranker(plan: "StoryPlan", blocks: list[SemanticBlock], source_durati
             text = (b.text or "").strip().replace("\n", " ")
             if len(text) > 500:
                 text = text[:500].rstrip() + "..."
-            lines.append(f"  B{b.block_id}: [{flags}] imp={b.importance:.0f} \"{text}\"")
+            wps_hint = f" wps={b.word_density:.1f}" if b.word_density > 0 else ""
+            lines.append(f"  B{b.block_id} [{b.start:.0f}-{b.end:.0f}s]: [{flags}] imp={b.importance:.0f}{wps_hint} \"{text}\"")
         lines.append("")
     return "\n".join(lines)
 
@@ -3644,13 +3754,16 @@ def _rank_beats_for_plan(
     reporter: Any,
     interactions: list[LLMInteraction] | None,
     content_type: str = "",
+    content_identity: ContentIdentity | None = None,
+    reel_dur_min: int = 90,
+    reel_dur_max: int = 100,
 ) -> dict[int, dict[str, list[int]]]:
     """One LLM call: rank block IDs per beat intent. Never raises — {} on failure."""
     try:
         raw = _call_llm(
             [
                 {"role": "system", "content": "Respond with ONLY valid JSON."},
-                {"role": "user", "content": _prompt_ranker(plan, blocks, source_duration, content_type=content_type)},
+                {"role": "user", "content": _prompt_ranker(plan, blocks, source_duration, content_type=content_type, content_identity=content_identity, reel_dur_min=reel_dur_min, reel_dur_max=reel_dur_max)},
             ],
             progress_cb, reporter, interactions, stage_name="moment_beat_matcher",
             max_tokens=65536,
@@ -3683,7 +3796,7 @@ def _select_reel_plan_executor(
     worth_verdict: str = "",
     worth_breakdown: dict | None = None,
     content_identity: ContentIdentity | None = None,
-    hook_mode: HookMode = "auto",
+    hook_mode: HookMode = "skip",
     multimodal_signals: MultimodalSignals | None = None,
     entity_segments: list[EntitySegment] | None = None,
     entity_grouped: bool = False,
@@ -3701,10 +3814,13 @@ def _select_reel_plan_executor(
         place_narration_events,
     )
     from backend.pipeline.plan_schema import (
+        _validate_plan_integrity,
+        _validate_entity_merges,
         heuristic_story_plan,
         parse_story_plan,
         plan_to_blocks_hint,
         plan_to_structure_analysis,
+        StoryPlan,
     )
 
     logger.info(
@@ -3715,12 +3831,11 @@ def _select_reel_plan_executor(
 
     planner_branch = "unknown"
 
-    # ── LLM #1 Story Planner — entity or genre-specific prompt ──
+    # ── Entity grouping: LLM merges adjacent segments into challenge-level reels ──
     plan = None
     if entity_grouped and entity_segments:
-        # Entity mode: group segments into reels
         if progress_cb:
-            progress_cb("Planning entity-grouped reels (LLM)...", 20)
+            progress_cb("Grouping entity segments into challenge reels (LLM)...", 20)
         for attempt in (1, 2):
             try:
                 extra = (
@@ -3739,6 +3854,8 @@ def _select_reel_plan_executor(
                                 reel_dur_min=reel_dur_min,
                                 reel_dur_max=reel_dur_max,
                                 content_type=content_type,
+                                min_groups=min_groups,
+                                max_groups=max_groups,
                             ) + extra
                         )},
                     ],
@@ -3747,14 +3864,13 @@ def _select_reel_plan_executor(
                 )
                 plan = parse_story_plan(
                     _parse_json_response(raw_plan), source_duration,
-                    min_groups=1, max_groups=max_groups,
+                    min_groups=min_groups, max_groups=max_groups,
                     hook_mode=hook_mode,
                     entity_segments=entity_segments,
                     blocks=blocks,
                     content_identity=content_identity,
+                    content_type=content_type,
                 )
-                # Cap to max_groups (parse_story_plan's early-return path
-                # for merge_groups skips the truncation block)
                 if len(plan.units) > max_groups:
                     plan.units.sort(key=lambda u: (u.priority, u.unit_id))
                     plan.units = plan.units[:max_groups]
@@ -3765,13 +3881,12 @@ def _select_reel_plan_executor(
                 logger.warning(f"Entity planner attempt {attempt} failed: {e}")
         if plan is None:
             logger.warning("Entity planner failed — creating one unit per segment (capped to max_groups=%d)", max_groups)
-            from backend.pipeline.plan_schema import _validate_entity_merges
             units = _validate_entity_merges(
                 [{"segment_ids": [s.entity_segment_id]} for s in entity_segments],
                 entity_segments, blocks, source_duration,
                 content_identity=content_identity,
+                content_type=content_type,
             )
-            # Cap to max_groups: keep highest-priority (longest-duration) units
             if len(units) > max_groups:
                 units.sort(key=lambda u: (u.priority, -sum(
                     (seg.end - seg.start) for seg in entity_segments
@@ -3808,6 +3923,7 @@ def _select_reel_plan_executor(
                                 content_identity=planner_identity,
                                 reel_dur_min=reel_dur_min,
                                 reel_dur_max=reel_dur_max,
+                                hook_mode=hook_mode,
                             ) + extra
                         )},
                     ],
@@ -3829,6 +3945,8 @@ def _select_reel_plan_executor(
             plan = heuristic_story_plan(source_duration, min_groups, max_groups, hook_mode=hook_mode)
             planner_branch = "genre_fallback"
 
+    _validate_plan_integrity(plan, min_groups, max_groups)
+
     logger.info(
         f"STORY PLAN: type={plan.video_type} units={len(plan.units)} "
         f"({', '.join(u.name for u in plan.units[:6])})"
@@ -3838,7 +3956,8 @@ def _select_reel_plan_executor(
     if progress_cb:
         progress_cb("Matching beats to moments (LLM)...", 40)
     relevance = _rank_beats_for_plan(
-        plan, blocks, source_duration, progress_cb, reporter, interactions, content_type=content_type
+        plan, blocks, source_duration, progress_cb, reporter, interactions, content_type=content_type,
+        content_identity=content_identity, reel_dur_min=reel_dur_min, reel_dur_max=reel_dur_max,
     )
 
     # ── Python: execute the plan into concrete clips ──
@@ -3850,6 +3969,8 @@ def _select_reel_plan_executor(
         plan, blocks, source_duration, reel_dur_min, reel_dur_max, relevance,
         content_type=content_type,
         entity_segments=entity_segments if entity_grouped else None,
+        scene_cut_at=multimodal_signals.scene_cut_at if multimodal_signals else None,
+        content_identity=content_identity,
     )
     logger.info(f"EXECUTOR: built {len(groups)} groups")
     pre_qa_groups = [g.copy() for g in groups]
@@ -3885,7 +4006,7 @@ def _select_reel_plan_executor(
     raw_writer = _call_llm(
         [
             {"role": "system", "content": "Respond with ONLY valid JSON. Do NOT include any reasoning, thinking, or commentary. Output ONLY the JSON object."},
-            {"role": "user", "content": _prompt_writer(video_title, groups, sa, blocks_hint, content_type)},
+            {"role": "user", "content": _prompt_writer(video_title, groups, sa, blocks_hint, content_type, hook_mode=hook_mode, reel_dur_min=reel_dur_min, reel_dur_max=reel_dur_max)},
         ],
         progress_cb, reporter, interactions, stage_name="script_narration_writer",
         max_tokens=65536,
@@ -3901,9 +4022,27 @@ def _select_reel_plan_executor(
         for i, g in enumerate(writer_groups)
         if isinstance(g, dict)
     }
+    # Also build a name-based lookup for cross-referencing
+    writer_by_name = {
+        str(g.get("group_name", "")).strip().lower(): g
+        for g in writer_groups
+        if isinstance(g, dict) and g.get("group_name")
+    }
+    # Warn if LLM returned different number of groups
+    if len(writer_groups) != len(groups):
+        logger.warning(
+            f"Narration writer returned {len(writer_groups)} groups but expected {len(groups)} "
+            f"— matching by index with fallback to name"
+        )
     for i, g in enumerate(groups):
         idx = g.get("group_index", i)
+        unit_name = g.get("name", "")
+        # Try index match first, then name match
         wg = writer_by_idx.get(idx, {})
+        if not wg and unit_name:
+            wg = writer_by_name.get(str(unit_name).strip().lower(), {})
+        if not wg:
+            logger.warning(f"Group {i} (unit_id={idx}, name='{unit_name}'): no matching writer group found")
         events = wg.get("narration_events", [])
         clean = []
         if isinstance(events, list):

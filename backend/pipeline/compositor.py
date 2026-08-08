@@ -434,6 +434,7 @@ def compose_group(
     source_duration: float = 0.0,
     progress_cb: Callable[[str, float], None] | None = None,
     min_duration: float | None = None,
+    max_last_clip_end: float = 0.0,
 ) -> dict[str, Any]:
     """Build a single group's output reel.
 
@@ -459,6 +460,9 @@ def compose_group(
         estimated_duration_seconds: Target duration from the analyzer.
         source_duration: Total source video duration in seconds (for extending last clip).
         progress_cb: Optional progress callback.
+        max_last_clip_end: Maximum allowed source_end for the last clip when
+            extending to fill gaps. Prevents extension from crossing into the
+            next group's source territory. 0.0 = no limit (use source_duration).
 
     Returns:
         Dict with 'output_path', 'vad_stats', and 'vad_analysis' keys.
@@ -558,7 +562,10 @@ def compose_group(
     if pad_duration > 0 and source_duration > 0 and source_clips:
         last_clip = source_clips[-1]
         last_end = last_clip.get("source_end", 0.0)
-        room = source_duration - last_end
+        max_end = source_duration
+        if max_last_clip_end > 0:
+            max_end = min(source_duration, max_last_clip_end)
+        room = max(0.0, max_end - last_end)
         extend_by = min(pad_duration, room)
         if extend_by > 0.5:
             last_clip["source_end"] = round(last_end + extend_by, 3)
@@ -568,6 +575,7 @@ def compose_group(
             logger.info(
                 f"Group {group_idx}: Extended last clip [{last_end:.1f} -> "
                 f"{last_clip['source_end']:.1f}] by {extend_by:.1f}s to fill gap"
+                f"{f' (capped at {max_end:.1f}s)' if max_last_clip_end > 0 else ''}"
             )
 
     logger.info(f"Group {group_idx}: total_clip_duration={total_clip_duration:.1f}s, "

@@ -8,7 +8,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-HookMode = Literal["required", "skip", "auto"]
+HookMode = Literal["required", "skip"]
 
 
 class SourceMetadata(BaseModel):
@@ -50,6 +50,7 @@ class SourceClip(BaseModel):
     source_end: float
     reason: str
     is_hook_clip: bool = False
+    beat: str | None = None  # "hook", "start", "escalation", "payoff"
     segment_end: float = 0.0  # Rich Timeline segment boundary at/after source_end (0 = unknown)
 
 
@@ -85,7 +86,6 @@ class ContentIdentity(BaseModel):
     detected_genre: str
     structure: Literal["single_narrative", "multi_entity"]
     entity_names: list[str] = Field(default_factory=list)
-    hook_recommendation: Literal["hook", "skip"]
     planning_notes: str
     # Arc style drives payoff requirements: "reveal" and "showcase" need a
     # payoff beat (winner reveal, final moment); "quiz" (question-answer
@@ -270,7 +270,7 @@ class VideoJob(BaseModel):
     source_path: str | None = None
     source_metadata: SourceMetadata | None = None
     content_identity: ContentIdentity | None = None
-    hook_mode: HookMode = "auto"
+    hook_mode: HookMode = "skip"
     transcript: list[dict] | None = None
     clip_windows: list[dict] | None = None
     commentary_lines: list[dict] | None = None

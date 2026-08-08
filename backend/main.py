@@ -154,7 +154,7 @@ FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend" / "renderer"
 class CreateJobRequest(BaseModel):
     url: str
     generate_captions: bool = True
-    hook_mode: HookMode = "auto"
+    hook_mode: HookMode = "skip"
 
 
 class PreflightJobRequest(BaseModel):
@@ -163,7 +163,7 @@ class PreflightJobRequest(BaseModel):
 
 class PreflightJobResponse(BaseModel):
     source_metadata: SourceMetadata
-    suggested_hook_mode: HookMode = "required"
+    suggested_hook_mode: HookMode = "skip"
 
 
 def _check_rate_limit() -> bool:

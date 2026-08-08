@@ -19,9 +19,17 @@ from pydantic import BaseModel, Field, ValidationError
 from backend.models import ContentIdentity, EntitySegment, HookMode
 from backend.config import ENTITY_MIN_SEGMENT_SECONDS
 from backend.pipeline.analyzer import (
+    GENRE_COMEDY_SKETCH,
+    GENRE_DATING_REALITY,
     GENRE_EXPERIMENT,
     GENRE_GAME_CHALLENGE,
+    GENRE_MUSIC_PERF,
+    GENRE_NEWS_DOC,
+    GENRE_PODCAST,
+    GENRE_ROAST_REACTION,
     GENRE_SPORTS_FITNESS,
+    GENRE_TUTORIAL,
+    GENRE_VLOG_PERSONAL,
     SemanticBlock,
 )
 
@@ -69,12 +77,12 @@ class StoryPlan(BaseModel):
     units: list[Unit] = Field(default_factory=list)
 
 
-def _repair_unit(unit: Unit, hook_mode: HookMode = "auto") -> Unit:
+def _repair_unit(unit: Unit, hook_mode: HookMode = "skip") -> Unit:
     """Normalize a unit's arc: canonical beat ordering for the given hook_mode.
 
     Ordering:
       required: hook -> start -> escalation* -> payoff
-      skip/auto: start -> escalation* -> payoff
+      skip: start -> escalation* -> payoff (hook deterministically stripped)
     """
     has_hook = any(b.beat == "hook" for b in unit.arc)
     has_start = any(b.beat == "start" for b in unit.arc)
@@ -108,8 +116,13 @@ def _repair_unit(unit: Unit, hook_mode: HookMode = "auto") -> Unit:
             # Insert start after hook (if present) or at beginning
             insert_at = 1 if any(b.beat == "hook" for b in beats) else 0
             beats.insert(insert_at, Beat(beat="start", position="start", intent="scene introduction"))
+    elif hook_mode == "skip":
+        # Deterministic strip: any hook beat the LLM included is removed.
+        beats = [b for b in beats if b.beat != "hook"]
+        if not has_start:
+            beats.insert(0, Beat(beat="start", position="start", intent="scene introduction"))
     else:
-        # skip / auto: no hook, start is required
+        # Fallback (should not occur after auto removal): treat as skip
         beats = [b for b in beats if b.beat != "hook"]
         if not has_start:
             beats.insert(0, Beat(beat="start", position="start", intent="scene introduction"))
@@ -153,10 +166,11 @@ def parse_story_plan(
     source_duration: float,
     min_groups: int,
     max_groups: int,
-    hook_mode: HookMode = "auto",
+    hook_mode: HookMode = "skip",
     entity_segments: list[EntitySegment] | None = None,
     blocks: list[SemanticBlock] | None = None,
     content_identity: ContentIdentity | None = None,
+    content_type: str = "",
 ) -> StoryPlan:
     """Validate + repair an LLM story plan. Never raises on shape issues.
 
@@ -176,6 +190,7 @@ def parse_story_plan(
         units = _validate_entity_merges(
             merge_groups, entity_segments, blocks or [], source_duration,
             content_identity=content_identity,
+            content_type=content_type,
         )
         if units:
             return StoryPlan(video_type="entity", units=units)
@@ -310,13 +325,13 @@ def heuristic_story_plan(
     source_duration: float,
     min_groups: int,
     max_groups: int,
-    hook_mode: HookMode = "auto",
+    hook_mode: HookMode = "skip",
 ) -> StoryPlan:
     """Deterministic fallback plan — no LLM involved.
 
     Splits the source timeline into evenly spaced regions and gives every
     unit the standard arc.  When hook_mode='required', arc is
-    hook -> start -> escalation -> payoff; otherwise start -> escalation -> payoff.
+    hook -> start -> escalation -> payoff; when 'skip', start -> escalation -> payoff.
     """
     n = max(min_groups, min(max_groups, max(1, int(source_duration / 480) + 1)))
     regions = ["early", "mid", "mid", "late"]
@@ -336,6 +351,47 @@ def heuristic_story_plan(
             arc=arc,
         ))
     return StoryPlan(video_type="other", units=units)
+
+
+def _validate_plan_integrity(
+    plan: "StoryPlan",
+    min_groups: int,
+    max_groups: int,
+) -> None:
+    """Warn if the LLM returned a plan with structural issues.
+
+    Checks:
+    - Units with no beats (will produce empty/silent reels)
+    - Units missing key beats (hook, escalation, payoff)
+    - Significantly fewer units than requested
+    """
+    if not plan.units:
+        logger.warning("PLAN VALIDATION: plan has zero units")
+        return
+
+    if len(plan.units) < min_groups:
+        logger.warning(
+            f"PLAN VALIDATION: plan has {len(plan.units)} units but "
+            f"min_groups={min_groups} — LLM may have dropped content"
+        )
+
+    for i, unit in enumerate(plan.units):
+        if not unit.arc:
+            logger.warning(
+                f"PLAN VALIDATION: unit {i} ('{unit.name}') has no beats — "
+                f"will produce empty reel"
+            )
+            continue
+        beats = [b.beat for b in unit.arc]
+        if "hook" not in beats and "start" not in beats:
+            logger.warning(
+                f"PLAN VALIDATION: unit {i} ('{unit.name}') missing "
+                f"opening beat (hook/start) — beats: {beats}"
+            )
+        if "payoff" not in beats:
+            logger.info(
+                f"PLAN VALIDATION: unit {i} ('{unit.name}') has no payoff beat"
+            )
 
 
 def _segment_requires_payoff(
@@ -362,12 +418,122 @@ def _segment_requires_payoff(
     return question_ratio < 0.3
 
 
+# Genre-specific arc templates for entity mode.
+# Each template provides start/escalation intents that the beat-relevance
+# ranker can match against block content.
+_GENRE_ENTITY_ARCS: dict[str, dict] = {
+    GENRE_GAME_CHALLENGE: {
+        "start_intent": "stakes reveal or challenge rules — the moment that makes you care",
+        "escalation_intents": [
+            "building pressure — near-misses, competitor reactions, mounting tension",
+            "escalating challenge — harder tasks, bigger stakes, dramatic moments",
+        ],
+        "payoff_intent": "winner reveal or final result — who won and what happened",
+    },
+    GENRE_SPORTS_FITNESS: {
+        "start_intent": "peak action or spectacular play — the moment that demands attention",
+        "escalation_intents": [
+            "building intensity — increasingly impressive plays or training progression",
+            "climax approach — near-record moments, crowd energy rising",
+        ],
+        "payoff_intent": "winning moment or record broken — the definitive result",
+    },
+    GENRE_EXPERIMENT: {
+        "start_intent": "dramatic hypothesis or result teaser — the question that hooks",
+        "escalation_intents": [
+            "building process — setup, testing, mounting evidence",
+            "tension peak — almost-failures, surprising intermediate results",
+        ],
+        "payoff_intent": "final result reveal — does it work? what happens?",
+    },
+    GENRE_DATING_REALITY: {
+        "start_intent": "most charged or awkward moment — the chemistry or tension that hooks",
+        "escalation_intents": [
+            "building flirtation or confrontation — mounting tension between people",
+            "dramatic turning point — rejection, confession, or twist",
+        ],
+        "payoff_intent": "emotional climax — acceptance, rejection, or defining moment",
+    },
+    GENRE_COMEDY_SKETCH: {
+        "start_intent": "comedic setup or premise — the situation that creates expectation",
+        "escalation_intents": [
+            "absurdity builds — misunderstanding deepens, situation spirals",
+            "peak absurdity — the most ridiculous moment before the punchline",
+        ],
+        "payoff_intent": "punchline or big reveal — the moment that delivers the laugh",
+    },
+    GENRE_PODCAST: {
+        "start_intent": "most provocative or surprising claim — something that demands context",
+        "escalation_intents": [
+            "story context — mounting details, the journey to the insight",
+            "tension peak — the crucial detail that changes everything",
+        ],
+        "payoff_intent": "insight or reveal — the surprising truth or realization",
+    },
+    GENRE_ROAST_REACTION: {
+        "start_intent": "most shocking claim or brutal opener — the moment that demands a reaction",
+        "escalation_intents": [
+            "escalating savagery — increasingly intense comments or reactions",
+            "peak intensity — the most extreme moment before resolution",
+        ],
+        "payoff_intent": "hardest punchline or most shocked reaction — the mic-drop moment",
+    },
+    GENRE_VLOG_PERSONAL: {
+        "start_intent": "peak emotional moment — the reveal, surprise, or dramatic beat that hooks",
+        "escalation_intents": [
+            "journey building — anticipation, effort, near-misses leading to the peak",
+            "approach climax — getting closer to the goal, mounting emotion",
+        ],
+        "payoff_intent": "emotional resolution — the photo, gift, surprise, or personal climax",
+    },
+    GENRE_TUTORIAL: {
+        "start_intent": "finished result or specific problem — show WHY someone should watch",
+        "escalation_intents": [
+            "key transformation steps — the most interesting or surprising parts",
+            "progress visible — things taking shape, visible change happening",
+        ],
+        "payoff_intent": "completed result — before/after, final product, it actually worked",
+    },
+    GENRE_MUSIC_PERF: {
+        "start_intent": "most powerful vocal or best riff — drop into the climax, not the intro",
+        "escalation_intents": [
+            "building energy — verse leading to chorus, crowd growing",
+            "peak buildup — the moment before the biggest drop or note",
+        ],
+        "payoff_intent": "final chorus or high note — the performance's emotional peak",
+    },
+    GENRE_NEWS_DOC: {
+        "start_intent": "most shocking fact or key revelation — name the event or stakes",
+        "escalation_intents": [
+            "evidence building — testimony, developing events, mounting proof",
+            "climax approach — the crucial detail that seals the story",
+        ],
+        "payoff_intent": "conclusion or verdict — the consequence or unanswered question",
+    },
+}
+
+_GENRE_ENTITY_ARCS_DEFAULT = {
+    "start_intent": "the moment that creates the strongest curiosity — a question or dramatic statement",
+    "escalation_intents": [
+        "tension building — context, details, mounting pressure",
+        "peak tension — the most intense moment before resolution",
+    ],
+    "payoff_intent": "the answer or climax — whatever makes the viewer think 'that was worth watching'",
+}
+
+
+def _entity_arc_for_genre(content_type: str) -> dict:
+    """Return genre-specific arc template for entity mode."""
+    return _GENRE_ENTITY_ARCS.get(content_type, _GENRE_ENTITY_ARCS_DEFAULT)
+
+
 def _validate_entity_merges(
     raw_merges: list[dict],
     entity_segments: list[EntitySegment],
     blocks: list[SemanticBlock],
     source_duration: float,
     content_identity: ContentIdentity | None = None,
+    content_type: str = "",
 ) -> list[Unit]:
     """Validate LLM merge groups and convert to Units with entity_segment_ids.
 
@@ -386,6 +552,7 @@ def _validate_entity_merges(
 
     used_ids: set[str] = set()
     units: list[Unit] = []
+    arc_tpl = _entity_arc_for_genre(content_type)
 
     for group in raw_merges:
         seg_ids = group.get("segment_ids", [])
@@ -425,9 +592,9 @@ def _validate_entity_merges(
                     priority=1,
                     region="mid",
                     arc=[
-                        Beat(beat="start", position="start", intent="introduce scene"),
-                        Beat(beat="escalation", position="any", intent="tension builds"),
-                    ] + ([Beat(beat="payoff", position="end", intent="resolution")] if rp else []),
+                        Beat(beat="start", position="start", intent=arc_tpl["start_intent"]),
+                        Beat(beat="escalation", position="any", intent=arc_tpl["escalation_intents"][0]),
+                    ] + ([Beat(beat="payoff", position="end", intent=arc_tpl["payoff_intent"])] if rp else []),
                     entity_segment_ids=[sid],
                     requires_payoff=rp,
                 )
@@ -469,9 +636,9 @@ def _validate_entity_merges(
             priority=1,
             region="mid",
             arc=[
-                Beat(beat="start", position="start", intent="introduce scene"),
-                Beat(beat="escalation", position="any", intent="tension builds"),
-            ] + ([Beat(beat="payoff", position="end", intent="resolution")] if _segment_requires_payoff(merged_start, merged_end, blocks, content_identity) else []),
+                Beat(beat="start", position="start", intent=arc_tpl["start_intent"]),
+                Beat(beat="escalation", position="any", intent=arc_tpl["escalation_intents"][0]),
+            ] + ([Beat(beat="payoff", position="end", intent=arc_tpl["payoff_intent"])] if _segment_requires_payoff(merged_start, merged_end, blocks, content_identity) else []),
             entity_segment_ids=valid_ids,
             requires_payoff=_segment_requires_payoff(merged_start, merged_end, blocks, content_identity),
         )
@@ -488,9 +655,9 @@ def _validate_entity_merges(
                 priority=1,
                 region="mid",
                 arc=[
-                    Beat(beat="start", position="start", intent="introduce scene"),
-                    Beat(beat="escalation", position="any", intent="tension builds"),
-                ] + ([Beat(beat="payoff", position="end", intent="resolution")] if rp else []),
+                    Beat(beat="start", position="start", intent=arc_tpl["start_intent"]),
+                    Beat(beat="escalation", position="any", intent=arc_tpl["escalation_intents"][0]),
+                ] + ([Beat(beat="payoff", position="end", intent=arc_tpl["payoff_intent"])] if rp else []),
                 entity_segment_ids=[seg.entity_segment_id],
                 requires_payoff=rp,
             )
@@ -626,7 +793,14 @@ def _unit_windows(
                         all_starts.append(seg.start)
                         all_ends.append(seg.end)
                 if all_starts and all_ends:
-                    entity_windows[u.unit_id] = (min(all_starts), max(all_ends))
+                    win_start = min(all_starts)
+                    win_end = max(all_ends)
+                    # Expand window by 60% to include adjacent content for extension
+                    win_dur = win_end - win_start
+                    expand = win_dur * 0.6
+                    win_start = max(0.0, win_start - expand)
+                    win_end = min(source_duration, win_end + expand)
+                    entity_windows[u.unit_id] = (round(win_start, 2), round(win_end, 2))
         if entity_windows:
             return entity_windows
 

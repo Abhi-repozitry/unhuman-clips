@@ -166,7 +166,6 @@ class TestHookModeSchema:
 
         assert TestModel(mode="required").mode == "required"
         assert TestModel(mode="skip").mode == "skip"
-        assert TestModel(mode="auto").mode == "auto"
 
     def test_hook_mode_invalid_rejected(self):
         from backend.models import HookMode

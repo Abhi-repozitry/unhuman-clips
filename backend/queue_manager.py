@@ -79,7 +79,7 @@ class QueueManager:
         self,
         url: str,
         generate_captions: bool = True,
-        hook_mode: HookMode = "auto",
+        hook_mode: HookMode = "skip",
     ) -> VideoJob:
         """Create a new job, enqueue it, and return the job object."""
         job = VideoJob(url=url, generate_captions=generate_captions, hook_mode=hook_mode)
@@ -361,6 +361,10 @@ class QueueManager:
         if analyze_ckpt and analyze_ckpt.get("reel_plan"):
             reel_plan = ReelPlan.model_validate(analyze_ckpt["reel_plan"])
             reporter.log_info(f"Resuming from checkpoint: analysis already complete ({len(reel_plan.reel_groups)} groups)")
+            # Restore LLM interactions from checkpoint if available
+            saved_interactions = analyze_ckpt.get("llm_interactions", [])
+            if saved_interactions:
+                llm_interactions.extend([LLMInteraction.model_validate(i) for i in saved_interactions])
         else:
             multimodal_signals = None
             multimodal_ckpt = ckpt.load_stage("multimodal")
@@ -399,7 +403,7 @@ class QueueManager:
                 ) from None
             if reel_plan.multimodal_signals is not None:
                 ckpt.save_stage("multimodal", reel_plan.multimodal_signals.model_dump())
-            ckpt.save_stage("analyze", {"reel_plan": reel_plan.model_dump()})
+            ckpt.save_stage("analyze", {"reel_plan": reel_plan.model_dump(), "llm_interactions": [i.model_dump() for i in llm_interactions]})
 
         if llm_interactions:
             job.stage_data["llm_interactions"] = [i.model_dump() for i in llm_interactions]
@@ -436,7 +440,6 @@ class QueueManager:
                 "detected_genre": ci.detected_genre,
                 "structure": ci.structure,
                 "entity_names": ci.entity_names,
-                "hook_recommendation": ci.hook_recommendation,
                 "planning_notes": ci.planning_notes,
             }
             job.stage_data["content_identity"] = ci_dict

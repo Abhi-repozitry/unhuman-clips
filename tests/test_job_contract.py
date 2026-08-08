@@ -38,7 +38,7 @@ async def test_preflight_returns_normalized_source_metadata(monkeypatch):
 
     response = await main.preflight_job(main.PreflightJobRequest(url="https://youtube.com/watch?v=test"))
 
-    assert response.suggested_hook_mode == "required"
+    assert response.suggested_hook_mode == "skip"
     assert response.source_metadata == SourceMetadata(
         video_id="test",
         title="Test video",
@@ -48,7 +48,7 @@ async def test_preflight_returns_normalized_source_metadata(monkeypatch):
 
 
 def test_create_job_request_validates_hook_mode():
-    assert main.CreateJobRequest(url="https://youtube.com/watch?v=test").hook_mode == "auto"
+    assert main.CreateJobRequest(url="https://youtube.com/watch?v=test").hook_mode == "skip"
     assert main.CreateJobRequest(url="https://youtube.com/watch?v=test", hook_mode="required").hook_mode == "required"
     with pytest.raises(ValueError):
         main.CreateJobRequest(url="https://youtube.com/watch?v=test", hook_mode="invalid")

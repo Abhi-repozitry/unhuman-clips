@@ -22,6 +22,7 @@ def validate_and_adjust_narration_timings(
     target_duration: float,
     reporter: Any,
     group_idx: int,
+    rich_timeline: Any = None,
 ) -> None:
     """Map reel timestamps to source transcript speech intervals across source_clips.
 
@@ -36,11 +37,25 @@ def validate_and_adjust_narration_timings(
         target_duration: Target duration for capping narration end times.
         reporter: ProgressReporter for status updates.
         group_idx: Group index for log messages.
+        rich_timeline: Optional RichTimeline with VAD energy data for more
+            accurate speech gap detection.
     """
     if not group_narration_audio:
         return
 
-    # 1. Map transcript speech segments to reel-relative timeline
+    _vad_min_energy = 0.15
+
+    def _has_speech_energy(source_start: float, source_end: float) -> bool:
+        if rich_timeline is None:
+            return True
+        for seg in rich_timeline.segments:
+            if seg.end <= source_start or seg.start >= source_end:
+                continue
+            overlap = min(seg.end, source_end) - max(seg.start, source_start)
+            if overlap > 0.1 and seg.speech_energy >= _vad_min_energy:
+                return True
+        return False
+
     reel_speech_intervals = []
     cumulative_offset = 0.0
     for clip in source_clips:
@@ -52,7 +67,7 @@ def validate_and_adjust_narration_timings(
             s_end = seg["end"]
             ov_s = max(c_start, s_start)
             ov_e = min(c_end, s_end)
-            if ov_s < ov_e - 0.1:  # meaningful speech duration
+            if ov_s < ov_e - 0.1 and _has_speech_energy(ov_s, ov_e):
                 reel_s = cumulative_offset + (ov_s - c_start)
                 reel_e = cumulative_offset + (ov_e - c_start)
                 reel_speech_intervals.append((reel_s, reel_e, seg.get("text", "")))

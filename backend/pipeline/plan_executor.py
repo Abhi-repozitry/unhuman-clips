@@ -24,7 +24,9 @@ import logging
 from typing import Any
 
 from backend.config import MIN_ENTITY_REEL_SECONDS, MIN_USABLE_BLOCK_FRACTION
+from backend.models import ContentIdentity
 from backend.pipeline.analyzer import (
+    CLIP_LONG_MAX_SECONDS,
     CLIP_MEDIUM_MAX_SECONDS,
     CLIP_SHORT_MAX_SECONDS,
     SemanticBlock,
@@ -49,6 +51,10 @@ PAYOFF_MAX_SECONDS = CLIP_MEDIUM_MAX_SECONDS       # payoff stays MEDIUM (6-15s)
 ESCALATION_MAX_SECONDS = CLIP_MEDIUM_MAX_SECONDS
 MIN_CLIP_SECONDS = 3.0
 WINDOW_EDGE_GAP = 0.0
+
+# Scene-cut snapping: clip boundaries within this tolerance of a real scene
+# cut are nudged to the cut for cleaner editorial transitions.
+SCENE_CUT_SNAP_TOLERANCE = 0.5
 
 # Content-type-aware duration overrides.
 # Fast-paced content (comedy, roast, sports) needs shorter hooks/payoffs;
@@ -132,6 +138,56 @@ def _trim_block(block: SemanticBlock, max_seconds: float, keep_end: bool = False
     if new_end > end:
         new_end, new_start = end, end - max_seconds
     return max(start, new_start), min(end, new_end)
+
+
+def _snap_to_scene_cut(
+    t: float, scene_cuts: list[float], tolerance: float = SCENE_CUT_SNAP_TOLERANCE,
+) -> float:
+    """Snap a timestamp to the nearest scene cut within *tolerance*.
+
+    Returns the original timestamp unchanged if no scene cut is close enough.
+    """
+    best_dist = tolerance + 1.0
+    best = t
+    for cut in scene_cuts:
+        d = abs(cut - t)
+        if d < best_dist:
+            best_dist = d
+            best = cut
+    return best if best_dist <= tolerance else t
+
+
+def _snap_clip_boundaries(
+    clips: list[dict[str, Any]],
+    scene_cuts: list[float],
+) -> None:
+    """Snap clip start/end boundaries to nearby scene cuts.
+
+    Only nudges boundaries that fall within SCENE_CUT_SNAP_TOLERANCE of a real
+    scene cut.  Strictly corrective: never changes which blocks were selected,
+    only nudges the exact in/out point for cleaner editorial transitions.
+
+    Mutates clips in-place.
+    """
+    if not scene_cuts:
+        return
+    sorted_cuts = sorted(scene_cuts)
+    for clip in clips:
+        orig_start = clip["source_start"]
+        orig_end = clip["source_end"]
+        snapped_start = _snap_to_scene_cut(orig_start, sorted_cuts)
+        snapped_end = _snap_to_scene_cut(orig_end, sorted_cuts)
+        # Respect the original constraint: snapped start must be before snapped end
+        if snapped_start < snapped_end:
+            clip["source_start"] = round(snapped_start, 3)
+            clip["source_end"] = round(snapped_end, 3)
+        elif snapped_start != orig_start or snapped_end != orig_end:
+            # Snapping would invert the range — keep original boundaries.
+            # This can happen when both start and end are near the same cut.
+            logger.debug(
+                f"Scene-cut snap skipped for clip [{orig_start:.2f}-{orig_end:.2f}]: "
+                f"would invert to [{snapped_start:.2f}-{snapped_end:.2f}]"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -228,6 +284,7 @@ def _pick_hook_block(
     blocks: list[SemanticBlock],
     payoff_block: SemanticBlock | None,
     hook_ranked: list[int] | None = None,
+    entity_names: set[str] | None = None,
 ) -> SemanticBlock | None:
     if not candidates:
         return None
@@ -259,9 +316,19 @@ def _pick_hook_block(
         elif _block_any_flag(b):
             score += 2.0
 
-        # Opening position preference: hook should setup the story at the start
+        # Mild opening position preference: slightly prefer earlier blocks
+        # but don't let timing dominate over content quality. A fluff block
+        # at 5s should NOT beat a meaningful intro at 30s.
         if (b.start + b.end) / 2.0 <= early_cutoff:
-            score += 20.0
+            score += 5.0
+
+        # Entity name bonus: prefer blocks that mention the named entity
+        if entity_names and b.text:
+            text_lower = b.text.lower()
+            for name in entity_names:
+                if name.lower() in text_lower:
+                    score += 15.0
+                    break
 
         key = (round(score, 3), -b.start)
         if best is None or key > best:
@@ -271,6 +338,50 @@ def _pick_hook_block(
 
 
 _POS_HINT_FRACTION = {"start": 0.2, "any": 0.5, "end": 0.8}
+
+
+def _apply_pacing_strategy(clips: list[dict[str, Any]], blocks: list[Any], window: tuple[float, float]) -> None:
+    """Adjust clip durations to create short→medium→long pacing.
+
+    Pattern:
+    - Hook: SHORT (4-8s)
+    - Early escalation: SHORT (3-6s) - quick cuts
+    - Middle escalation: MEDIUM (8-15s) - building
+    - Late escalation: LONG (15-25s) - sustained
+    - Payoff: MEDIUM (6-12s)
+    """
+    if len(clips) <= 2:
+        return
+
+    block_lookup = {b.block_id: b for b in blocks}
+    source_duration = window[1] - window[0]
+
+    esc_clips = [c for c in clips if c.get("beat") == "escalation"]
+    n_esc = len(esc_clips)
+    if n_esc == 0:
+        return
+
+    for i, c in enumerate(esc_clips):
+        src_start = c["source_start"]
+        src_end = c["source_end"]
+        max_possible = src_end - src_start
+
+        if n_esc == 1:
+            target = min(CLIP_MEDIUM_MAX_SECONDS, max_possible)
+        elif n_esc == 2:
+            target = min(CLIP_SHORT_MAX_SECONDS if i == 0 else CLIP_MEDIUM_MAX_SECONDS, max_possible)
+        else:
+            ratio = i / max(1, n_esc - 1)
+            if ratio <= 0.33:
+                target = min(CLIP_SHORT_MAX_SECONDS, max_possible)
+            elif ratio <= 0.66:
+                target = min(CLIP_MEDIUM_MAX_SECONDS, max_possible)
+            else:
+                target = min(CLIP_LONG_MAX_SECONDS, max_possible)
+
+        current_dur = c["source_end"] - c["source_start"]
+        if current_dur > target:
+            c["source_end"] = round(c["source_start"] + target, 3)
 
 
 def _pick_escalation_blocks(
@@ -340,6 +451,15 @@ def _pick_escalation_blocks(
                 dist = payoff_block.start - b.end
                 if 0.0 <= dist <= 25.0:
                     score += 15.0 * (1.0 - dist / 25.0)
+            # Gameplay/action content bonus: STAKES, VIRAL, and INTERRUPT flags
+            # mark moments with real substance — near-misses, dramatic reveals,
+            # action peaks — that make escalation feel like it's building.
+            if b.has_stakes:
+                score += 12.0
+            if b.has_viral_trigger:
+                score += 10.0
+            if b.has_pattern_interrupt:
+                score += 8.0
             return score
 
         best = max(
@@ -408,6 +528,7 @@ def _extend_short_clip(
     block_ids_used: set[int],
     reserved_ranges: list[tuple[float, float]] | None = None,
     entity_segment_ids: list[str] | None = None,
+    entity_segments: list[EntitySegment] | None = None,
 ) -> dict[str, Any]:
     """Grow a too-short clip by absorbing adjacent blocks within the window.
 
@@ -415,8 +536,21 @@ def _extend_short_clip(
     absorbed, so cross-group overlap can't sneak in via extension.
     When entity_segment_ids is provided, only blocks from those segments
     are absorbed — clips cannot cross entity boundaries.
+    When entity_segments is provided, the new endpoint is verified to stay
+    within the entity's effective_ranges (prevents crossing gaps).
     """
     reserved_ranges = reserved_ranges or []
+
+    # Precompute entity time boundaries for gap checks
+    entity_ranges: list[tuple[float, float]] = []
+    if entity_segments and entity_segment_ids:
+        for seg in entity_segments:
+            if seg.entity_segment_id in entity_segment_ids:
+                if seg.effective_ranges:
+                    entity_ranges.extend(seg.effective_ranges)
+                else:
+                    entity_ranges.append((seg.start, seg.end))
+
     while clip["source_end"] - clip["source_start"] < target_seconds - 0.01:
         candidates = [
             b for b in blocks
@@ -432,7 +566,17 @@ def _extend_short_clip(
         if not candidates:
             break
         nxt = min(candidates, key=lambda b: b.start)
-        clip["source_end"] = round(max(clip["source_end"], nxt.end), 3)
+        new_end = round(max(clip["source_end"], nxt.end), 3)
+        # Gap check: verify new endpoint stays within an entity range
+        if entity_ranges:
+            in_range = any(
+                r_start - 0.1 <= new_end <= r_end + 0.1
+                for r_start, r_end in entity_ranges
+            )
+            if not in_range:
+                # Extending would cross into a gap — clamp to nearest range boundary
+                break
+        clip["source_end"] = new_end
         block_ids_used.add(nxt.block_id)
     return clip
 
@@ -586,6 +730,7 @@ def _build_group_dict(
     hook_reason = next((c["reason"] for c in clips if c.get("is_hook_clip")), "")
     return {
         "group_index": unit.unit_id,
+        "name": unit.name,
         "group_reasoning": (
             f"{counts['Short']} Short:{counts['Medium']} Medium:{counts['Long']} Long, "
             f"{total:.1f}s total. Arc: {arc_desc}. {hook_reason}"
@@ -606,11 +751,15 @@ def _build_group_dict(
 def _reorder_reel_clips(clips: list[dict[str, Any]]) -> None:
     """Restore reel order after deterministic helpers re-sorted the list:
     hook first, escalation by source time, payoff last.
+
+    The hook/start clip always opens the reel regardless of source time.
+    Escalation clips play in chronological order for smooth temporal flow.
+    Payoff always closes the reel.
     """
     beat_rank = {"hook": 0, "start": 0, "escalation": 1, "payoff": 2}
 
     def _key(c: dict[str, Any]) -> tuple[int, float]:
-        return (beat_rank.get(c.get("_beat", "escalation"), 1), c.get("source_start", 0.0))
+        return (beat_rank.get(c.get("beat") or c.get("_beat", "escalation"), 1), c.get("source_start", 0.0))
 
     clips.sort(key=_key)
 
@@ -662,6 +811,8 @@ def execute_plan(
     relevance: dict[int, dict[str, list[int]]] | None = None,
     content_type: str = "",
     entity_segments: list | None = None,
+    scene_cut_at: list[float] | None = None,
+    content_identity: ContentIdentity | None = None,
 ) -> list[dict[str, Any]]:
     """Convert a validated story plan into reel_groups dicts (deterministic).
 
@@ -695,22 +846,24 @@ def execute_plan(
         candidates = _window_blocks(window, blocks, reserved_ranges, reserved_ids)
 
         if not candidates:
-            # Last resort: let this unit draw from the whole source (excluding
-            # what higher-priority units already claimed) so we never drop a
-            # unit below the min_groups floor.
+            # No usable blocks in this unit's window — skip it rather than
+            # risk pulling blocks from other regions (which would corrupt
+            # other groups' content).  The min_groups floor is enforced
+            # later by the heuristic fallback if needed.
             logger.warning(
                 f"Unit {unit.unit_id} ('{unit.name}'): no usable blocks in "
-                f"[{window[0]:.0f}-{window[1]:.0f}]s — falling back to whole source"
+                f"[{window[0]:.0f}-{window[1]:.0f}]s — skipping (isolated groups)"
             )
-            window = (0.0, source_duration)
-            candidates = _window_blocks(window, blocks, reserved_ranges, reserved_ids)
+            continue
 
         if not candidates:
             logger.warning(f"Unit {unit.unit_id} ('{unit.name}'): no usable blocks in window — skipping")
             continue
 
-        # Entity mode: restrict candidates to this unit's entity segments
+        # Entity mode: restrict HIGH-QUALITY candidates to entity segments
+        # But allow extension to use ALL blocks in window (gap content)
         entity_block_ids: set[int] | None = None
+        entity_window_only = False
         if unit.entity_segment_ids:
             entity_block_ids = set()
             for seg in (entity_segments or []):
@@ -719,22 +872,28 @@ def execute_plan(
             entity_candidates = [b for b in candidates if b.block_id in entity_block_ids]
             if entity_candidates:
                 candidates = entity_candidates
+            # If multiple segments merged, allow extension beyond entity blocks
+            if len(unit.entity_segment_ids) > 1:
+                entity_window_only = False  # Allow gap content for merged groups
+            else:
+                entity_window_only = True
 
-        # Entity mode: scale duration targets to this unit's usable content
+        # Duration targets for this unit
         unit_reel_dur_min = reel_dur_min
         unit_reel_dur_max = reel_dur_max
-        if unit.entity_segment_ids and entity_segments:
-            seg_usable = sum(
-                b.duration for b in candidates
-                if not b.black_frame and not b.freeze and b.importance >= 25
-            )
-            if seg_usable > 0:
-                unit_reel_dur_min = max(MIN_ENTITY_REEL_SECONDS, min(reel_dur_min, int(seg_usable * 1.3)))
-                unit_reel_dur_max = max(unit_reel_dur_min + 5, min(reel_dur_max, int(seg_usable * 1.5)))
-                logger.debug(
-                    f"Unit {unit.unit_id}: entity duration target scaled to "
-                    f"{unit_reel_dur_min}-{unit_reel_dur_max}s (usable={seg_usable:.1f}s)"
-                )
+
+        # For merged entity groups, don't clamp to entity boundaries (allow gap content)
+        should_clamp_entity = entity_window_only
+        if entity_window_only:
+            ext_entity_ids = unit.entity_segment_ids or None
+            ext_entity_segs = entity_segments
+        else:
+            ext_entity_ids = None
+            ext_entity_segs = None
+
+        logger.debug(
+            f"Unit {unit.unit_id}: duration target {unit_reel_dur_min}-{unit_reel_dur_max}s"
+        )
 
         u_rel = relevance.get(unit.unit_id, {})
         hook_ranked = u_rel.get("hook", [])
@@ -742,17 +901,20 @@ def execute_plan(
         esc_ranked = u_rel.get("escalation", [])
         payoff_ranked = u_rel.get("payoff", [])
 
+        # Extract entity names for opening clip preference
+        entity_names = set(content_identity.entity_names) if content_identity and content_identity.entity_names else None
+
         # Determine opening clip: hook (when present) or start (when no hook)
         has_hook_beat = any(b.beat == "hook" for b in unit.arc)
         has_start_beat = any(b.beat == "start" for b in unit.arc)
 
         payoff_block = _pick_payoff_block(candidates, unit, window, payoff_ranked) if unit.requires_payoff else None
-        hook_block = _pick_hook_block(candidates, unit, blocks, payoff_block, hook_ranked)
+        hook_block = _pick_hook_block(candidates, unit, blocks, payoff_block, hook_ranked, entity_names=entity_names) if has_hook_beat else None
 
-        # When no hook beat exists, the start beat fills the opening slot
+        # When no hook beat exists (hook_mode="skip"), the start beat fills the opening slot
         start_block = None
         if not has_hook_beat and has_start_beat:
-            start_block = _pick_hook_block(candidates, unit, blocks, payoff_block, start_ranked)
+            start_block = _pick_hook_block(candidates, unit, blocks, payoff_block, start_ranked, entity_names=entity_names)
 
         # Escalation fills the space between opening + payoff and the max reel
         # budget. Overshoot is trimmed later; undershoot is topped up by the
@@ -769,7 +931,7 @@ def execute_plan(
             # Target 4.0 - {hook_max}s for hook clip
             target_dur = max(HOOK_MIN_SECONDS, min(hook_max, hook_block.duration))
             hook_clip = _clip_from_block(hook_block, target_dur, keep_end=False)
-            hook_clip = _extend_short_clip(hook_clip, blocks, window, HOOK_MIN_SECONDS, used_blocks, reserved_ranges, entity_segment_ids=unit.entity_segment_ids or None)
+            hook_clip = _extend_short_clip(hook_clip, blocks, window, HOOK_MIN_SECONDS, used_blocks, reserved_ranges, entity_segment_ids=ext_entity_ids, entity_segments=ext_entity_segs)
 
             # Clamp hook clip duration strictly to HOOK_MIN_SECONDS - {hook_max}s range
             h_dur = hook_clip["source_end"] - hook_clip["source_start"]
@@ -778,9 +940,11 @@ def execute_plan(
             elif h_dur > hook_max:
                 hook_clip["source_end"] = round(hook_clip["source_start"] + hook_max, 3)
             # Entity boundary: don't let hook extend past its segment
-            _clamp_clip_to_entity_segments(hook_clip, entity_segments, unit.entity_segment_ids or None)
+            if should_clamp_entity:
+                _clamp_clip_to_entity_segments(hook_clip, entity_segments, unit.entity_segment_ids or None)
 
             hook_clip["is_hook_clip"] = True
+            hook_clip["beat"] = "hook"
             hook_clip["_beat"] = "hook"
             hook_clip["reason"] = (
                 f"HOOK: {_beat_intent(unit, 'hook') or 'curiosity trigger'} — \"{_snippet(hook_block.text)}\""
@@ -789,7 +953,7 @@ def execute_plan(
             # Start beat fills the opening slot (no hook present)
             target_dur = max(HOOK_MIN_SECONDS, min(hook_max, start_block.duration))
             hook_clip = _clip_from_block(start_block, target_dur, keep_end=False)
-            hook_clip = _extend_short_clip(hook_clip, blocks, window, HOOK_MIN_SECONDS, used_blocks, reserved_ranges, entity_segment_ids=unit.entity_segment_ids or None)
+            hook_clip = _extend_short_clip(hook_clip, blocks, window, HOOK_MIN_SECONDS, used_blocks, reserved_ranges, entity_segment_ids=ext_entity_ids, entity_segments=ext_entity_segs)
 
             h_dur = hook_clip["source_end"] - hook_clip["source_start"]
             if h_dur < HOOK_MIN_SECONDS:
@@ -798,7 +962,8 @@ def execute_plan(
                 hook_clip["source_end"] = round(hook_clip["source_start"] + hook_max, 3)
             _clamp_clip_to_entity_segments(hook_clip, entity_segments, unit.entity_segment_ids or None)
 
-            hook_clip["is_hook_clip"] = True
+            hook_clip["is_hook_clip"] = False
+            hook_clip["beat"] = "start"
             hook_clip["_beat"] = "start"
             hook_clip["reason"] = (
                 f"START: {_beat_intent(unit, 'start') or 'scene introduction'} — \"{_snippet(start_block.text)}\""
@@ -807,9 +972,11 @@ def execute_plan(
         payoff_clip = None
         if payoff_block is not None:
             payoff_clip = _clip_from_block(payoff_block, PAYOFF_MAX_SECONDS, keep_end=True)
-            payoff_clip = _extend_short_clip(payoff_clip, blocks, window, payoff_min, used_blocks, reserved_ranges, entity_segment_ids=unit.entity_segment_ids or None)
-            _clamp_clip_to_entity_segments(payoff_clip, entity_segments, unit.entity_segment_ids or None)
+            payoff_clip = _extend_short_clip(payoff_clip, blocks, window, payoff_min, used_blocks, reserved_ranges, entity_segment_ids=ext_entity_ids, entity_segments=ext_entity_segs)
+            if should_clamp_entity:
+                _clamp_clip_to_entity_segments(payoff_clip, entity_segments, unit.entity_segment_ids or None)
             payoff_clip["is_hook_clip"] = False
+            payoff_clip["beat"] = "payoff"
             payoff_clip["_beat"] = "payoff"
             payoff_clip["reason"] = (
                 f"PAYOFF: {_beat_intent(unit, 'payoff') or 'resolution / reveal'} — \"{_snippet(payoff_block.text)}\""
@@ -819,8 +986,11 @@ def execute_plan(
         esc_intent = _beat_intent(unit, "escalation") or "tension builds"
         for i, b in enumerate(esc_blocks):
             clip = _clip_from_block(b, ESCALATION_MAX_SECONDS, keep_end=False)
-            clip = _extend_short_clip(clip, blocks, window, MIN_CLIP_SECONDS, used_blocks, reserved_ranges, entity_segment_ids=unit.entity_segment_ids or None)
+            clip = _extend_short_clip(clip, blocks, window, MIN_CLIP_SECONDS, used_blocks, reserved_ranges, entity_segment_ids=ext_entity_ids, entity_segments=ext_entity_segs)
+            if should_clamp_entity:
+                _clamp_clip_to_entity_segments(clip, entity_segments, unit.entity_segment_ids or None)
             clip["is_hook_clip"] = False
+            clip["beat"] = "escalation"
             clip["_beat"] = "escalation"
             label = f"ESCALATION {i + 1}" if len(esc_blocks) > 1 else "ESCALATION"
             clip["reason"] = f"{label}: {esc_intent} — \"{_snippet(b.text)}\""
@@ -832,6 +1002,13 @@ def execute_plan(
 
         # Hardcoded Story Flow: Hook (Start, 4-10s) -> Journey (Mid escalation) -> Payoff (End climax)
         esc_clips.sort(key=lambda c: c["source_start"])
+        # Renumber escalations chronologically after sorting
+        if len(esc_clips) > 1:
+            for i, c in enumerate(esc_clips):
+                old_reason = c.get("reason", "")
+                # Replace "ESCALATION N" with the correct chronological number
+                import re as _re
+                c["reason"] = _re.sub(r"ESCALATION \d+", f"ESCALATION {i + 1}", old_reason)
         clips: list[dict[str, Any]] = []
         if hook_clip:
             clips.append(hook_clip)
@@ -851,6 +1028,9 @@ def execute_plan(
             body = clips[1:] if has_hook else clips
             body.sort(key=lambda c: c["source_start"])
             clips = ([hook] + body) if hook else body
+
+        # Apply short→medium→long pacing strategy for engaging reels
+        _apply_pacing_strategy(clips, blocks, window)
 
         # Seamless pre-payoff buildup connection: eliminate small gaps between final escalation and payoff
         if esc_clips and payoff_clip:
@@ -888,8 +1068,11 @@ def execute_plan(
                 if len(clips) >= 3:
                     break
                 pad_clip = _clip_from_block(pad_b, ESCALATION_MAX_SECONDS, keep_end=False)
-                pad_clip = _extend_short_clip(pad_clip, blocks, window, MIN_CLIP_SECONDS, used_blocks, reserved_ranges, entity_segment_ids=unit.entity_segment_ids or None)
+                pad_clip = _extend_short_clip(pad_clip, blocks, window, MIN_CLIP_SECONDS, used_blocks, reserved_ranges, entity_segment_ids=ext_entity_ids, entity_segments=ext_entity_segs)
+                if should_clamp_entity:
+                    _clamp_clip_to_entity_segments(pad_clip, entity_segments, unit.entity_segment_ids or None)
                 pad_clip["is_hook_clip"] = False
+                pad_clip["beat"] = "escalation"
                 pad_clip["_beat"] = "escalation"
                 pad_clip["reason"] = f"ESCALATION (padded): tension — \"{_snippet(pad_b.text)}\""
                 # Insert before payoff clip
@@ -912,23 +1095,32 @@ def execute_plan(
         if total > unit_reel_dur_max:
             _trim_clips_to_budget(clips, unit_reel_dur_max, payoff_min=payoff_min)
 
-        # Short source: extend clips into source content instead of freeze-frame padding
+        # Short source: extend clips to reach minimum duration target
         total = sum(c["source_end"] - c["source_start"] for c in clips)
         if total < unit_reel_dur_min - 0.5:
             prev_total = total
+            soft_target = unit_reel_dur_min
+            # For merged entity groups, allow extension using ALL blocks in window
+            ext_block_ids = entity_block_ids if entity_window_only else None
             n_ext = _extend_clips_to_fill(
-                clips, unit_reel_dur_min, source_duration, window,
+                clips, soft_target, source_duration, window,
                 blocks, used_blocks, reserved_ranges,
-                entity_block_ids=entity_block_ids,
+                entity_block_ids=ext_block_ids,
             )
             if n_ext > 0:
                 total = sum(c["source_end"] - c["source_start"] for c in clips)
-                logger.warning(
-                    f"Unit {unit.unit_id} ('{unit.name}'): clips too short "
-                    f"({prev_total:.1f}s < {unit_reel_dur_min}s target) — "
+                logger.info(
+                    f"Unit {unit.unit_id} ('{unit.name}'): clips short "
+                    f"({prev_total:.1f}s) — "
                     f"extended {n_ext} clips to {total:.1f}s "
-                    f"(using real source content, no freeze-frame padding)"
+                    f"(target {soft_target}s)"
                 )
+
+        # Scene-cut snapping: nudge clip boundaries to real scene cuts when
+        # available and within tolerance.  Strictly corrective — never changes
+        # which blocks were selected, only nudges the exact in/out points.
+        if scene_cut_at:
+            _snap_clip_boundaries(clips, scene_cut_at)
 
         _reorder_reel_clips(clips)
 
@@ -1040,7 +1232,7 @@ def post_execution_qa(
             continue
         payoff_idx = None
         for i, c in enumerate(clips):
-            beat = c.get("_beat", "")
+            beat = c.get("beat") or c.get("_beat", "")
             reason = (c.get("reason") or "").upper()
             if beat == "payoff" or reason.startswith("PAYOFF"):
                 payoff_idx = i
@@ -1085,10 +1277,31 @@ def post_execution_qa(
                 f"(per-unit target)"
             )
         elif estimated < g_min - 0.5:
+            g["_below_min"] = True
             logger.info(
                 f"QA: group {g.get('group_index')} estimated {estimated:.1f}s "
-                f"< {g_min}s min (short source — retain as-is)"
+                f"< {g_min}s min (marked as below minimum)"
             )
+
+    # --- 3b. Drop weakest below-minimum groups when enough strong groups exist ---
+    below_min = [g for g in groups if g.get("_below_min")]
+    at_or_above = [g for g in groups if not g.get("_below_min")]
+    if below_min and len(at_or_above) >= 3:
+        below_min.sort(key=lambda g: g.get("estimated_duration_seconds", 0.0))
+        survivors_needed = max(1, len(at_or_above) // 3)
+        kept_weak = below_min[-survivors_needed:]
+        dropped_weak = below_min[:len(below_min) - survivors_needed]
+        for g in dropped_weak:
+            g["source_clips"] = []
+            logger.info(
+                f"QA: pruned below-min group {g.get('group_index')} "
+                f"({g.get('estimated_duration_seconds', 0.0):.1f}s) "
+                f"in favor of stronger groups"
+            )
+        for g in kept_weak:
+            g.pop("_below_min", None)
+        for g in at_or_above:
+            g.pop("_below_min", None)
 
     # --- 4. Cross-group source overlap resolution ---
     # Sort groups by priority (lower index = higher priority)
@@ -1148,7 +1361,7 @@ def _trim_to_duration(clips: list[dict[str, Any]], budget: float) -> None:
     # Sort candidates: trimmable clips (not hook, not payoff) by duration desc
     candidates = []
     for i, c in enumerate(clips):
-        if c.get("is_hook_clip") or c.get("_beat") == "payoff":
+        if c.get("is_hook_clip") or (c.get("beat") or c.get("_beat")) == "payoff":
             continue
         dur = c["source_end"] - c["source_start"]
         if dur > MIN_CLIP_SECONDS:
@@ -1165,7 +1378,7 @@ def _trim_to_duration(clips: list[dict[str, Any]], budget: float) -> None:
     # If still over budget, trim payoff (respect PAYOFF_MIN_SECONDS)
     if over > 0:
         for c in clips:
-            if c.get("_beat") == "payoff" or c.get("reason", "").startswith("PAYOFF"):
+            if (c.get("beat") or c.get("_beat")) == "payoff" or c.get("reason", "").startswith("PAYOFF"):
                 dur = c["source_end"] - c["source_start"]
                 trim = min(over, max(0.0, dur - PAYOFF_MIN_SECONDS))
                 c["source_start"] = round(c["source_start"] + trim, 3)
@@ -1178,11 +1391,18 @@ def _trim_to_gap(
     claimed: list[tuple[float, float]],
     source_duration: float,
 ) -> dict[str, Any] | None:
-    """Trim a clip so it fits in the earliest available gap within [0, source_duration].
+    """Trim a clip so it fits in the closest available gap to its original position.
+
+    Unlike the old "earliest gap" approach, this finds the gap whose center
+    is closest to the clip's original center. This prevents the payoff clip
+    from being relocated to a completely different part of the source video.
 
     Returns None if no gap can accommodate the clip.
     """
     cs, ce = clip["source_start"], clip["source_end"]
+    clip_mid = (cs + ce) / 2.0
+    clip_len = ce - cs
+
     # Sort claimed ranges and find gaps
     gaps: list[tuple[float, float]] = []
     prev_end = 0.0
@@ -1193,23 +1413,36 @@ def _trim_to_gap(
     if prev_end < source_duration - 0.05:
         gaps.append((prev_end, source_duration))
 
-    # Try to fit into the earliest gap that can hold the full clip
-    clip_len = ce - cs
-    for g_start, g_end in gaps:
-        gap_len = g_end - g_start
-        if gap_len >= clip_len - 0.05:
-            clip["source_start"] = round(g_start, 3)
-            clip["source_end"] = round(g_start + clip_len, 3)
-            return clip
+    if not gaps:
+        return None
 
-    # No gap fits the full clip — use the earliest gap that fits MIN_CLIP_SECONDS
+    # Score each gap by distance from clip's original center (prefer closest)
+    # and whether it can fit the full clip (prefer full-fit over partial)
+    scored_gaps: list[tuple[float, float, float, bool]] = []
     for g_start, g_end in gaps:
         gap_len = g_end - g_start
-        if gap_len >= MIN_CLIP_SECONDS:
-            clip["source_start"] = round(g_start, 3)
-            clip["source_end"] = round(g_end, 3)
-            return clip
-    return None
+        gap_mid = (g_start + g_end) / 2.0
+        dist = abs(gap_mid - clip_mid)
+        fits_full = gap_len >= clip_len - 0.05
+        fits_min = gap_len >= MIN_CLIP_SECONDS
+        if fits_min:
+            # priority_key: (fits_full, -dist) — True > False, higher dist score better
+            scored_gaps.append((g_start, g_end, dist, fits_full))
+
+    if not scored_gaps:
+        return None
+
+    # Sort: prefer gaps that fit the full clip, then by closest distance
+    scored_gaps.sort(key=lambda x: (not x[3], x[2]))
+
+    g_start, g_end, _, fits_full = scored_gaps[0]
+    if fits_full:
+        clip["source_start"] = round(g_start, 3)
+        clip["source_end"] = round(g_start + clip_len, 3)
+    else:
+        clip["source_start"] = round(g_start, 3)
+        clip["source_end"] = round(g_end, 3)
+    return clip
 
 
 # ---------------------------------------------------------------------------

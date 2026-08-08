@@ -53,6 +53,69 @@ class GroupOrchestrator:
         plan = self.job.reel_plan
         return plan is not None and getattr(plan, "plan_mode", "llm") == "executor"
 
+    def _compute_expected_extension(
+        self, group: ReelGroup, group_narration_audio: list[dict],
+        group_idx: int,
+    ) -> float:
+        """Compute how much the compositor will extend the last clip.
+
+        This mirrors the compositor's extension logic so we can pre-adjust
+        caption timing to match the final video output.
+        """
+        from backend.config import MAX_OUTPUT_DURATION, MIN_OUTPUT_DURATION
+
+        if not group.source_clips:
+            return 0.0
+
+        total_clip_dur = sum((c.source_end - c.source_start) for c in group.source_clips)
+        max_nar_end = max((nar.get("reel_end", 0) for nar in group_narration_audio), default=0.0)
+        dur_floor = group.unit_dur_min if group.unit_dur_min > 0 else float(MIN_OUTPUT_DURATION)
+        target_dur = max(total_clip_dur, max_nar_end, group.estimated_duration_seconds, dur_floor)
+        target_dur = min(target_dur, float(MAX_OUTPUT_DURATION))
+        pad_duration = target_dur - total_clip_dur
+
+        if pad_duration <= 0:
+            return 0.0
+
+        last_clip_end = max(c.source_end for c in group.source_clips)
+        source_dur = float(self.job.transcript[-1]["end"]) if self.job.transcript else 0.0
+        max_end = source_dur
+        next_start = self._get_next_group_start(group_idx)
+        if next_start > 0:
+            max_end = min(source_dur, next_start)
+
+        room = max(0.0, max_end - last_clip_end)
+        extend_by = min(pad_duration, room)
+        return extend_by if extend_by > 0.5 else 0.0
+
+    def _get_next_group_start(self, current_group_idx: int) -> float:
+        """Get the earliest source_start among groups whose clips begin AFTER
+        the current group's last clip ends.
+
+        Groups are NOT in chronological source order (e.g. Group 0 may cover
+        [199-327]s while Group 1 covers [0-121]s). We must find the true
+        chronological successor, not just the next array element.
+
+        Returns 0.0 (no limit) if no group starts after the current one.
+        """
+        plan = self.job.reel_plan
+        if plan is None:
+            return 0.0
+        groups = plan.reel_groups
+        current = groups[current_group_idx]
+        if not current.source_clips:
+            return 0.0
+        current_end = max(c.source_end for c in current.source_clips)
+
+        earliest_next = 0.0
+        for i, g in enumerate(groups):
+            if i == current_group_idx or not g.source_clips:
+                continue
+            g_start = min(c.source_start for c in g.source_clips)
+            if g_start > current_end and (earliest_next == 0.0 or g_start < earliest_next):
+                earliest_next = g_start
+        return earliest_next
+
     # ------------------------------------------------------------------
     # Stage: CLIPPING
     # ------------------------------------------------------------------
@@ -300,6 +363,7 @@ class GroupOrchestrator:
             target_duration=narration_limit,
             reporter=reporter,
             group_idx=group_idx,
+            rich_timeline=self.job.rich_timeline,
         )
 
         self.ckpt.save_stage(ckpt_key, {
@@ -313,7 +377,7 @@ class GroupOrchestrator:
     # ------------------------------------------------------------------
     async def run_captioning(
         self, group_idx: int, group: ReelGroup, reporter: Any, working_dir: Path,
-        group_narration_audio: list[dict]
+        group_narration_audio: list[dict], expected_extension: float = 0.0,
     ) -> tuple[list[str], list[dict]]:
         """Generate ASS captions for clips and narration.
 
@@ -323,6 +387,8 @@ class GroupOrchestrator:
             reporter: ProgressReporter for status updates.
             working_dir: Working directory for caption files.
             group_narration_audio: TTS audio metadata list.
+            expected_extension: How much the compositor will extend the
+                last clip. Used to adjust the last caption's end time.
 
         Returns:
             Tuple of (clip_captions paths, narration_captions dicts).
@@ -352,14 +418,15 @@ class GroupOrchestrator:
 
         # Clip captions
         cumulative_offset = 0.0
+        n_clips = len(group.source_clips)
         for i, clip in enumerate(group.source_clips):
-            reporter.update_clip_progress(i, "captioning", (i / len(group.source_clips)) * 100)
+            reporter.update_clip_progress(i, "captioning", (i / n_clips) * 100)
             self.job.stage_data = {
                 "status": "captioning",
                 "group_index": group_idx,
                 "sub": "clip",
                 "current": i + 1,
-                "total": len(group.source_clips),
+                "total": n_clips,
             }
 
             clip_caption_path = working_dir / f"group_{group_idx}_clip_caption_{i}.ass"
@@ -367,17 +434,22 @@ class GroupOrchestrator:
             def caption_progress(msg: str, prog: float, idx=i):
                 reporter.progress_callback(f"Clip {idx+1} caption: {msg}", prog)
 
+            clip_duration = clip.source_end - clip.source_start
+            is_last_clip = (i == n_clips - 1)
+            if is_last_clip and expected_extension > 0:
+                clip_duration += expected_extension
+
             await asyncio.to_thread(
                 generate_clip_ass,
                 self.job.transcript,
                 clip.source_start,
-                clip.source_end,
+                clip.source_start + clip_duration,
                 str(clip_caption_path),
                 caption_progress,
                 cumulative_offset,
             )
             group_clip_captions.append(str(clip_caption_path))
-            cumulative_offset += (clip.source_end - clip.source_start)
+            cumulative_offset += clip_duration
 
         # Narration captions
         for i, nar in enumerate(group_narration_audio):
@@ -428,7 +500,7 @@ class GroupOrchestrator:
         self, group_idx: int, group: ReelGroup, reporter: Any, working_dir: Path,
         group_clip_paths: list[str], group_narration_audio: list[dict],
         group_clip_captions: list[str], group_narration_captions: list[dict],
-        source_path: str
+        source_path: str, max_last_clip_end: float = 0.0,
     ) -> str:
         """Composite the final video for this group.
 
@@ -442,6 +514,8 @@ class GroupOrchestrator:
             group_clip_captions: Paths to clip caption ASS files.
             group_narration_captions: Narration caption metadata list.
             source_path: Path to the source video file.
+            max_last_clip_end: Maximum allowed source_end for the last clip
+                when extending. Prevents crossing into next group's territory.
 
         Returns:
             Path to the composited output video.
@@ -472,6 +546,8 @@ class GroupOrchestrator:
             }
             reporter.progress_callback(msg, prog)
 
+        source_dur = float(self.job.transcript[-1]["end"]) if self.job.transcript and len(self.job.transcript) > 0 else 0.0
+
         compose_result = await asyncio.to_thread(
             compose_group,
             self.job.id,
@@ -484,11 +560,12 @@ class GroupOrchestrator:
             source_path,
             working_dir,
             group.estimated_duration_seconds,
-            float(self.job.transcript[-1]["end"]) if self.job.transcript and len(self.job.transcript) > 0 else 0.0,
+            source_dur,
             compositor_progress,
             # Executor mode: plan's content length IS the reel length (no floor).
             # Legacy mode: enforce MIN_OUTPUT_DURATION floor.
             min_duration=0.0 if self._is_executor_mode() else float(MIN_OUTPUT_DURATION),
+            max_last_clip_end=max_last_clip_end,
         )
 
         if isinstance(compose_result, dict):
@@ -629,9 +706,12 @@ class GroupOrchestrator:
                 group_clip_paths = await self.run_clipping(group_idx, group, reporter, source_path)
                 group_narration_audio, _ = await self.run_tts(group_idx, group, reporter, working_dir)
 
+                expected_ext = self._compute_expected_extension(group, group_narration_audio, group_idx)
+
                 if generate_captions:
                     group_clip_captions, group_narration_captions = await self.run_captioning(
-                        group_idx, group, reporter, working_dir, group_narration_audio
+                        group_idx, group, reporter, working_dir, group_narration_audio,
+                        expected_extension=expected_ext,
                     )
                 else:
                     reporter.log_info(f"Group {group_idx+1}: Skipping clip captions (generate_captions=False)")
@@ -680,10 +760,12 @@ class GroupOrchestrator:
                         "captions_disabled": True,
                     }
                     reporter.log_info(f"Group {group_idx+1}: Generated {len(group_narration_captions)} commentary captions (clip captions skipped)")
+                next_group_start = self._get_next_group_start(group_idx)
                 group_output_path = await self.run_compositing(
                     group_idx, group, reporter, working_dir,
                     group_clip_paths, group_narration_audio,
-                    group_clip_captions, group_narration_captions, source_path
+                    group_clip_captions, group_narration_captions, source_path,
+                    max_last_clip_end=next_group_start,
                 )
                 final_path, duration = await self.run_editing(
                     group_idx, group, reporter, working_dir, group_output_path

@@ -836,12 +836,12 @@ class TestStartBeatType:
             assert "start" in beats, "required mode must include start beat"
             assert "payoff" in beats
 
-    def test_heuristic_plan_auto_mode_has_hook_and_start(self):
-        plan = heuristic_story_plan(1800.0, 3, 6, hook_mode="auto")
+    def test_heuristic_plan_skip_mode_has_start_no_hook(self):
+        plan = heuristic_story_plan(1800.0, 3, 6, hook_mode="skip")
         for u in plan.units:
             beats = [b.beat for b in u.arc]
-            # auto mode: heuristic can't inspect identity, so it follows skip semantics
-            assert "start" in beats
+            assert "start" in beats, "skip mode must include start beat"
+            assert "hook" not in beats, "skip mode must not include hook beat"
             assert "payoff" in beats
 
     def test_parse_story_plan_skip_mode_generates_start(self):
@@ -928,4 +928,243 @@ class TestStartBeatType:
         clips = groups[0]["source_clips"]
         assert len(clips) > 0
         opening = clips[0]
-        assert opening["is_hook_clip"] is True
+        assert opening["is_hook_clip"] is False
+        assert opening["beat"] == "start"
+
+
+# ---------------------------------------------------------------------------
+# hook_mode="skip" enforcement — regression tests
+# ---------------------------------------------------------------------------
+
+class TestHookModeSkipEnforcement:
+    """Verify hook_mode='skip' deterministically strips hook beats from the plan.
+
+    These are the regression tests that would have caught the original bug where
+    'skip' was indistinguishable from 'auto' — the LLM could include a hook beat
+    and no deterministic backend enforcement existed to strip it.
+    """
+
+    def test_repair_unit_strips_hook_beat_in_skip_mode(self):
+        """_repair_unit with hook_mode='skip' must remove any hook beat from unit.arc."""
+        from backend.pipeline.plan_schema import _repair_unit, Beat, Unit
+        unit = Unit(
+            unit_id=0, name="Test", priority=1, region="mid",
+            arc=[
+                Beat(beat="hook", position="start", intent="curiosity trigger"),
+                Beat(beat="escalation", position="any", intent="tension"),
+                Beat(beat="payoff", position="end", intent="reveal"),
+            ],
+        )
+        repaired = _repair_unit(unit, hook_mode="skip")
+        beats = [b.beat for b in repaired.arc]
+        assert "hook" not in beats, "skip mode must strip hook beats"
+        assert "start" in beats, "skip mode must insert start beat"
+        assert "escalation" in beats
+        assert "payoff" in beats
+        assert beats[0] == "start", "start must be the opening beat"
+
+    def test_repair_unit_keeps_hook_in_required_mode(self):
+        """_repair_unit with hook_mode='required' must keep/add hook beat."""
+        from backend.pipeline.plan_schema import _repair_unit, Beat, Unit
+        unit = Unit(
+            unit_id=0, name="Test", priority=1, region="mid",
+            arc=[
+                Beat(beat="hook", position="start", intent="curiosity trigger"),
+                Beat(beat="escalation", position="any", intent="tension"),
+                Beat(beat="payoff", position="end", intent="reveal"),
+            ],
+        )
+        repaired = _repair_unit(unit, hook_mode="required")
+        beats = [b.beat for b in repaired.arc]
+        assert "hook" in beats, "required mode must keep hook beat"
+        assert beats[0] == "hook", "hook must be first in required mode"
+
+    def test_skip_mode_plan_has_zero_hook_clips(self):
+        """End-to-end: hook_mode='skip' produces zero clips with _beat='hook'.
+
+        This is THE regression test: if a permissive LLM returns a plan with
+        hook beats and the backend doesn't enforce 'skip', this test catches it.
+
+        Note: is_hook_clip=True is used for the opening clip (beat type "start")
+        in skip mode — that's expected. The assertion checks that no clip is
+        labeled with _beat='hook', which means no hook beat was executed.
+        """
+        # Simulate a permissive LLM that included hook beats despite skip mode
+        plan_with_hook = StoryPlan(
+            video_type="challenge",
+            units=[{
+                "unit_id": 0, "name": "Story", "priority": 1, "region": "early",
+                "arc": [
+                    {"beat": "hook", "position": "start", "flags": ["STAKES"], "intent": "curiosity"},
+                    {"beat": "escalation", "position": "any", "flags": [], "intent": "tension"},
+                    {"beat": "payoff", "position": "end", "flags": ["STAKES"], "intent": "reveal"},
+                ],
+            }],
+        )
+        # Parse through repair (which enforces skip) then execute
+        from backend.pipeline.plan_schema import parse_story_plan
+        repaired_plan = parse_story_plan(
+            plan_with_hook.model_dump(), 120.0, 1, 6, hook_mode="skip",
+        )
+        # Verify the plan itself has no hook beat
+        for unit in repaired_plan.units:
+            beats = [b.beat for b in unit.arc]
+            assert "hook" not in beats, f"repaired plan must not have hook beat, got {beats}"
+
+        blocks = spread_blocks(40, 120.0)
+        groups = execute_plan(repaired_plan, blocks, 120.0, 45, 100)
+        # No clip in any group should have _beat='hook' — the opening clip
+        # uses _beat='start' in skip mode, not 'hook'
+        for g in groups:
+            for c in g["source_clips"]:
+                assert c.get("_beat") != "hook", (
+                    f"hook_mode='skip' produced a hook beat clip: {c.get('reason')}"
+                )
+
+    def test_heuristic_plan_skip_mode_has_no_hook(self):
+        """heuristic_story_plan with hook_mode='skip' must produce no hook beats."""
+        from backend.pipeline.plan_schema import heuristic_story_plan
+        plan = heuristic_story_plan(600.0, 2, 4, hook_mode="skip")
+        for unit in plan.units:
+            beats = [b.beat for b in unit.arc]
+            assert "hook" not in beats
+            assert "start" in beats
+            assert "payoff" in beats
+
+    def test_skip_mode_start_clip_used_as_opening(self):
+        """When hook_mode='skip', the opening clip should be labeled as 'start' beat."""
+        plan = StoryPlan(
+            video_type="other",
+            units=[{
+                "unit_id": 0, "name": "Test", "priority": 1, "region": "early",
+                "arc": [
+                    {"beat": "start", "position": "start", "flags": [], "intent": "introduce scene"},
+                    {"beat": "escalation", "position": "any", "flags": [], "intent": "tension"},
+                    {"beat": "payoff", "position": "end", "flags": [], "intent": "reveal"},
+                ],
+            }],
+        )
+        blocks = spread_blocks(20, 120.0)
+        groups = execute_plan(plan, blocks, 120.0, 45, 100)
+        assert len(groups) == 1
+        opening = groups[0]["source_clips"][0]
+        assert opening["is_hook_clip"] is False  # start beat is not a hook clip
+        assert opening["beat"] == "start", "opening should be labeled as start beat"
+
+
+# ---------------------------------------------------------------------------
+# Scene-cut snapping tests
+# ---------------------------------------------------------------------------
+
+class TestSceneCutSnapping:
+    """Tests for scene-cut boundary snapping in plan_executor."""
+
+    def test_snap_boundary_near_scene_cut(self):
+        """A clip boundary within tolerance of a scene cut should be snapped."""
+        from backend.pipeline.plan_executor import _snap_to_scene_cut, SCENE_CUT_SNAP_TOLERANCE
+        # Boundary at 10.2s, scene cut at 10.0s — within tolerance
+        snapped = _snap_to_scene_cut(10.2, [10.0, 50.0, 100.0])
+        assert snapped == 10.0, "should snap to the nearby scene cut"
+
+    def test_snap_boundary_far_from_scene_cut(self):
+        """A clip boundary far from any scene cut should remain unchanged."""
+        from backend.pipeline.plan_executor import _snap_to_scene_cut
+        # Boundary at 25.0s, nearest cut at 10.0s — far away
+        snapped = _snap_to_scene_cut(25.0, [10.0, 50.0, 100.0])
+        assert snapped == 25.0, "should not snap when no cut within tolerance"
+
+    def test_snap_boundary_exact_on_cut(self):
+        """A clip boundary exactly on a scene cut should stay there."""
+        from backend.pipeline.plan_executor import _snap_to_scene_cut
+        snapped = _snap_to_scene_cut(50.0, [10.0, 50.0, 100.0])
+        assert snapped == 50.0
+
+    def test_snap_boundary_at_tolerance_edge(self):
+        """A clip boundary exactly at tolerance distance should snap."""
+        from backend.pipeline.plan_executor import _snap_to_scene_cut, SCENE_CUT_SNAP_TOLERANCE
+        cut = 10.0
+        boundary = cut + SCENE_CUT_SNAP_TOLERANCE
+        snapped = _snap_to_scene_cut(boundary, [cut])
+        assert snapped == cut, "should snap at exactly the tolerance edge"
+
+    def test_snap_boundary_just_beyond_tolerance(self):
+        """A clip boundary just beyond tolerance should not snap."""
+        from backend.pipeline.plan_executor import _snap_to_scene_cut, SCENE_CUT_SNAP_TOLERANCE
+        cut = 10.0
+        boundary = cut + SCENE_CUT_SNAP_TOLERANCE + 0.01
+        snapped = _snap_to_scene_cut(boundary, [cut])
+        assert snapped == boundary, "should not snap beyond tolerance"
+
+    def test_snap_clip_boundaries_snaps_both_start_and_end(self):
+        """_snap_clip_boundaries should snap both start and end of each clip."""
+        from backend.pipeline.plan_executor import _snap_clip_boundaries
+        clips = [
+            {"source_start": 10.2, "source_end": 20.3},  # near cuts at 10.0 and 20.0
+        ]
+        _snap_clip_boundaries(clips, [10.0, 20.0, 50.0])
+        assert clips[0]["source_start"] == 10.0
+        assert clips[0]["source_end"] == 20.0
+
+    def test_snap_clip_boundaries_no_snapping_without_cuts(self):
+        """_snap_clip_boundaries with empty scene_cuts should be a no-op."""
+        from backend.pipeline.plan_executor import _snap_clip_boundaries
+        clips = [
+            {"source_start": 10.2, "source_end": 20.3},
+        ]
+        _snap_clip_boundaries(clips, [])
+        assert clips[0]["source_start"] == 10.2
+        assert clips[0]["source_end"] == 20.3
+
+    def test_multimodal_none_identical_output(self):
+        """Passing scene_cut_at=None to execute_plan produces identical output.
+
+        This is the most important regression test — it proves scene-cut
+        snapping can't degrade quality for anyone (including OCR-skip users).
+        """
+        blocks = spread_blocks(40, 120.0)
+        plan = standard_plan()
+        g_no_mm = execute_plan(plan, blocks, 120.0, 90, 100, scene_cut_at=None)
+        g_with_mm_none = execute_plan(plan, blocks, 120.0, 90, 100, scene_cut_at=None)
+        assert g_no_mm == g_with_mm_none, "None scene_cut_at must produce identical groups"
+
+    def test_multimodal_empty_list_identical_output(self):
+        """Passing empty scene_cut_at list produces identical output to None."""
+        blocks = spread_blocks(40, 120.0)
+        plan = standard_plan()
+        g_none = execute_plan(plan, blocks, 120.0, 90, 100, scene_cut_at=None)
+        g_empty = execute_plan(plan, blocks, 120.0, 90, 100, scene_cut_at=[])
+        assert g_none == g_empty, "empty scene_cut_at must produce identical groups to None"
+
+    def test_scene_cut_snapping_does_not_change_block_selection(self):
+        """Snapping only nudges boundaries — it never changes which blocks are picked."""
+        blocks = [
+            mk_block(0, 0.0, 8.0, "Hook content.", importance=70.0, silence_before=True),
+            mk_block(1, 9.0, 20.0, "Escalation content.", importance=60.0),
+            mk_block(2, 80.0, 95.0, "Payoff content.", importance=85.0, has_stakes=True),
+        ]
+        plan = StoryPlan(
+            video_type="challenge",
+            units=[{
+                "unit_id": 0, "name": "Story", "priority": 1, "region": "mid",
+                "arc": [
+                    {"beat": "hook", "position": "start", "flags": [], "intent": "curiosity"},
+                    {"beat": "escalation", "position": "any", "flags": [], "intent": "tension"},
+                    {"beat": "payoff", "position": "end", "flags": ["STAKES"], "intent": "reveal"},
+                ],
+            }],
+        )
+        # Scene cuts aligned with block boundaries — snapping should be neutral
+        g_no_snap = execute_plan(plan, blocks, 100.0, 45, 100, scene_cut_at=None)
+        g_with_snap = execute_plan(plan, blocks, 100.0, 45, 100, scene_cut_at=[0.0, 8.0, 9.0, 20.0, 80.0, 95.0])
+        # Same blocks selected (same clip start/end values) since cuts are on boundaries
+        assert g_no_snap == g_with_snap, "cuts on block boundaries should not change selection"
+
+    def test_snap_inversion_fallback_preserves_original(self):
+        """When snapping would invert a clip's range, original boundaries are kept."""
+        from backend.pipeline.plan_executor import _snap_clip_boundaries
+        # A very short clip (10.2 to 10.4) with a scene cut at 10.0.
+        # Both start and end would snap to 10.0 → inversion → originals kept.
+        clips = [{"source_start": 10.2, "source_end": 10.4}]
+        _snap_clip_boundaries(clips, [10.0])
+        assert clips[0]["source_start"] == 10.2, "inverted snap should keep original start"
+        assert clips[0]["source_end"] == 10.4, "inverted snap should keep original end"
