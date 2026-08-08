@@ -52,10 +52,10 @@ PAYOFF_MAX_SECONDS = CLIP_MEDIUM_MAX_SECONDS       # payoff stays MEDIUM (6-15s)
 # tightly-adjacent trailing "conclusion" block (e.g. a result/winner
 # announcement that lands in its own block right after the payoff moment,
 # often after a short dramatic pause before the reveal line).
-PAYOFF_EPILOGUE_MAX_SECONDS = 7.0
+PAYOFF_EPILOGUE_MAX_SECONDS = 9.0
 # Only bridge a small gap — this absorbs a block split by a pause, not a
 # jump to unrelated later content.
-PAYOFF_EPILOGUE_GAP_TOLERANCE = 2.5
+PAYOFF_EPILOGUE_GAP_TOLERANCE = 3.5
 ESCALATION_MAX_SECONDS = CLIP_MEDIUM_MAX_SECONDS
 MIN_CLIP_SECONDS = 3.0
 WINDOW_EDGE_GAP = 0.0
@@ -649,29 +649,33 @@ def _extend_payoff_epilogue(
 
     A payoff's real conclusion ("...and the gold medal goes to...") often
     sits in its own short semantic block immediately after the climax
-    moment — exactly where the PAYOFF_MAX_SECONDS cap would otherwise cut
-    the clip off. This bridges only a small gap (PAYOFF_EPILOGUE_GAP_TOLERANCE)
-    and only if the resulting clip stays within
+    moment — sometimes split further by a dramatic pause into two short
+    blocks (the suspense beat, then the announcement line) — exactly where
+    the PAYOFF_MAX_SECONDS cap would otherwise cut the clip off. This
+    bridges gaps of at most PAYOFF_EPILOGUE_GAP_TOLERANCE between
+    consecutive blocks, looping to chain more than one short trailing block
+    together, but only ever while the resulting clip stays within
     PAYOFF_MAX_SECONDS + PAYOFF_EPILOGUE_MAX_SECONDS, so it can't turn into
     another unbounded absorption.
     """
     reserved_ranges = reserved_ranges or []
     hard_cap = clip["source_start"] + PAYOFF_MAX_SECONDS + PAYOFF_EPILOGUE_MAX_SECONDS
-    candidates = [
-        b for b in blocks
-        if b.block_id not in block_ids_used
-        and not b.black_frame and not b.freeze
-        and b.start >= clip["source_end"] - 0.1
-        and b.start <= clip["source_end"] + PAYOFF_EPILOGUE_GAP_TOLERANCE
-        and b.end <= window[1] + 0.1
-        and b.end <= hard_cap
-        and not any(max(b.start, r0) < min(b.end, r1) - 0.05 for r0, r1 in reserved_ranges)
-    ]
-    if not candidates:
-        return clip
-    nxt = min(candidates, key=lambda b: b.start)
-    clip["source_end"] = round(max(clip["source_end"], nxt.end), 3)
-    block_ids_used.add(nxt.block_id)
+    while True:
+        candidates = [
+            b for b in blocks
+            if b.block_id not in block_ids_used
+            and not b.black_frame and not b.freeze
+            and b.start >= clip["source_end"] - 0.1
+            and b.start <= clip["source_end"] + PAYOFF_EPILOGUE_GAP_TOLERANCE
+            and b.end <= window[1] + 0.1
+            and b.end <= hard_cap
+            and not any(max(b.start, r0) < min(b.end, r1) - 0.05 for r0, r1 in reserved_ranges)
+        ]
+        if not candidates:
+            break
+        nxt = min(candidates, key=lambda b: b.start)
+        clip["source_end"] = round(max(clip["source_end"], nxt.end), 3)
+        block_ids_used.add(nxt.block_id)
     return clip
 
 
@@ -935,7 +939,24 @@ def execute_plan(
     hook_max = _HOOK_MAX_BY_CONTENT.get(content_type, HOOK_MAX_SECONDS)
 
     groups: list[dict[str, Any]] = []
-    for unit in plan.units:
+    # Process units in CHRONOLOGICAL (source-time) order — NOT plan.units'
+    # own list order, which is priority-sorted (see plan_schema.parse_story_
+    # plan) purely to decide which units survive the max_groups cap.
+    # Reserved-range bookkeeping below must accumulate in time order: a
+    # unit's payoff/epilogue often needs to reach into the small gap AFTER
+    # its own footage to catch a trailing conclusion line, and the only
+    # unit that should legitimately win that gap is whichever one's own
+    # footage the gap actually follows. Processing in priority order let a
+    # later-in-time-but-higher-priority unit's window run first and claim
+    # that gap out from under the earlier one — exactly what produced
+    # "group opens with the previous group's payoff" / "group's real
+    # conclusion got cut off". Priority still fully governs which units
+    # were kept; it should not also decide who wins a race for shared
+    # boundary seconds.
+    processing_order = sorted(
+        plan.units, key=lambda u: windows.get(u.unit_id, (0.0, source_duration))[0]
+    )
+    for unit in processing_order:
         window = windows.get(unit.unit_id, (0.0, source_duration))
         candidates = _window_blocks(window, blocks, reserved_ranges, reserved_ids)
 
@@ -1073,15 +1094,27 @@ def execute_plan(
             p_dur = payoff_clip["source_end"] - payoff_clip["source_start"]
             if p_dur > PAYOFF_MAX_SECONDS:
                 payoff_clip["source_start"] = round(payoff_clip["source_end"] - PAYOFF_MAX_SECONDS, 3)
+            # Entity boundary clamp runs BEFORE the epilogue extension, not
+            # after. A genuine conclusion line ("...and the gold medal goes
+            # to...") routinely sits just past the entity segment's own
+            # detected boundary — clamping AFTER the epilogue step undid all
+            # of its work by cutting straight back to that boundary, which
+            # is exactly why a payoff could look complete right up until a
+            # max-duration cut and then simply lose its ending. Clamping
+            # first (so the "core" pick+extend-to-minimum stays honest to
+            # the segment), then deliberately letting the epilogue step
+            # reach past that boundary — bounded by its own small,
+            # self-contained cap — is what lets the real conclusion survive.
+            if should_clamp_entity:
+                _clamp_clip_to_entity_segments(payoff_clip, entity_segments, unit.entity_segment_ids or None)
             # Epilogue: a genuine conclusion line ("...and the gold medal
             # goes to...") often lands in its own short block immediately
             # after the payoff moment, right where PAYOFF_MAX_SECONDS cuts
-            # off. Allow ONE short, tightly-adjacent trailing block through
+            # off. Absorb short, tightly-adjacent trailing blocks (a
+            # suspense pause + the announcement line are often two blocks)
             # even if it pushes past the normal cap, bounded by
             # PAYOFF_EPILOGUE_MAX_SECONDS so it can never run away.
             payoff_clip = _extend_payoff_epilogue(payoff_clip, blocks, window, used_blocks, reserved_ranges)
-            if should_clamp_entity:
-                _clamp_clip_to_entity_segments(payoff_clip, entity_segments, unit.entity_segment_ids or None)
             payoff_clip["is_hook_clip"] = False
             payoff_clip["beat"] = "payoff"
             payoff_clip["_beat"] = "payoff"
@@ -1250,6 +1283,17 @@ def execute_plan(
         groups.append(group)
 
         reserved_ranges.extend((c["source_start"], c["source_end"]) for c in clips)
+        # Also reserve the unit's FULL window, not just the seconds it
+        # actually picked. The window was already computed conservatively
+        # (padding capped at a fraction of the real gap to each neighbor —
+        # see _unit_windows), so it can never reach into another unit's own
+        # footage. Reserving it in full means a later-processed unit can't
+        # pick up leftover, unused seconds inside an earlier unit's fair
+        # territory (e.g. a bit of trailing crowd reaction the earlier unit
+        # chose not to use) and present it as its own opening — closing the
+        # other half of the cross-group bleed that chronological processing
+        # order alone doesn't cover.
+        reserved_ranges.append(window)
         reserved_ids |= {b.block_id for b in (hook_block, start_block, payoff_block, *esc_blocks) if b is not None}
 
         logger.info(
@@ -1324,12 +1368,14 @@ def post_execution_qa(
 
     Checks (in order):
     1. Trim/drop clips that cross entity boundaries.
-    2. Ensure payoff is the latest source-time clip in each group.
-    2b. Resolve overlapping source ranges within a group (repeated footage).
-    3. Enforce output duration bounds using actual clip duration + 2s pad.
-    4. Resolve cross-group source overlaps globally.
-    5. Recalculate estimates for every modified group.
-    6. Drop only unsalvageable groups (zero usable clips); retain everything else.
+    2. Resolve overlapping source ranges within a group (repeated footage,
+       or an escalation clip's extension creeping into the payoff's own
+       territory).
+    3. Ensure payoff is the latest source-time clip in each group.
+    4. Enforce output duration bounds using actual clip duration + 2s pad.
+    5. Resolve cross-group source overlaps globally.
+    6. Recalculate estimates for every modified group.
+    7. Drop only unsalvageable groups (zero usable clips); retain everything else.
 
     Returns the (possibly pruned) groups list.
     """
@@ -1385,7 +1431,33 @@ def post_execution_qa(
                 f"QA: trimmed entity-boundary crossings in group {g.get('group_index')}"
             )
 
-    # --- 2. Payoff must be the latest source-time clip in its group ---
+    # --- 2. Resolve overlapping source ranges WITHIN a group ---
+    # Beats (hook/start, escalation, payoff) are picked semi-independently
+    # and each can be independently extended, so two clips in the same
+    # group can end up covering the same source seconds — the reel then
+    # visibly repeats that footage, or an escalation clip's extension
+    # creeps past the payoff block's own start into the payoff's own
+    # territory. This runs BEFORE the "payoff must be latest" check below:
+    # if an escalation clip were left overrunning into the payoff's range,
+    # its (wrongly) later source_end could fool that check into swapping
+    # the two clips' identities — crowning the overrun escalation clip as
+    # "the payoff" and demoting the real payoff to an escalation slot. Only
+    # this raw, mislabeled ordering issue is distinct from step 5 below,
+    # which resolves overlaps ACROSS groups instead of within one.
+    for g in groups:
+        clips = g.get("source_clips", [])
+        if len(clips) < 2:
+            continue
+        before = [(c["source_start"], c["source_end"]) for c in clips]
+        if _resolve_intra_group_overlaps(clips):
+            g["source_clips"] = clips
+            modified_groups.add(g.get("group_index", -1))
+            logger.info(
+                f"QA: resolved intra-group overlap in group {g.get('group_index')} "
+                f"({before} -> {[(c['source_start'], c['source_end']) for c in clips]})"
+            )
+
+    # --- 3. Payoff must be the latest source-time clip in its group ---
     for g in groups:
         clips = g.get("source_clips", [])
         if len(clips) < 2:
@@ -1414,26 +1486,7 @@ def post_execution_qa(
                 f"QA: moved payoff timestamps to latest source-time in group {g.get('group_index')}"
             )
 
-    # --- 2b. Resolve overlapping source ranges WITHIN a group ---
-    # Beats (hook/start, escalation, payoff) are picked semi-independently
-    # and each can be independently extended, so two clips in the same
-    # group can end up covering the same source seconds — the reel then
-    # visibly repeats that footage. This is distinct from step 4 below,
-    # which only resolves overlaps ACROSS groups.
-    for g in groups:
-        clips = g.get("source_clips", [])
-        if len(clips) < 2:
-            continue
-        before = [(c["source_start"], c["source_end"]) for c in clips]
-        if _resolve_intra_group_overlaps(clips):
-            g["source_clips"] = clips
-            modified_groups.add(g.get("group_index", -1))
-            logger.info(
-                f"QA: resolved intra-group overlap in group {g.get('group_index')} "
-                f"({before} -> {[(c['source_start'], c['source_end']) for c in clips]})"
-            )
-
-    # --- 3. Duration bounds enforcement (actual clip duration + 2.0s pad) ---
+    # --- 4. Duration bounds enforcement (actual clip duration + 2.0s pad) ---
     for g in groups:
         clips = g.get("source_clips", [])
         if not clips:
