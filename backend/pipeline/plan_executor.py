@@ -48,6 +48,14 @@ HOOK_MIN_SECONDS = 4.0
 HOOK_MAX_SECONDS = 10.0                             # default; overridden per content type
 PAYOFF_MIN_SECONDS = 6.0                            # default; overridden per content type
 PAYOFF_MAX_SECONDS = CLIP_MEDIUM_MAX_SECONDS       # payoff stays MEDIUM (6-15s)
+# Extra runway (on top of PAYOFF_MAX_SECONDS) allowed ONLY for a short,
+# tightly-adjacent trailing "conclusion" block (e.g. a result/winner
+# announcement that lands in its own block right after the payoff moment,
+# often after a short dramatic pause before the reveal line).
+PAYOFF_EPILOGUE_MAX_SECONDS = 7.0
+# Only bridge a small gap — this absorbs a block split by a pause, not a
+# jump to unrelated later content.
+PAYOFF_EPILOGUE_GAP_TOLERANCE = 2.5
 ESCALATION_MAX_SECONDS = CLIP_MEDIUM_MAX_SECONDS
 MIN_CLIP_SECONDS = 3.0
 WINDOW_EDGE_GAP = 0.0
@@ -117,6 +125,38 @@ def _block_has_flag(block: SemanticBlock, flag: str) -> bool:
 
 def _block_any_flag(block: SemanticBlock) -> bool:
     return block.has_vulgarity or block.has_dating or block.has_roast or block.has_stakes
+
+
+# Sponsor / ad-read phrases. Matched case-insensitively as substrings, so
+# "use code SAVE20" and "USE CODE save20" both hit "use code". Kept
+# deliberately short and high-precision (real ad-read boilerplate) rather
+# than broad topical terms, so we don't accidentally filter out genuine
+# content that happens to mention a brand in passing.
+_SPONSOR_PHRASES = (
+    "use code", "promo code", "discount code", "coupon code",
+    "% off", "percent off",
+    "link in description", "link in bio", "link below",
+    "sponsored by", "this video is sponsored", "this episode is sponsored",
+    "thanks to our sponsor", "today's sponsor", "brought to you by",
+    "download the app", "sign up at", "sign up now",
+    "swipe up", "click the link", "check out the link",
+    "free shipping", "limited time offer", "use my code",
+)
+
+
+def _is_sponsor_or_offtopic(block: SemanticBlock) -> bool:
+    """True if a block's text reads like an ad read / sponsor segment.
+
+    Applied at the candidate-pool level (``_window_blocks``) so ad reads are
+    hard-excluded from every beat's pool, not merely scored lower — a
+    high-energy sponsor read can otherwise still out-score genuine content
+    on importance/energy alone (see: a Mr Beast chocolate-bar ad winning an
+    escalation slot).
+    """
+    text = (block.text or "").lower()
+    if not text:
+        return False
+    return any(phrase in text for phrase in _SPONSOR_PHRASES)
 
 
 def _trim_block(block: SemanticBlock, max_seconds: float, keep_end: bool = False) -> tuple[float, float]:
@@ -221,7 +261,7 @@ def _window_blocks(
     if not raw:
         return []
 
-    usable = [b for b in raw if not (b.black_frame or b.freeze)]
+    usable = [b for b in raw if not (b.black_frame or b.freeze) and not _is_sponsor_or_offtopic(b)]
     strict = [b for b in usable if b.importance >= 25]
     # Soft gate: if the importance filter would leave almost nothing to pick
     # from (e.g. VAD produced no speech energy), relax it instead of starving
@@ -306,8 +346,7 @@ def _pick_hook_block(
     best: tuple[float, float] | None = None
     best_block: SemanticBlock | None = None
     for b in candidates:
-        if not _usable(b):
-            continue
+        usable = _usable(b)
         clip = {"source_start": b.start, "source_end": b.end}
         score = _score_clip_as_hook(clip, blocks)
         score += _relevance_bonus(hook_ranked, b.block_id)
@@ -329,6 +368,16 @@ def _pick_hook_block(
                 if name.lower() in text_lower:
                     score += 15.0
                     break
+
+        if not usable:
+            # Overlaps the payoff block — strongly avoid it, but don't
+            # exclude it outright. A hard `continue` here meant that when
+            # EVERY candidate overlapped the payoff (a tight window), the
+            # hook/start beat silently got no clip at all — the "no start"
+            # symptom. A heavy penalty keeps the normal case (plenty of
+            # non-overlapping candidates) unaffected while guaranteeing a
+            # last-resort pick when nothing else is available.
+            score -= 1000.0
 
         key = (round(score, 3), -b.start)
         if best is None or key > best:
@@ -392,6 +441,7 @@ def _pick_escalation_blocks(
     window: tuple[float, float],
     esc_beats: list[Beat],
     esc_ranked: list[int] | None = None,
+    entity_names: set[str] | None = None,
 ) -> list[SemanticBlock]:
     """Pick escalation blocks wired to POSITIONS across the unit window.
 
@@ -460,6 +510,13 @@ def _pick_escalation_blocks(
                 score += 10.0
             if b.has_pattern_interrupt:
                 score += 8.0
+            # On-topic bonus: prefer blocks that actually mention the named
+            # entity/action over adjacent banter or sponsor-adjacent chatter
+            # that happens to score well on energy alone.
+            if entity_names and b.text:
+                text_lower = b.text.lower()
+                if any(name.lower() in text_lower for name in entity_names):
+                    score += 15.0
             return score
 
         best = max(
@@ -578,6 +635,43 @@ def _extend_short_clip(
                 break
         clip["source_end"] = new_end
         block_ids_used.add(nxt.block_id)
+    return clip
+
+
+def _extend_payoff_epilogue(
+    clip: dict[str, Any],
+    blocks: list[SemanticBlock],
+    window: tuple[float, float],
+    block_ids_used: set[int],
+    reserved_ranges: list[tuple[float, float]] | None = None,
+) -> dict[str, Any]:
+    """Absorb ONE short, tightly-adjacent trailing block past PAYOFF_MAX_SECONDS.
+
+    A payoff's real conclusion ("...and the gold medal goes to...") often
+    sits in its own short semantic block immediately after the climax
+    moment — exactly where the PAYOFF_MAX_SECONDS cap would otherwise cut
+    the clip off. This bridges only a small gap (PAYOFF_EPILOGUE_GAP_TOLERANCE)
+    and only if the resulting clip stays within
+    PAYOFF_MAX_SECONDS + PAYOFF_EPILOGUE_MAX_SECONDS, so it can't turn into
+    another unbounded absorption.
+    """
+    reserved_ranges = reserved_ranges or []
+    hard_cap = clip["source_start"] + PAYOFF_MAX_SECONDS + PAYOFF_EPILOGUE_MAX_SECONDS
+    candidates = [
+        b for b in blocks
+        if b.block_id not in block_ids_used
+        and not b.black_frame and not b.freeze
+        and b.start >= clip["source_end"] - 0.1
+        and b.start <= clip["source_end"] + PAYOFF_EPILOGUE_GAP_TOLERANCE
+        and b.end <= window[1] + 0.1
+        and b.end <= hard_cap
+        and not any(max(b.start, r0) < min(b.end, r1) - 0.05 for r0, r1 in reserved_ranges)
+    ]
+    if not candidates:
+        return clip
+    nxt = min(candidates, key=lambda b: b.start)
+    clip["source_end"] = round(max(clip["source_end"], nxt.end), 3)
+    block_ids_used.add(nxt.block_id)
     return clip
 
 
@@ -922,7 +1016,7 @@ def execute_plan(
         payoff_reserve = PAYOFF_MAX_SECONDS if unit.requires_payoff else 0.0
         budget = max(0.0, unit_reel_dur_max - (hook_max + payoff_reserve))
         esc_beats = [b for b in unit.arc if b.beat == "escalation"]
-        esc_blocks = _pick_escalation_blocks(candidates, hook_block or start_block, payoff_block, budget, window, esc_beats, esc_ranked)
+        esc_blocks = _pick_escalation_blocks(candidates, hook_block or start_block, payoff_block, budget, window, esc_beats, esc_ranked, entity_names=entity_names)
 
         # Build concrete clips --------------------------------------------------
         used_blocks = {b.block_id for b in (hook_block, start_block, payoff_block, *esc_blocks) if b is not None}
@@ -973,6 +1067,19 @@ def execute_plan(
         if payoff_block is not None:
             payoff_clip = _clip_from_block(payoff_block, PAYOFF_MAX_SECONDS, keep_end=True)
             payoff_clip = _extend_short_clip(payoff_clip, blocks, window, payoff_min, used_blocks, reserved_ranges, entity_segment_ids=ext_entity_ids, entity_segments=ext_entity_segs)
+            # _extend_short_clip only checks the target (floor) before
+            # absorbing each block — it has no ceiling, so a single large
+            # adjacent block can push the payoff well past PAYOFF_MAX_SECONDS.
+            p_dur = payoff_clip["source_end"] - payoff_clip["source_start"]
+            if p_dur > PAYOFF_MAX_SECONDS:
+                payoff_clip["source_start"] = round(payoff_clip["source_end"] - PAYOFF_MAX_SECONDS, 3)
+            # Epilogue: a genuine conclusion line ("...and the gold medal
+            # goes to...") often lands in its own short block immediately
+            # after the payoff moment, right where PAYOFF_MAX_SECONDS cuts
+            # off. Allow ONE short, tightly-adjacent trailing block through
+            # even if it pushes past the normal cap, bounded by
+            # PAYOFF_EPILOGUE_MAX_SECONDS so it can never run away.
+            payoff_clip = _extend_payoff_epilogue(payoff_clip, blocks, window, used_blocks, reserved_ranges)
             if should_clamp_entity:
                 _clamp_clip_to_entity_segments(payoff_clip, entity_segments, unit.entity_segment_ids or None)
             payoff_clip["is_hook_clip"] = False
@@ -987,6 +1094,11 @@ def execute_plan(
         for i, b in enumerate(esc_blocks):
             clip = _clip_from_block(b, ESCALATION_MAX_SECONDS, keep_end=False)
             clip = _extend_short_clip(clip, blocks, window, MIN_CLIP_SECONDS, used_blocks, reserved_ranges, entity_segment_ids=ext_entity_ids, entity_segments=ext_entity_segs)
+            # Same no-ceiling issue as payoff above: clamp back down if a
+            # single large adjacent block got absorbed whole.
+            e_dur = clip["source_end"] - clip["source_start"]
+            if e_dur > ESCALATION_MAX_SECONDS:
+                clip["source_end"] = round(clip["source_start"] + ESCALATION_MAX_SECONDS, 3)
             if should_clamp_entity:
                 _clamp_clip_to_entity_segments(clip, entity_segments, unit.entity_segment_ids or None)
             clip["is_hook_clip"] = False
@@ -1154,6 +1266,53 @@ def execute_plan(
 # Post-execution QA — deterministic Python repairs after execute_plan()
 # ---------------------------------------------------------------------------
 
+def _resolve_intra_group_overlaps(clips: list[dict[str, Any]]) -> bool:
+    """Trim overlapping source ranges between clips in the SAME group.
+
+    Different beats (hook/start, escalation, payoff) are selected somewhat
+    independently and each can be extended on its own, so two clips can end
+    up covering the same source seconds even though they never share a
+    block id — the reel then visibly repeats that footage. The payoff
+    keeps its tail (the reveal) since that's the moment the reel is
+    building to; the earlier-in-source-time clip gives up the overlapping
+    head. Clips that shrink below MIN_CLIP_SECONDS are dropped.
+
+    Note: `clips` list ORDER is the reel's playback order (hook first,
+    then escalations chronologically, then payoff last) — that is NOT
+    necessarily source-chronological order, so this function must not
+    reorder the list. It only mutates the shared clip dicts (by walking
+    a source-time-sorted VIEW) and drops any that shrink too far,
+    filtering the original list in its original order.
+
+    Mutates `clips` in place (may remove entries, never reorders the
+    survivors). Returns True if anything changed.
+    """
+    if len(clips) < 2:
+        return False
+    ordered_view = sorted(clips, key=lambda c: c["source_start"])
+    changed = False
+    for i in range(1, len(ordered_view)):
+        prev = ordered_view[i - 1]
+        cur = ordered_view[i]
+        overlap = prev["source_end"] - cur["source_start"]
+        if overlap <= 0.05:
+            continue
+        changed = True
+        cur_is_payoff = (cur.get("beat") or cur.get("_beat")) == "payoff"
+        prev_is_payoff = (prev.get("beat") or prev.get("_beat")) == "payoff"
+        if cur_is_payoff and not prev_is_payoff:
+            # Payoff keeps its range — the earlier clip gives up its tail.
+            prev["source_end"] = round(max(prev["source_start"], cur["source_start"]), 3)
+        else:
+            # Default: the later-starting clip gives up the overlapping head.
+            cur["source_start"] = round(min(cur["source_end"], prev["source_end"]), 3)
+    survivors = [c for c in clips if c["source_end"] - c["source_start"] >= MIN_CLIP_SECONDS - 0.01]
+    if len(survivors) != len(clips):
+        changed = True
+    clips[:] = survivors
+    return changed
+
+
 def post_execution_qa(
     groups: list[dict[str, Any]],
     source_duration: float,
@@ -1166,6 +1325,7 @@ def post_execution_qa(
     Checks (in order):
     1. Trim/drop clips that cross entity boundaries.
     2. Ensure payoff is the latest source-time clip in each group.
+    2b. Resolve overlapping source ranges within a group (repeated footage).
     3. Enforce output duration bounds using actual clip duration + 2s pad.
     4. Resolve cross-group source overlaps globally.
     5. Recalculate estimates for every modified group.
@@ -1252,6 +1412,25 @@ def post_execution_qa(
             modified_groups.add(g.get("group_index", -1))
             logger.info(
                 f"QA: moved payoff timestamps to latest source-time in group {g.get('group_index')}"
+            )
+
+    # --- 2b. Resolve overlapping source ranges WITHIN a group ---
+    # Beats (hook/start, escalation, payoff) are picked semi-independently
+    # and each can be independently extended, so two clips in the same
+    # group can end up covering the same source seconds — the reel then
+    # visibly repeats that footage. This is distinct from step 4 below,
+    # which only resolves overlaps ACROSS groups.
+    for g in groups:
+        clips = g.get("source_clips", [])
+        if len(clips) < 2:
+            continue
+        before = [(c["source_start"], c["source_end"]) for c in clips]
+        if _resolve_intra_group_overlaps(clips):
+            g["source_clips"] = clips
+            modified_groups.add(g.get("group_index", -1))
+            logger.info(
+                f"QA: resolved intra-group overlap in group {g.get('group_index')} "
+                f"({before} -> {[(c['source_start'], c['source_end']) for c in clips]})"
             )
 
     # --- 3. Duration bounds enforcement (actual clip duration + 2.0s pad) ---

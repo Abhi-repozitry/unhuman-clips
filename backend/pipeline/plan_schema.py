@@ -745,6 +745,12 @@ _REGION_SPANS = {"early": (0.0, 0.25), "mid": (0.25, 0.75), "late": (0.75, 1.0)}
 # - mid: unchanged (the contest/game itself)
 _GAME_REGION_SPANS = {"early": (0.0, 0.15), "mid": (0.15, 0.70), "late": (0.70, 1.0)}
 
+# Entity-window padding (see _unit_windows): a unit's window may absorb at
+# most half of the REAL gap to its nearest neighboring unit's own segment,
+# capped absolutely — so it can never reach the neighbor's own footage.
+_ENTITY_WINDOW_PAD_FRACTION = 0.5
+_ENTITY_WINDOW_PAD_MAX_SECONDS = 4.0
+
 
 def _unit_windows(
     plan: StoryPlan,
@@ -773,35 +779,60 @@ def _unit_windows(
     # For non-adjacent merged segments (effective_ranges set), use the
     # union of actual block time ranges instead of seg.start..seg.end
     # which would span across other speakers' time.
+    #
+    # Padding: each unit gets a little room on either side to absorb
+    # adjacent filler (so a too-short hook/payoff clip can still reach its
+    # minimum duration), but that room is capped at HALF the real gap to the
+    # nearest neighboring unit's own footage (and capped absolutely at
+    # _ENTITY_WINDOW_PAD_MAX_SECONDS). A unit's window can therefore never
+    # reach into a sibling unit's real segment. The previous blind
+    # "expand by 60% of the segment's own duration, clamp only to
+    # 0/source_duration" logic had no neighbor-awareness at all, so for
+    # back-to-back segments (the common case for a challenge/reel
+    # compilation) it routinely padded straight into the next — or
+    # previous — unit's own footage, and every downstream extension helper
+    # then had a legal (if wide) window to absorb that footage into its
+    # own clips. That is the root cause of one group's reel ending with
+    # the next group's intro, or opening with the previous group's payoff.
     if has_entity_units and entity_segments:
         entity_map = {s.entity_segment_id: s for s in entity_segments}
-        entity_windows: dict[int, tuple[float, float]] = {}
+        own_ranges: dict[int, tuple[float, float]] = {}
         for u in plan.units:
-            if u.entity_segment_ids:
-                all_starts: list[float] = []
-                all_ends: list[float] = []
-                for sid in u.entity_segment_ids:
-                    seg = entity_map.get(sid)
-                    if seg is None:
-                        continue
-                    if seg.effective_ranges:
-                        # Non-adjacent merged — use actual sub-ranges
-                        for r_start, r_end in seg.effective_ranges:
-                            all_starts.append(r_start)
-                            all_ends.append(r_end)
-                    else:
-                        all_starts.append(seg.start)
-                        all_ends.append(seg.end)
-                if all_starts and all_ends:
-                    win_start = min(all_starts)
-                    win_end = max(all_ends)
-                    # Expand window by 60% to include adjacent content for extension
-                    win_dur = win_end - win_start
-                    expand = win_dur * 0.6
-                    win_start = max(0.0, win_start - expand)
-                    win_end = min(source_duration, win_end + expand)
-                    entity_windows[u.unit_id] = (round(win_start, 2), round(win_end, 2))
-        if entity_windows:
+            if not u.entity_segment_ids:
+                continue
+            all_starts: list[float] = []
+            all_ends: list[float] = []
+            for sid in u.entity_segment_ids:
+                seg = entity_map.get(sid)
+                if seg is None:
+                    continue
+                if seg.effective_ranges:
+                    # Non-adjacent merged — use actual sub-ranges
+                    for r_start, r_end in seg.effective_ranges:
+                        all_starts.append(r_start)
+                        all_ends.append(r_end)
+                else:
+                    all_starts.append(seg.start)
+                    all_ends.append(seg.end)
+            if all_starts and all_ends:
+                own_ranges[u.unit_id] = (min(all_starts), max(all_ends))
+
+        if own_ranges:
+            # Sort by source-time order so "neighbor" means the unit whose
+            # own footage is actually adjacent in the timeline, not
+            # whichever unit happens to have an adjacent unit_id.
+            ordered = sorted(own_ranges.items(), key=lambda kv: kv[1][0])
+            entity_windows: dict[int, tuple[float, float]] = {}
+            for idx, (uid, (own_start, own_end)) in enumerate(ordered):
+                prev_own_end = ordered[idx - 1][1][1] if idx > 0 else own_start
+                next_own_start = ordered[idx + 1][1][0] if idx + 1 < len(ordered) else own_end
+                gap_before = max(0.0, own_start - prev_own_end)
+                gap_after = max(0.0, next_own_start - own_end)
+                back_pad = min(gap_before * _ENTITY_WINDOW_PAD_FRACTION, _ENTITY_WINDOW_PAD_MAX_SECONDS)
+                fwd_pad = min(gap_after * _ENTITY_WINDOW_PAD_FRACTION, _ENTITY_WINDOW_PAD_MAX_SECONDS)
+                win_start = max(0.0, own_start - back_pad)
+                win_end = min(source_duration, own_end + fwd_pad)
+                entity_windows[uid] = (round(win_start, 2), round(win_end, 2))
             return entity_windows
 
     # Region-based mode (default)
